@@ -34,6 +34,7 @@ NOTE:
 import os
 import sys
 import shutil
+import importlib
 import traceback
 
 import maya.cmds as cmds
@@ -132,6 +133,29 @@ def _ensure_importable():
         sys.path.append(d)
 
 
+def _reload_if_cached(module_name):
+    """
+    そのMayaセッションで以前に一度でも import 済みのモジュールは、
+    sys.modules にキャッシュされたままになる。ファイルを新しい内容で
+    上書きコピーしても、単に import しただけでは古いキャッシュが
+    返ってしまい、"install.py を再D&Dしても更新されない"ように見える
+    原因になる。importlib.reload() で明示的に再読込することで、
+    ディスク上の最新コードを確実に反映させる。
+    (対象モジュールが未importなら何もしない/初回はimportlib.import_moduleへ)
+    """
+    if module_name in sys.modules:
+        try:
+            importlib.reload(sys.modules[module_name])
+            print("[Live Sync Installer] Reloaded cached module: {0}".format(module_name))
+        except Exception as e:
+            print("[Live Sync Installer] Reload failed for {0}: {1}".format(module_name, e))
+    else:
+        try:
+            importlib.import_module(module_name)
+        except Exception:
+            pass  # モジュール側で読み込み時エラーがあっても、後続の登録処理には委ねる
+
+
 def _add_shelf_button(label, annotation, command):
     """アクティブなシェルフにボタンを1つ追加する。成否を返す。"""
     try:
@@ -176,6 +200,12 @@ def _run():
     copied = _copy_tools(source_dir)
     _ensure_importable()
 
+    # コピーした各ツールについて、以前このセッションでimport済みなら
+    # 強制的に再読込する(再D&D時に古いコードのまま動く問題への対処)。
+    for name in copied:
+        module_name = os.path.splitext(name)[0]
+        _reload_if_cached(module_name)
+
     has_aiss = "sp_to_aiStandardSurface.py" in copied
 
     livesync_shelf = _add_shelf_button(LIVESYNC_LABEL, LIVESYNC_ANNOTATION, LIVESYNC_COMMAND)
@@ -188,7 +218,7 @@ def _run():
 
     lines.append("[コピーしたツール]")
     for name in copied:
-        lines.append("  - {0}".format(name))
+        lines.append("  - {0}（最新の内容に更新済み）".format(name))
     if not has_aiss:
         lines.append("  * sp_to_aiStandardSurface.py は同じフォルダに無かったため未導入です。")
 

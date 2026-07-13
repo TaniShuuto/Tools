@@ -1136,8 +1136,12 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         tabs.addTab(sync_tab, "同期")
         layout = QtWidgets.QVBoxLayout(sync_tab)
 
-        self.enable_btn = QtWidgets.QPushButton("監視: OFF")
+        self.enable_btn = QtWidgets.QPushButton("監視（自動反映）: OFF")
         self.enable_btn.setCheckable(True)
+        self.enable_btn.setToolTip(
+            "ONにすると、SP側で塗った内容がMayaへ自動で反映されるようになります。\n"
+            "(SPの書き出しフォルダを見張り、更新があるとテクスチャを読み込み直します)"
+        )
         self.enable_btn.toggled.connect(self._on_toggle)
         layout.addWidget(self.enable_btn)
 
@@ -1157,16 +1161,22 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         form = QtWidgets.QFormLayout()
         row = QtWidgets.QHBoxLayout()
         self.watch_edit = QtWidgets.QLineEdit()
+        self.watch_edit.setToolTip(
+            "SP側が塗った内容を書き出すフォルダです。ここが更新されると\n"
+            "Mayaが自動で反映します。通常はSP側の設定と同じ場所になります。"
+        )
         browse_btn = QtWidgets.QPushButton("参照...")
+        browse_btn.setToolTip("フォルダをダイアログから選びます。")
         browse_btn.clicked.connect(self._browse_watch_dir)
         row.addWidget(self.watch_edit)
         row.addWidget(browse_btn)
         row_widget = QtWidgets.QWidget()
         row_widget.setLayout(row)
-        form.addRow("監視フォルダ", row_widget)
+        form.addRow("監視フォルダ（SPの書き出し先）", row_widget)
 
         self.renderer_combo = QtWidgets.QComboBox()
         self.renderer_combo.addItems(RENDERER_CHOICES)
+        self.renderer_combo.setToolTip("マテリアルを作るときに使うレンダラーです（通常はArnold）。")
         form.addRow("レンダラー", self.renderer_combo)
         layout.addLayout(form)
 
@@ -1183,19 +1193,30 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         self.more_btn = QtWidgets.QToolButton()
         self.more_btn.setText("その他の設定")
+        self.more_btn.setToolTip("自動起動の登録や、棚へのショートカット追加などを行えます。")
         self.more_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.more_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         more_menu = QtWidgets.QMenu(self.more_btn)
 
-        wizard_action = more_menu.addAction("セットアップウィザートを開く")
-        wizard_action.setToolTip("監視フォルダ・レンダラーの設定と接続テストを対話形式で見直せます。")
+        wizard_action = more_menu.addAction("設定をやり直す（ウィザード）")
+        wizard_action.setToolTip(
+            "監視フォルダやレンダラーの設定を、最初のセットアップと同じ\n"
+            "対話形式でやり直せます。接続テストもここから行えます。"
+        )
         wizard_action.triggered.connect(self.open_setup_wizard)
 
-        shelf_action = more_menu.addAction("shelfボタンを設置")
+        shelf_action = more_menu.addAction("ショートカットを棚（シェルフ）に追加")
+        shelf_action.setToolTip(
+            "画面上部の棚（シェルフ）に、このウィンドウを1クリックで開く\n"
+            "ボタンを追加します。次回から素早く起動できます。"
+        )
         shelf_action.triggered.connect(self._install_shelf_button)
 
-        register_action = more_menu.addAction("userSetup.pyに登録")
-        register_action.setToolTip("Maya起動時に自動でこのスクリプトをimportするよう登録します(任意)。")
+        register_action = more_menu.addAction("Maya起動時に自動で開く")
+        register_action.setToolTip(
+            "次回以降、Mayaを起動したときにこのウィンドウが自動で\n"
+            "開くようになります（任意）。いつでも解除できます。"
+        )
         register_action.triggered.connect(self._on_register_user_setup)
 
         self.more_btn.setMenu(more_menu)
@@ -1207,16 +1228,17 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         layout.addLayout(btn_row)
 
         stats_group = QtWidgets.QGroupBox("反映状況")
+        stats_group.setToolTip("自動反映が正しく動いているかの目安です。")
         stats_layout = QtWidgets.QFormLayout(stats_group)
         self.last_reload_label = QtWidgets.QLabel("-")
         self.reload_count_label = QtWidgets.QLabel("0")
         self.node_count_label = QtWidgets.QLabel("0")
-        stats_layout.addRow("最終反映時刻", self.last_reload_label)
-        stats_layout.addRow("反映回数", self.reload_count_label)
-        stats_layout.addRow("直近の対象ノード数", self.node_count_label)
+        stats_layout.addRow("最後に反映した時刻", self.last_reload_label)
+        stats_layout.addRow("これまでの反映回数", self.reload_count_label)
+        stats_layout.addRow("直近で反映したテクスチャ数", self.node_count_label)
         layout.addWidget(stats_group)
 
-        layout.addWidget(QtWidgets.QLabel("ログ"))
+        layout.addWidget(QtWidgets.QLabel("ログ（動作の記録）"))
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
@@ -1224,13 +1246,14 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         # --- タブ2: マテリアル構造(Phase 2) ---
         material_tab = QtWidgets.QWidget()
-        tabs.addTab(material_tab, "マテリアル構造")
+        tabs.addTab(material_tab, "マテリアル")
         mat_layout = QtWidgets.QVBoxLayout(material_tab)
 
         mat_layout.addWidget(QtWidgets.QLabel(
-            "SP側で検出されたテクスチャセットと、Maya側の対応状況です。\n"
-            "「未対応」の行を選択して自動生成すると、Arnoldの標準シェーダー\n"
-            "ネットワークが作成されます(ジオメトリへの割り当ては手動で行ってください)。"
+            "SP側で見つかったテクスチャセットと、Maya側でマテリアルが\n"
+            "できているかの一覧です。\n"
+            "「未対応」の行を選んで下のボタンを押すと、Arnold用のマテリアルを\n"
+            "自動で作成します（モデルへの割り当ては手動で行ってください）。"
         ))
         # Phase 3: 今どのSPプロジェクトの一覧を見ているかを明示する
         # (複数プロジェクト混在時の誤解を防ぐため)。
@@ -1239,7 +1262,12 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         mat_layout.addWidget(self.active_project_label)
 
         # Phase 2 最適化: 生成するチャンネルを選択できるようにする
-        channel_group = QtWidgets.QGroupBox("生成するチャンネル")
+        channel_group = QtWidgets.QGroupBox("マテリアルに含めるチャンネル")
+        channel_group.setToolTip(
+            "マテリアルを作るときに、どの種類のテクスチャをつなぐかを選びます。\n"
+            "（BaseColor=色、Roughness=ざらつき、Metallic=金属感、\n"
+            " Normal=凹凸の向き、Height=変位、Emissive=発光）"
+        )
         channel_layout = QtWidgets.QHBoxLayout(channel_group)
         for suffix in CHANNEL_SUFFIXES:
             cb = QtWidgets.QCheckBox(suffix)
@@ -1256,19 +1284,31 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         mat_layout.addWidget(self.material_table)
 
         mat_btn_row = QtWidgets.QHBoxLayout()
-        self.refresh_material_btn = QtWidgets.QPushButton("状態を更新")
+        self.refresh_material_btn = QtWidgets.QPushButton("一覧を最新にする")
+        self.refresh_material_btn.setToolTip("上の一覧を、現在のSP側・Maya側の状況に合わせて更新します。")
         self.refresh_material_btn.clicked.connect(self._refresh_material_table)
-        self.create_shader_btn = QtWidgets.QPushButton("選択行のシェーダーを自動生成")
+        self.create_shader_btn = QtWidgets.QPushButton("選んだ素材のマテリアルを作る")
+        self.create_shader_btn.setToolTip(
+            "一覧で選んだテクスチャセットから、Arnold用のマテリアル\n"
+            "（シェーダーネットワーク）を自動で組み立てます。\n"
+            "作ったマテリアルをどのモデルに割り当てるかは手動です。"
+        )
         self.create_shader_btn.clicked.connect(self._on_create_shader_clicked)
         mat_btn_row.addWidget(self.refresh_material_btn)
         mat_btn_row.addWidget(self.create_shader_btn)
         mat_layout.addLayout(mat_btn_row)
 
-        mat_layout.addWidget(QtWidgets.QLabel("孤立ノード(リネーム/削除で取り残されたfileノード。自動削除はしません)"))
+        orphan_label = QtWidgets.QLabel("使われていないファイルノード")
+        orphan_label.setToolTip(
+            "モデル名やマテリアル名の変更・削除によって、どのマテリアルにも\n"
+            "つながらなくなって取り残された file ノードの一覧です。\n"
+            "誤削除を防ぐため、このツールが自動で消すことはありません。"
+        )
+        mat_layout.addWidget(orphan_label)
         self.orphan_list = QtWidgets.QListWidget()
         self.orphan_list.setMaximumHeight(100)
         mat_layout.addWidget(self.orphan_list)
-        self.refresh_orphan_btn = QtWidgets.QPushButton("孤立ノードを一覧表示")
+        self.refresh_orphan_btn = QtWidgets.QPushButton("使われていないノードを探す")
         self.refresh_orphan_btn.clicked.connect(self._refresh_orphan_list)
         mat_layout.addWidget(self.refresh_orphan_btn)
 
@@ -1312,7 +1352,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.watch_edit.setText(selected)
 
     def _on_toggle(self, checked):
-        self.enable_btn.setText("監視: {0}".format("ON" if checked else "OFF"))
+        self.enable_btn.setText("監視（自動反映）: {0}".format("ON" if checked else "OFF"))
         if checked:
             self.watcher.start()
         else:
