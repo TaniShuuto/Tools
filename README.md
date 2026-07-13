@@ -6,7 +6,7 @@
 
   * [Substance 3D Painter](#substance-3d-painter)
   * [Maya](#maya)
-* [Usage](#usage)
+* [使い方](#usage)
 
   * [Live Syncについて](#live-syncについて)
   * [Substance 3D Painter](#substance-3d-painter-1)
@@ -461,8 +461,8 @@ C:\SPMayaLiveSync\live
 現在対応しているレンダラー
 
 * Arnold
+今後追加対応していきます。
 
-今後対応レンダラーを追加する予定です。
 
 ---
 
