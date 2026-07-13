@@ -2,7 +2,7 @@
 
 * [Features](#features)
 * [Requirements](#requirements)
-* [Installation](#installation)
+* [インストール方法](#installation)
 
   * [Substance 3D Painter](#substance-3d-painter)
   * [Maya](#maya)
