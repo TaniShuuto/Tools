@@ -220,6 +220,21 @@ def register_user_setup(auto_open=False):
     既に登録済み(マーカーコメントが存在する)場合は二重登録しない。
     既存ファイルがある場合は、追記前にタイムスタンプ付きでバックアップ
     してから追記する(ユーザーの既存userSetup.py内容を壊さないため)。
+
+    auto_open=True の場合、ウィンドウを開くタイミングには
+    OpenMaya.MSceneMessage.kMayaInitialized コールバックを使う。
+    以前は maya.utils.executeDeferred を userSetup.py 実行時点で
+    直接呼んでいたが、これは「Mayaのアイドルキューが一度空いた瞬間」
+    に実行されるだけで、UI全体の起動が完了したことまでは保証しない。
+    実機で、起動ロゴ表示中〜メインウィンドウ構築中にLive Syncの
+    ウィンドウが表示されてしまう不具合として確認された。
+    kMayaInitialized はMaya本体の初期化が完了した後に一度だけ通知される
+    イベントで、そのコールバック内でさらに cmds.evalDeferred(...,
+    lowestPriority=True) を挟むことで、「メインウィンドウ・既定
+    プロジェクトの表示まで完了した後」まで確実に遅延させる
+    (maya.utils.executeDeferred には lowestPriority 相当の引数が無いため、
+    こちらは cmds.evalDeferred 側のフラグを利用する)。
+
     戻り値: (成功したか, メッセージ)
     """
     path = _user_setup_path()
@@ -238,8 +253,21 @@ def register_user_setup(auto_open=False):
         lines = ["\n", REGISTER_MARKER + "\n", "try:\n", "    import maya_live_sync\n"]
         if auto_open:
             lines += [
-                "    import maya.utils as _sp_live_sync_utils\n",
-                "    _sp_live_sync_utils.executeDeferred(maya_live_sync.show_ui)\n",
+                "    import maya.cmds as _sp_live_sync_cmds\n",
+                "    import maya.OpenMaya as _sp_live_sync_om\n",
+                "\n",
+                "    def _sp_live_sync_on_initialized(*_args):\n",
+                "        # Maya本体の起動が完了した後、さらにアイドルキューの\n",
+                "        # 最後尾(lowestPriority)に回すことで、メインウィンドウや\n",
+                "        # 既定プロジェクトの表示まで確実に終えてから開く。\n",
+                "        # (maya.utils.executeDeferred には lowestPriority 引数が\n",
+                "        # 無いため、cmds.evalDeferred 側のフラグを使う)\n",
+                "        _sp_live_sync_cmds.evalDeferred(\n",
+                "            maya_live_sync.show_ui, lowestPriority=True)\n",
+                "\n",
+                "    _sp_live_sync_om.MSceneMessage.addCallback(\n",
+                "        _sp_live_sync_om.MSceneMessage.kMayaInitialized,\n",
+                "        _sp_live_sync_on_initialized)\n",
             ]
         lines += ["except Exception:\n", "    pass\n"]
 
@@ -248,6 +276,7 @@ def register_user_setup(auto_open=False):
         return True, "userSetup.pyに登録しました: {0}".format(path)
     except Exception as e:
         return False, "登録に失敗しました: {0}".format(e)
+
 
 
 def load_config():
