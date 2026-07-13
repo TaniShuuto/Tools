@@ -93,6 +93,11 @@ DEFAULT_CONFIG = {
     # これが分かれば、複数プロジェクトを横断して作業した場合でも
     # 別プロジェクトのテクスチャセットが一覧に混在しなくなる。
     "active_project_key": None,
+    # 複数プロジェクト対応: Finalは <final_export_dir>/<subfolder>/ に
+    # 書き出される。SP側が現在アクティブなプロジェクトのサブフォルダ名を
+    # ここに書き込むので、aiSSボタンはこれを読んで正しい取り込み先を
+    # 自動入力する。None のときは final_export_dir 直下を使う(後方互換)。
+    "active_final_subfolder": None,
     # Phase 3: SP側が実際に書き出したファイル名のprefix
     # (テクスチャセット名 -> prefix文字列)。分かっていればこちらを
     # 最優先で使い、_safe_name() による予測はフォールバックとする。
@@ -380,6 +385,18 @@ class LiveSyncWatcher(QtCore.QObject):
         self.debounce_timer.setInterval(400)
         self.debounce_timer.timeout.connect(self._process_pending_changes)
 
+        # 複数プロジェクト対応: QFileSystemWatcherは「既に監視登録した
+        # フォルダの変化」しか通知しない。SP側でプロジェクトを切り替えて
+        # 新しい(まだ一度もWatcherに登録していない)Finalサブフォルダが
+        # 誕生した場合、directoryChangedは一切発火しないため、
+        # _process_pending_changes への動的追従だけでは間に合わない
+        # (鶏と卵の問題)。そのため、フォルダ変化とは独立に、数秒おきで
+        # 「アクティブなFinalサブフォルダがWatcher登録済みか」だけを
+        # 軽量に確認するポーリングタイマーを別途持つ。
+        self.project_poll_timer = QtCore.QTimer(self)
+        self.project_poll_timer.setInterval(3000)
+        self.project_poll_timer.timeout.connect(self._ensure_active_final_watched)
+
     def _emit_status(self, text):
         line = "[{0}] {1}".format(_now(), text)
         print("[LiveSync] {0}".format(text))
@@ -411,6 +428,28 @@ class LiveSyncWatcher(QtCore.QObject):
 
     # -- 開始/停止 --------------------------------------------------------
 
+    def _ensure_active_final_watched(self):
+        """アクティブなFinalサブフォルダがWatcherに登録済みか確認し、
+        未登録(＝SP側でプロジェクトが切り替わり新しいサブフォルダが
+        誕生した、または初回)であればフォルダを作成して監視に加える。
+        3秒間隔の軽量ポーリングタイマーからのみ呼ばれる。
+        """
+        if not self.enabled:
+            return
+        active_final_dir = self._active_final_dir()
+        if not active_final_dir:
+            return
+        active_final_dir = os.path.normpath(active_final_dir)
+        if active_final_dir in self.fs_watcher.directories():
+            return
+        try:
+            os.makedirs(active_final_dir, exist_ok=True)
+            ok = self.fs_watcher.addPath(active_final_dir)
+            if ok:
+                self._emit_status("プロジェクトの切り替えを検知し、Finalフォルダの監視先を更新しました: {0}".format(active_final_dir))
+        except Exception as e:
+            self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
+
     def start(self):
         other = _check_other_session()
         if other:
@@ -428,7 +467,19 @@ class LiveSyncWatcher(QtCore.QObject):
         # Finalフォルダも監視対象に加える(表示品質をFinalにしたまま
         # SP側で保存しても自動反映されない不具合の修正。プレビュー
         # フォルダと同様、更新を検知したら再読込のトリガーにする)。
-        for d in (watch_dir, final_dir):
+        #
+        # 複数プロジェクト対応: SP側は Final を final_export_dir 直下では
+        # なく <final_export_dir>/<アクティブなサブフォルダ>/ に書き出す
+        # ため、直下だけでなくアクティブなサブフォルダも監視対象に含める。
+        # サブフォルダ自体がまだ存在しない場合(一度もFinalを書き出して
+        # いない)は作成してから監視に加える。
+        watch_targets = [watch_dir, final_dir]
+        active_final_dir = self._active_final_dir()
+        if active_final_dir:
+            active_final_dir = os.path.normpath(active_final_dir)
+            os.makedirs(active_final_dir, exist_ok=True)
+            watch_targets.append(active_final_dir)
+        for d in watch_targets:
             if d not in self.fs_watcher.directories():
                 ok = self.fs_watcher.addPath(d)
                 if not ok:
@@ -460,7 +511,23 @@ class LiveSyncWatcher(QtCore.QObject):
 
     def _process_pending_changes(self):
         watch_dir = os.path.normpath(self.config["watch_dir"])
-        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+
+        # 複数プロジェクト対応: 「Finalフォルダ」は固定の final_export_dir
+        # 直下ではなく、SP側のプロジェクト切り替えに応じて変わる
+        # アクティブなサブフォルダを指す。ここで最新の値を読み直し、
+        # まだ監視対象に入っていなければ動的に追加する
+        # (start() は監視開始時の1回しか対象を確定しないため、開始後に
+        # SP側でプロジェクトを切り替えて新しいサブフォルダができた場合、
+        # ここで追従しないと新フォルダの変更を一切検知できない)。
+        active_final_dir = self._active_final_dir()
+        final_dir = os.path.normpath(active_final_dir) if active_final_dir else os.path.normpath(
+            self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        if self.enabled and final_dir not in self.fs_watcher.directories():
+            try:
+                os.makedirs(final_dir, exist_ok=True)
+                self.fs_watcher.addPath(final_dir)
+            except Exception as e:
+                self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
 
         watch_flag = os.path.join(watch_dir, "_sync_complete.flag")
         if os.path.isfile(watch_flag):
@@ -555,8 +622,14 @@ class LiveSyncWatcher(QtCore.QObject):
         往復切り替えしなくても自動的に反映されるようにするためのもの。
         呼び出し元(_process_pending_changes)でusing_final_qualityが
         True の場合のみ呼ばれる想定。
+
+        複数プロジェクト対応: 「Finalフォルダ」は final_export_dir 直下
+        ではなく、現在アクティブなプロジェクトのサブフォルダ
+        (_active_final_dir())を指す。
         """
-        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        final_dir = self._active_final_dir()
+        final_dir = os.path.normpath(final_dir) if final_dir else os.path.normpath(
+            self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
             return
@@ -642,6 +715,11 @@ class LiveSyncWatcher(QtCore.QObject):
         プレビューフォルダ・保存時の高画質Finalフォルダ)の集合を返す。
         Phase 6: 品質切り替え後もマッピング状況・孤立ノード判定が
         正しく機能するよう、両方のフォルダを対象にする。
+
+        複数プロジェクト対応: Final は <final_export_dir> 直下ではなく
+        <final_export_dir>/<active_final_subfolder>/ に書き出されるため、
+        後者も対象に含める(直下のみだと、サブフォルダを参照している
+        file ノードが「孤立ノード」や「切り替え対象」として認識されない)。
         """
         dirs = set()
         watch_dir = self.config.get("watch_dir")
@@ -650,7 +728,27 @@ class LiveSyncWatcher(QtCore.QObject):
         final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
         if final_dir:
             dirs.add(os.path.normpath(final_dir))
+            active_dir = self._active_final_dir()
+            if active_dir:
+                dirs.add(os.path.normpath(active_dir))
         return dirs
+
+    def _active_final_dir(self):
+        """現在アクティブなプロジェクトのFinal書き出し先の実パスを返す。
+
+        複数プロジェクト対応: SP側は Final を
+        <final_export_dir>/<active_final_subfolder>/ に書き出す。
+        active_final_subfolder が共有設定に無ければ(未対応の古いSP側や、
+        まだ一度もFinalを書き出していない場合)、後方互換として
+        final_export_dir 直下を返す。
+        """
+        final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
+        if not final_dir:
+            return None
+        subfolder = self.config.get("active_final_subfolder")
+        if subfolder:
+            return os.path.join(final_dir, subfolder)
+        return final_dir
 
     def is_texture_set_mapped(self, name):
         """このテクスチャセットに対応するシェーディンググループが
@@ -716,8 +814,19 @@ class LiveSyncWatcher(QtCore.QObject):
         戻り値: Finalのみを参照していればTrue、監視フォルダのみを参照
         していればFalse、fileノードが無い/両方混在している等で判別
         できない場合はNone。
+
+        複数プロジェクト対応: Finalは final_export_dir 直下だけでなく
+        現在アクティブなプロジェクトのサブフォルダ(_active_final_dir())
+        にも書き出される。直下しか見ないと、サブフォルダを参照している
+        (=switch_texture_qualityで正しく用いた)ノードが「Finalではない」
+        と誤判定され、Maya再起動後にボタンの見た目がプレビューに戻って
+        しまう。両方を「Final」として扱う。
         """
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        active_final_dir = self._active_final_dir()
+        final_dirs = {final_dir}
+        if active_final_dir:
+            final_dirs.add(os.path.normpath(active_final_dir))
         watch_dir = os.path.normpath(self.config.get("watch_dir") or "")
         found_final = False
         found_watch = False
@@ -729,7 +838,7 @@ class LiveSyncWatcher(QtCore.QObject):
             if not tex_path:
                 continue
             d = os.path.normpath(os.path.dirname(tex_path))
-            if d == final_dir:
+            if d in final_dirs:
                 found_final = True
             elif d == watch_dir:
                 found_watch = True
@@ -745,19 +854,29 @@ class LiveSyncWatcher(QtCore.QObject):
         (prefix_suffix.ext)は共通のため、フォルダ部分だけを付け替える。
         自動切り替えは行わない(切り替わったタイミングが分かりにくく
         なることを避けるため、常にGUIのボタン操作からのみ呼び出される)。
+
+        複数プロジェクト対応: 「Final」は final_export_dir 直下ではなく
+        現在アクティブなプロジェクトのサブフォルダ(_active_final_dir())を
+        指す。旧バージョンで final_export_dir 直下に書き出されたノードや、
+        別プロジェクトのサブフォルダを参照したままのノードも、切り替え
+        対象として拾えるよう managed_dirs には両方を含める。
+
         戻り値: 実際に切り替えたノード数。
         """
         watch_dir = os.path.normpath(self.config["watch_dir"])
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
-        dest_dir = final_dir if use_final else watch_dir
-        managed_dirs = {watch_dir, final_dir}
+        active_final_dir = self._active_final_dir()
+        active_final_dir = os.path.normpath(active_final_dir) if active_final_dir else final_dir
+        dest_dir = active_final_dir if use_final else watch_dir
+        managed_dirs = {watch_dir, final_dir, active_final_dir}
 
         # Phase 6不具合修正: 以前はボタンの状態から推測した「切り替え元」
         # フォルダのノードだけを対象にしていたが、Maya再起動でボタンの
         # 見た目は初期化されてもシーン内のfileノードのパスはそのまま
         # 保存されているため、両者がズレて一切切り替えられなくなる
-        # 不具合があった。監視フォルダ・Finalフォルダのどちらを参照して
-        # いるノードも対象に含め、常に希望の状態(dest_dir)へ収束させる。
+        # 不具合があった。監視フォルダ・Finalフォルダ(直下・アクティブ
+        # サブフォルダの両方)のどれかを参照しているノードも対象に含め、
+        # 常に希望の状態(dest_dir)へ収束させる。
         nodes = []
         for node in cmds.ls(type="file") or []:
             try:

@@ -43,6 +43,7 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 """
 
 import os
+import re
 import json
 import time
 import shutil
@@ -94,6 +95,10 @@ DEFAULT_CONFIG = {
     # 「どのプロジェクトのテクスチャセット一覧を見ればよいか」を機械的に
     # 判別できるよう、現在アクティブなプロジェクトのキーを共有する。
     "active_project_key": None,
+    # 複数プロジェクト対応: Final は <final_export_dir>/<subfolder>/ に
+    # 書き出す。現在アクティブなプロジェクトの Final サブフォルダ名を
+    # 共有し、Maya側(aiSSボタン)が正しい取り込み先を自動入力できるようにする。
+    "active_final_subfolder": None,
     # Phase 3: SP側が実際に書き出したファイル名のprefixを記録する。
     # Maya側はテクスチャセット名を自前で安全化(_safe_name)して予測する
     # 代わりに、この値があれば最優先で使うことで、スペースや日本語を
@@ -209,6 +214,30 @@ def _current_project_key():
     except Exception:
         path = None
     return path or "__unsaved__"
+
+
+def _project_subfolder_name():
+    """現在のプロジェクト用の Final サブフォルダ名を返す。
+
+    形式: <ファイル名(拡張子なし)>_<フルパスのハッシュ先頭6文字>
+      例: C:/work/ProjectA/proA.spp -> "proA_a1b2c3"
+
+    - ファイル名部分で人が見て判別でき、ハッシュ部分で「別の場所にある
+      同名プロジェクト」同士の衝突を防ぐ(両立方式)。
+    - 未保存プロジェクトはキーが "__unsaved__" 固定のため、フォルダ名も
+      "__unsaved__" になる(未保存同士は区別できないという既存の制限を
+      そのまま引き継ぐ)。この場合ファイル名部分は付けない。
+    - ファイル名部分は、フォルダ名として使えない文字を除去して安全化する。
+    """
+    key = _current_project_key()
+    if key == "__unsaved__":
+        return "__unsaved__"
+
+    stem = os.path.splitext(os.path.basename(key))[0]
+    # フォルダ名に使えない文字を除去(Windows/一般で不正な文字を _ に)
+    safe_stem = re.sub(r'[<>:"/\\|?*\s]', "_", stem).strip("_") or "project"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:6]
+    return "{0}_{1}".format(safe_stem, digest)
 
 
 def _duplicate_folder_warning(staging_dir, watch_dir, final_export_dir):
@@ -517,7 +546,21 @@ class LiveSyncEngine(QtCore.QObject):
 
     def _do_export(self, preview=True, dirty_stack_ids=None):
         cfg = self.config
-        dest_root = cfg["watch_dir"] if preview else cfg["final_export_dir"]
+        if preview:
+            # ライブプレビューは常にアクティブな1プロジェクトのみを対象と
+            # するため、従来どおり watch_dir 直下を使う(サブフォルダ化しない)。
+            dest_root = cfg["watch_dir"]
+        else:
+            # Final は複数プロジェクトが同じフォルダに混在・上書きするのを
+            # 防ぐため、プロジェクトごとのサブフォルダへ書き出す。
+            # 例: <final_export_dir>/proA_a1b2c3/
+            subfolder = _project_subfolder_name()
+            dest_root = os.path.join(cfg["final_export_dir"], subfolder)
+            # Maya 側(aiSSボタン)が「現在アクティブなプロジェクトのFinal
+            # フォルダ」を自動入力できるよう、サブフォルダ名を共有設定に記録。
+            if cfg.get("active_final_subfolder") != subfolder:
+                cfg["active_final_subfolder"] = subfolder
+                save_config({"active_final_subfolder": subfolder})
         stage_root = cfg["staging_dir"]
         os.makedirs(stage_root, exist_ok=True)
         os.makedirs(dest_root, exist_ok=True)
