@@ -14,6 +14,7 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 - `install.py` … Maya 用インストーラー
 - `maya_live_sync.py` … Maya 本体
 - `sp_live_sync_plugin.py` … Substance Painter 本体
+- `sp_to_aiStanderdSurface.py` … aiSS（自動テクスチャ割り当て機能）本体
 
 > `install.py` と `maya_live_sync.py` は**必ず同じフォルダ**に置いてください（インストーラーが隣のファイルを探します）。
 
