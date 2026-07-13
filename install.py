@@ -2,16 +2,29 @@
 install.py  -  SP -> Maya Live Sync : Maya drag-and-drop installer
 ================================================================================
 使い方:
-    この install.py を、maya_live_sync.py と同じフォルダに置いたまま、
-    Maya のビューポート(3D画面)へドラッグ&ドロップするだけ。
+    この install.py を、maya_live_sync.py / sp_to_aiStandardSurface.py と
+    同じフォルダに置いたまま、Maya のビューポート(3D画面)へドラッグ&ドロップ
+    するだけ。
 
 やっていること(自動):
-    1. 同じフォルダにある maya_live_sync.py を Maya の scripts フォルダへコピー
-    2. アクティブなシェルフに起動ボタンを1つ追加
-    3. Maya 起動時に自動で読み込まれるよう userSetup.py へ登録
+    1. 同じフォルダにある下記2ファイルを Maya の scripts フォルダへコピー
+         - maya_live_sync.py            (ライブ同期 本体)
+         - sp_to_aiStandardSurface.py   (Final取り込み・マテリアル一括生成)
+    2. アクティブなシェルフに 2 つの起動ボタンを追加
+         - [LiveSync] ... ライブ同期ウィンドウを開く
+         - [aiSS]     ... マテリアル生成ツールを開き、Final書き出しフォルダを
+                          自動入力する(= Final取り込みへ誘導)
+    3. Maya 起動時に LiveSync が自動読み込みされるよう userSetup.py へ登録
     4. 完了メッセージを表示
 
 対象: Maya 2022 以降(ドラッグ&ドロップ実行自体は 2017 Update 3 以降で対応)
+
+設計メモ:
+    sp_to_aiStandardSurface.py 本体には一切手を加えていない(拡張性・既存機能を
+    そのまま維持するため)。Final フォルダの自動入力は、このインストーラが登録
+    するシェルフボタンの起動コマンド側だけで行っている。フォルダのパスは
+    maya_live_sync.load_config() が返す共有設定 (final_export_dir) から取得する
+    ため、SP 側の設定と常に一致する。
 
 NOTE:
     UI文字列は、Windows + 日本語ロケール環境での文字化けを避けるため
@@ -41,9 +54,44 @@ def onMayaDroppedPythonFile(*args, **kwargs):
         )
 
 
-TOOL_FILE = "maya_live_sync.py"
-SHELF_BUTTON_LABEL = "LiveSync"
-SHELF_BUTTON_COMMAND = "import maya_live_sync\nmaya_live_sync.show_ui()"
+# --- コピー対象ファイル ---------------------------------------------------
+#  required=True のものが見つからない場合はインストールを中止する。
+#  required=False のものは、見つからなければ警告のみでスキップする。
+TOOL_FILES = [
+    {"name": "maya_live_sync.py", "required": True},
+    {"name": "sp_to_aiStandardSurface.py", "required": False},
+]
+
+# --- シェルフボタン: LiveSync ---------------------------------------------
+LIVESYNC_LABEL = "LiveSync"
+LIVESYNC_ANNOTATION = "SP -> Maya Live Sync : open the live sync window"
+LIVESYNC_COMMAND = "import maya_live_sync\nmaya_live_sync.show_ui()"
+
+# --- シェルフボタン: aiSS (Final取り込みへ誘導) ---------------------------
+#  ツールを開いた直後に、共有設定の final_export_dir をフォルダ入力欄へ
+#  流し込む。これにより「フォルダを探す」手間が消え、Final を書き出した後の
+#  取り込みへ自然に誘導できる。sp_to_aiStandardSurface.py には手を加えず、
+#  公開されている _gui_state["dir_field"] を使って外側から設定している。
+AISS_LABEL = "aiSS"
+AISS_ANNOTATION = "Build aiStandardSurface from the SP *Final* export (folder auto-filled)"
+AISS_COMMAND = (
+    "import maya.cmds as cmds\n"
+    "import sp_to_aiStandardSurface as _sp\n"
+    "_sp.show_ui()\n"
+    "try:\n"
+    "    import maya_live_sync as _mls\n"
+    "    _cfg = _mls.load_config()\n"
+    "    _final = _cfg.get('final_export_dir') or ''\n"
+    "    _fld = _sp._gui_state.get('dir_field')\n"
+    "    if _final and _fld and cmds.textField(_fld, exists=True):\n"
+    "        cmds.textField(_fld, edit=True, text=_final)\n"
+    "        print('[aiSS] Final folder set to: ' + _final)\n"
+    "        print('[aiSS] Tip: export Final in SP first, then click Scan -> Create.')\n"
+    "    else:\n"
+    "        print('[aiSS] Final folder not set automatically; enter it manually.')\n"
+    "except Exception as _e:\n"
+    "    print('[aiSS] Could not pre-fill Final folder: ' + str(_e))\n"
+)
 
 
 def _scripts_dir():
@@ -51,21 +99,30 @@ def _scripts_dir():
     return cmds.internalVar(userScriptDir=True)
 
 
-def _copy_tool(source_dir):
-    """maya_live_sync.py を scripts フォルダへコピーする。"""
-    src = os.path.join(source_dir, TOOL_FILE)
-    if not os.path.isfile(src):
-        raise RuntimeError(
-            "'{0}' がインストーラと同じフォルダに見つかりません。"
-            "install.py と maya_live_sync.py を同じフォルダに置いてください。".format(TOOL_FILE)
-        )
+def _copy_tools(source_dir):
+    """TOOL_FILES を scripts フォルダへコピーする。コピーした名前の一覧を返す。"""
     dst_dir = _scripts_dir()
     if not os.path.isdir(dst_dir):
         os.makedirs(dst_dir)
-    dst = os.path.join(dst_dir, TOOL_FILE)
-    shutil.copy2(src, dst)
-    print("[Live Sync Installer] Copied: {0} -> {1}".format(src, dst))
-    return dst
+
+    copied = []
+    for entry in TOOL_FILES:
+        name = entry["name"]
+        src = os.path.join(source_dir, name)
+        if not os.path.isfile(src):
+            if entry["required"]:
+                raise RuntimeError(
+                    "'{0}' がインストーラと同じフォルダに見つかりません。"
+                    "install.py と一緒に配置してください。".format(name)
+                )
+            else:
+                print("[Live Sync Installer] Optional file not found, skipped: {0}".format(name))
+                continue
+        dst = os.path.join(dst_dir, name)
+        shutil.copy2(src, dst)
+        copied.append(name)
+        print("[Live Sync Installer] Copied: {0} -> {1}".format(src, dst))
+    return copied
 
 
 def _ensure_importable():
@@ -75,29 +132,29 @@ def _ensure_importable():
         sys.path.append(d)
 
 
-def _add_shelf_button():
-    """アクティブなシェルフに起動ボタンを追加する。"""
+def _add_shelf_button(label, annotation, command):
+    """アクティブなシェルフにボタンを1つ追加する。成否を返す。"""
     try:
         current_shelf = mel.eval("tabLayout -q -selectTab $gShelfTopLevel")
         cmds.shelfButton(
             parent=current_shelf,
-            label=SHELF_BUTTON_LABEL,
-            annotation="SP -> Maya Live Sync",
+            label=label,
+            annotation=annotation,
             image="pythonFamily.png",
-            command=SHELF_BUTTON_COMMAND,
+            command=command,
             sourceType="python",
         )
-        print("[Live Sync Installer] Shelf button added to: {0}".format(current_shelf))
+        print("[Live Sync Installer] Shelf button '{0}' added to: {1}".format(label, current_shelf))
         return True
     except Exception as e:
-        print("[Live Sync Installer] Shelf button skipped: {0}".format(e))
+        print("[Live Sync Installer] Shelf button '{0}' skipped: {1}".format(label, e))
         return False
 
 
 def _register_autostart():
     """
-    maya_live_sync 側の自動起動登録機能を呼ぶ。
-    (register_user_setup が存在しない古いツール版でも失敗しないよう握る)
+    maya_live_sync 側の自動起動登録機能を呼ぶ(LiveSyncのみ)。
+    sp_to_aiStandardSurface は都度起動する一括ツールのため自動起動しない。
     """
     try:
         import maya_live_sync
@@ -116,33 +173,54 @@ def _register_autostart():
 def _run():
     source_dir = os.path.dirname(os.path.abspath(__file__))
 
-    _copy_tool(source_dir)
+    copied = _copy_tools(source_dir)
     _ensure_importable()
-    shelf_ok = _add_shelf_button()
+
+    has_aiss = "sp_to_aiStandardSurface.py" in copied
+
+    livesync_shelf = _add_shelf_button(LIVESYNC_LABEL, LIVESYNC_ANNOTATION, LIVESYNC_COMMAND)
+    aiss_shelf = _add_shelf_button(AISS_LABEL, AISS_ANNOTATION, AISS_COMMAND) if has_aiss else False
+
     auto_ok = _register_autostart()
 
-    lines = [
-        "SP -> Maya Live Sync のインストールが完了しました。",
-        "",
-        "- ツール本体を scripts フォルダへコピーしました。",
-    ]
+    # --- 完了メッセージ ---
+    lines = ["SP -> Maya Live Sync のインストールが完了しました。", ""]
+
+    lines.append("[コピーしたツール]")
+    for name in copied:
+        lines.append("  - {0}".format(name))
+    if not has_aiss:
+        lines.append("  * sp_to_aiStandardSurface.py は同じフォルダに無かったため未導入です。")
+
+    lines.append("")
+    lines.append("[シェルフボタン]")
     lines.append(
-        "- シェルフに '{0}' ボタンを追加しました。".format(SHELF_BUTTON_LABEL)
-        if shelf_ok else
-        "- シェルフボタンの追加はスキップされました(手動で作成できます)。"
+        "  - '{0}' : ライブ同期ウィンドウ".format(LIVESYNC_LABEL)
+        if livesync_shelf else
+        "  - LiveSync ボタンの追加はスキップされました(手動で作成できます)。"
     )
+    if has_aiss:
+        lines.append(
+            "  - '{0}' : Final取り込み(押すとFinalフォルダを自動入力)".format(AISS_LABEL)
+            if aiss_shelf else
+            "  - aiSS ボタンの追加はスキップされました(手動で作成できます)。"
+        )
+
+    lines.append("")
     lines.append(
-        "- Maya 起動時の自動読み込みを登録しました。"
+        "[自動起動] Maya 起動時に LiveSync を自動読み込みするよう登録しました。"
         if auto_ok else
-        "- 自動起動の登録はスキップされました(必要なら後で設定できます)。"
+        "[自動起動] 登録はスキップされました(必要なら後で設定できます)。"
     )
+
     lines += [
         "",
-        "今すぐ使うには、シェルフの '{0}' ボタンを押すか、".format(SHELF_BUTTON_LABEL),
-        "スクリプトエディタ(Python)で次を実行してください:",
-        "    import maya_live_sync",
-        "    maya_live_sync.show_ui()",
+        "[使い方の流れ]",
+        "  1. SPで塗る -> Maya側は '{0}' で監視、ライブ同期で確認".format(LIVESYNC_LABEL),
+        "  2. 仕上げ -> SPで Final を書き出す",
+        "  3. '{0}' ボタン -> フォルダは自動入力済み -> Scan -> Create".format(AISS_LABEL),
     ]
+
     message = "\n".join(lines)
     print("[Live Sync Installer]\n" + message)
     cmds.confirmDialog(title="Live Sync Installer", message=message, button=["OK"])

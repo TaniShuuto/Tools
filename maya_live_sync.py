@@ -467,6 +467,15 @@ class LiveSyncWatcher(QtCore.QObject):
             return
 
         reloaded = []
+        # v2.2 修正: stateWithoutFlush は「これから設定したいUndo有効/無効の
+        # 値」を渡す引数であり、Trueが有効化・Falseが無効化にあたる。
+        # 従来は開始時にTrue(有効化)、finally節でFalse(無効化)を渡しており、
+        # この関数を一度でも呼ぶとUndoがオフのまま戻らなくなるバグがあった
+        # (実機で "The undo queue is turned off" として再現・確認済み)。
+        # 呼び出し前の実際の状態を保存しておき、finally節ではその値へ
+        # 確実に復帰させる(呼び出し元が既にUndoをオフにしていた場合でも
+        # 壊さないようにするため、決め打ちのTrueには戻さない)。
+        prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
         try:
             for node in file_nodes:
@@ -508,7 +517,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 # 「見つからない」という誤解を招くログを出さない。
                 self._emit_status("監視フォルダを参照する file ノードが見つかりませんでした。")
         finally:
-            cmds.undoInfo(stateWithoutFlush=False)
+            cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
     def reload_final_textures(self):
         """Finalフォルダ配下のfileノードを強制再読込する
@@ -524,6 +533,9 @@ class LiveSyncWatcher(QtCore.QObject):
             return
 
         reloaded = []
+        # v2.2 修正: reload_textures() と同様の理由で、呼び出し前の状態を
+        # 保存してから復帰させる(詳細は reload_textures() のコメント参照)。
+        prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
         try:
             for node in file_nodes:
@@ -552,7 +564,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 self.stats_changed.emit(dict(self.stats))
                 self._emit_status("{0} 個の高画質(Final)テクスチャを再読込しました。".format(len(reloaded)))
         finally:
-            cmds.undoInfo(stateWithoutFlush=False)
+            cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
     def _flush_renderer_caches(self):
         renderer = (self.config.get("renderer") or "none").lower()
@@ -736,6 +748,9 @@ class LiveSyncWatcher(QtCore.QObject):
         switched = []
         missing = []
         already = 0
+        # v2.2 修正: reload_textures() と同様の理由で、呼び出し前の状態を
+        # 保存してから復帰させる(詳細は reload_textures() のコメント参照)。
+        prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
         try:
             for node in nodes:
@@ -758,7 +773,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 except Exception as e:
                     self._emit_status("切り替えに失敗: {0} ({1})".format(node, e))
         finally:
-            cmds.undoInfo(stateWithoutFlush=False)
+            cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
         if switched or already:
             self._flush_renderer_caches()

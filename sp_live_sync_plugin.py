@@ -279,6 +279,33 @@ class LiveSyncEngine(QtCore.QObject):
         event.DISPATCHER.connect_strong(event.ProjectAboutToClose, self.on_project_closing)
         event.DISPATCHER.connect_strong(event.ProjectEditionEntered, self.on_project_edition_entered)
 
+    # -- 後始末 ---------------------------------------------------------
+
+    def shutdown(self):
+        """イベント購読を解除し、タイマーを停止する。
+        connect_strong() は強参照でコールバックを保持し自動解放されない
+        ため、close_plugin() から明示的に本メソッドを呼ばないと、
+        プラグインの無効化→再有効化の際に古いエンジンのハンドラが残り、
+        イベントが多重発火する(同期処理が重複実行される)。公式サンプルに
+        倣い、接続時と同じ (event_cls, callback) の組で disconnect する。
+        """
+        pairs = [
+            (event.TextureStateEvent, self.on_texture_state),
+            (event.ProjectSaved, self.on_project_saved),
+            (event.ProjectAboutToClose, self.on_project_closing),
+            (event.ProjectEditionEntered, self.on_project_edition_entered),
+        ]
+        for evt_cls, cb in pairs:
+            try:
+                event.DISPATCHER.disconnect(evt_cls, cb)
+            except Exception as e:
+                _log("warning", "イベント購読解除に失敗しました({0}): {1}".format(
+                    getattr(evt_cls, "__name__", evt_cls), e))
+        try:
+            self.debounce_timer.stop()
+        except Exception:
+            pass
+
     # -- 設定 -----------------------------------------------------------
 
     def reload_config(self):
@@ -1065,6 +1092,13 @@ def start_plugin():
 
 def close_plugin():
     global _engine, _panel
+    # エンジンのイベント購読を先に解除してから参照を手放す。
+    # (connect_strong は自動解放されないため、明示的な解除が必須)
+    if _engine is not None:
+        try:
+            _engine.shutdown()
+        except Exception as e:
+            _log("error", "エンジンの後始末に失敗しました: {0}".format(e))
     if _panel is not None:
         ui.delete_ui_element(_panel)
         _panel = None
