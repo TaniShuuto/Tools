@@ -105,6 +105,7 @@ Substance 3D Painterから書き出したテクスチャを解析し、
 ---
 
 # Installation
+かんたんインストール方法は**Easy_Install.md**を参照してください。
 
 Substance 3D PainterとMayaでは導入方法が異なります。
 
