@@ -1,4 +1,4 @@
-# SP → Maya Live Sync かんたんインストール
+# かんたんインストール
 
 Substance Painter で塗った内容を、Maya にリアルタイム反映するツールです。
 **この手順どおりに進めれば、数分で導入できます。**
@@ -16,7 +16,7 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 - `sp_live_sync_plugin.py` … Substance Painter 本体
 - `sp_to_aiStanderdSurface.py` … aiSS（自動テクスチャ割り当て機能）本体
 
-> `install.py` と `maya_live_sync.py` は**必ず同じフォルダ**に置いてください（インストーラーが隣のファイルを探します）。
+> `install.py` と `maya_live_sync.py`  `sp_to_aistanderdsurface.py`は**必ず同じフォルダ**に置いてください（インストーラーが隣のファイルを探します）。
 
 ---
 
@@ -85,3 +85,12 @@ Height（変位）を使うと、箱などが**歪む・膨らむ・球になる
 | Maya に反映されない | Maya 側で「監視」、SP 側で「同期」の両方が開始されているか確認 |
 | 凹凸が歪む・膨らむ | 上の「Height を使うときの設定」を参照 |
 |同期されない|テクスチャをaiSSでfinalもしくはliveフォルダのテクスチャを割り当ててるか確認|
+## 同期を有効にしているのにテクスチャが反映されないときは
+
+以下の手順を行ってみてください。
+1. **Maya**を一度再起動し、AIStanderdSurfaceを`HyperShade`から全てのノードを削除する
+2. **SP**でCtrl+Sでプロジェクトを保存する
+3. **Maya**で`AiSS`を起動し`C/MayaLiveSync/Final/あなたのプロジェクト名_ハッシュ値`を指定し、スキャン/割り当てをしてください
+4. **Maya**で`LiveSyncパネル`で表示品質を切り替えてください
+
+上記の手順でもテクスチャが反映されない時はご連絡ください。
