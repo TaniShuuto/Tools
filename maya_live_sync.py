@@ -55,6 +55,67 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
       設定(ACES/カスタムOCIO等)による失敗に対して頑健にした。
     - 初回セットアップウィザード(QWizard)を追加し、監視フォルダ・
       レンダラー設定と接続テストを対話形式で行えるようにした。
+
+複数プロジェクト対応(2026.07.14):
+    - SP側がFinalを <final_export_dir>/<プロジェクト別サブフォルダ>/ に
+      書き出すようになったことに対応。_active_final_dir() を追加し、
+      reload_final_textures / _process_pending_changes / _managed_dirs /
+      detect_current_quality / switch_texture_quality の全てが
+      サブフォルダを考慮するようにした。
+    - 上記のうち switch_texture_quality と detect_current_quality は、
+      一度目の改修作業がタイムアウトで中断した際にサブフォルダ対応が
+      漏れたまま残ってしまい、「Finalへの切り替えが常に失敗する」
+      不具合として実機で確認・修正した。この種の版ズレに気付きやすく
+      するため、__version__ を追加し、import時・show_ui()実行時・
+      ウィンドウタイトルの3箇所に必ずバージョンを表示するようにした。
+      今後この関数群を変更する際は、__version__ の日付を上げること。
+
+2026.07.14-02:
+    - show_ui() を、シェルフボタンの再クリックで反応が無いように見える
+      (エラーも出ない)不具合に対応。原因は、一度ウィンドウを閉じる/
+      隠す等でworkspaceControlがvisible=Falseのまま残ると、
+      .show(dockable=True) だけではその状態から復帰しないという
+      MayaQWidgetDockableMixin側の既知の挙動だった。show_ui() 内で
+      workspaceControlの存在とvisible状態を確認し、隠れていれば
+      visible=True + restore=True で明示的に前面へ出すようにした。
+
+2026.07.14-03:
+    - Live/Preview も Final と同じくプロジェクト別サブフォルダ
+      (<watch_dir>/<active_watch_subfolder>/)へ書き出されるように
+      なったことに対応。_active_watch_dir() を新設し、start() /
+      _process_pending_changes() / reload_textures() / _managed_dirs() /
+      detect_current_quality() / switch_texture_quality() /
+      create_shader_network() の全てがアクティブサブフォルダを考慮する
+      よう修正した。project_poll_timer のコールバックも
+      _ensure_active_dirs_watched() に統合し、Live/Final両方の
+      プロジェクト切り替え追従を行うようにした。
+    - 背景: 学校の共用PC環境で、watch_dir 直下に過去の別Windowsユーザー
+      が残したファイルが混在していると、NTFSの所有権(ACL)により別
+      ユーザーからは読めず(PermissionError: [Errno 13])、プレビューへ
+      切り替えてもテクスチャが一切表示されない不具合が実機で確認された。
+      Finalは既にサブフォルダ化されていたため発生せず、Liveのみで
+      再現していた。切り替え先を常に「自分が今回新規作成したサブ
+      フォルダ」にすることで、この種の所有権衝突を回避する。
+
+2026.07.14-04:
+    - v03で active_watch_dir 追従の仕組みを入れたが、self.config が
+      LiveSyncWatcher 初期化時の1回(load_config())しか読まれず、以後
+      SP側が共有設定ファイルへ書き込む active_watch_subfolder 等の
+      更新をMaya側が一切拾えていない不具合が残っていた
+      (reload_config()というメソッド自体はあったが、定義されている
+      だけでどこからも呼ばれていなかった)。実機では、ディスク上の
+      設定ファイルには正しく "active_watch_subfolder": "TEST_d397fd"
+      等が書き込まれているのに、_active_watch_dir() がNoneを返し
+      続け、switch_texture_quality() がプレビュー切り替え先を
+      watch_dir 直下のままにしてしまう(=v03で対策したはずの所有権
+      問題が再発する)という形で発現した。
+    - _refresh_dynamic_config() を新設。SP側が随時更新する動的な値
+      (active_watch_subfolder / active_final_subfolder /
+      active_project_key / texture_set_export_prefix)だけをログ無しで
+      軽量に読み直す。3秒間隔の _ensure_active_dirs_watched() の冒頭、
+      および switch_texture_quality() / reload_textures() の冒頭
+      (ユーザー操作やイベント起点で、タイマーの次の実行を待たず
+      即座に最新値を掴む必要があるため)から呼ぶようにした。
 """
 
 import os
@@ -75,6 +136,28 @@ except ImportError:
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 
 
+# ============================================================
+#  バージョン情報
+# ============================================================
+#  複数のマシン・複数のタイミングでこのファイルを更新していると、
+#  「今Mayaで実際に動いているコードがどの版か」が分からなくなり、
+#  切り分けに時間がかかることが実際に起きた(switch_texture_qualityが
+#  複数プロジェクト対応"前"の古いロジックのまま残っていたケース)。
+#  それを即座に確認できるよう、import された時点で必ずバージョンを
+#  Script Editor に出力する。日付を上げ忘れないよう、変更のたびに
+#  ここを更新すること。
+__version__ = "2026.07.14-04"
+
+# ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
+# 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
+# であり、show_ui()側の再表示処理と、ここでの命名を一致させておく必要がある。
+WINDOW_OBJECT_NAME = "MayaLiveSyncWindow"
+WORKSPACE_CONTROL_NAME = WINDOW_OBJECT_NAME + "WorkspaceControl"
+
+print("[maya_live_sync] loaded version: {0}  (file: {1})".format(
+    __version__, os.path.abspath(__file__)))
+
+
 CONFIG_DIR = "C:/SPMayaLiveSync"
 CONFIG_PATH = os.path.join(CONFIG_DIR, "live_sync_config.json")
 
@@ -93,6 +176,17 @@ DEFAULT_CONFIG = {
     # これが分かれば、複数プロジェクトを横断して作業した場合でも
     # 別プロジェクトのテクスチャセットが一覧に混在しなくなる。
     "active_project_key": None,
+    # 複数プロジェクト対応: Finalは <final_export_dir>/<subfolder>/ に
+    # 書き出される。SP側が現在アクティブなプロジェクトのサブフォルダ名を
+    # ここに書き込むので、aiSSボタンはこれを読んで正しい取り込み先を
+    # 自動入力する。None のときは final_export_dir 直下を使う(後方互換)。
+    "active_final_subfolder": None,
+    # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): Live/Preview は
+    # <watch_dir>/<subfolder>/ に書き出される。SP側が現在アクティブな
+    # プロジェクトのサブフォルダ名をここに書き込むので、Maya側の監視・
+    # 反映処理はこれを読んで追従する。None のときは watch_dir 直下を
+    # 使う(後方互換)。
+    "active_watch_subfolder": None,
     # Phase 3: SP側が実際に書き出したファイル名のprefix
     # (テクスチャセット名 -> prefix文字列)。分かっていればこちらを
     # 最優先で使い、_safe_name() による予測はフォールバックとする。
@@ -380,6 +474,18 @@ class LiveSyncWatcher(QtCore.QObject):
         self.debounce_timer.setInterval(400)
         self.debounce_timer.timeout.connect(self._process_pending_changes)
 
+        # 複数プロジェクト対応: QFileSystemWatcherは「既に監視登録した
+        # フォルダの変化」しか通知しない。SP側でプロジェクトを切り替えて
+        # 新しい(まだ一度もWatcherに登録していない)Finalサブフォルダが
+        # 誕生した場合、directoryChangedは一切発火しないため、
+        # _process_pending_changes への動的追従だけでは間に合わない
+        # (鶏と卵の問題)。そのため、フォルダ変化とは独立に、数秒おきで
+        # 「アクティブなFinalサブフォルダがWatcher登録済みか」だけを
+        # 軽量に確認するポーリングタイマーを別途持つ。
+        self.project_poll_timer = QtCore.QTimer(self)
+        self.project_poll_timer.setInterval(3000)
+        self.project_poll_timer.timeout.connect(self._ensure_active_dirs_watched)
+
     def _emit_status(self, text):
         line = "[{0}] {1}".format(_now(), text)
         print("[LiveSync] {0}".format(text))
@@ -391,6 +497,40 @@ class LiveSyncWatcher(QtCore.QObject):
     def reload_config(self):
         self.config = load_config()
         self._emit_status("設定を再読込しました。")
+
+    def _refresh_dynamic_config(self):
+        """SP側が随時書き込む「動的な値」だけをディスクから読み直す。
+
+        経緯: reload_config() は毎回ログを出す想定のユーザー操作向け
+        メソッドで、これまでどこからも定期的に呼ばれていなかった。
+        そのため self.config は LiveSyncWatcher 初期化時の1回きり
+        (load_config())で固定され、SP側が _do_export() のたびに
+        書き込む active_watch_subfolder / active_final_subfolder /
+        active_project_key / texture_set_export_prefix が、Mayaの
+        メモリ上には一切反映されないという不具合があった。
+        実機では、共有設定ファイル(ディスク)には正しい値
+        (active_watch_subfolder="TEST_d397fd" 等)が書き込まれている
+        のに、_active_watch_dir() が古い(Noneのままの)値を返し、
+        switch_texture_quality() がプレビューの切り替え先を
+        サブフォルダではなく watch_dir 直下のままにしてしまう
+        (共有PCでの所有権問題の再発)という形で顕在化した。
+        3秒間隔の project_poll_timer から呼ばれる想定のため、
+        reload_config() と違いログは出さない(頻度が高くログが
+        埋もれてしまうため)。
+        """
+        try:
+            latest = load_config()
+        except Exception:
+            return
+        dynamic_keys = (
+            "active_watch_subfolder",
+            "active_final_subfolder",
+            "active_project_key",
+            "texture_set_export_prefix",
+        )
+        for key in dynamic_keys:
+            if key in latest:
+                self.config[key] = latest[key]
 
     def apply_and_save_config(self, new_values):
         """ユーザー操作(監視フォルダ変更等)による保存。監視の再起動を伴う。"""
@@ -411,6 +551,67 @@ class LiveSyncWatcher(QtCore.QObject):
 
     # -- 開始/停止 --------------------------------------------------------
 
+    def _ensure_active_watch_watched(self):
+        """アクティブなLive/Previewサブフォルダ(所有権問題回避のため
+        2026.07.14-02で導入)がWatcherに登録済みか確認し、未登録
+        (＝SP側でプロジェクトが切り替わり新しいサブフォルダが誕生した、
+        または初回)であればフォルダを作成して監視に加える。
+        _ensure_active_final_watched() のLive/Preview版で、同じタイマー
+        から呼ばれる。
+        """
+        if not self.enabled:
+            return
+        active_watch_dir = self._active_watch_dir()
+        if not active_watch_dir:
+            return
+        active_watch_dir = os.path.normpath(active_watch_dir)
+        if active_watch_dir in self.fs_watcher.directories():
+            return
+        try:
+            os.makedirs(active_watch_dir, exist_ok=True)
+            ok = self.fs_watcher.addPath(active_watch_dir)
+            if ok:
+                self._emit_status("プロジェクトの切り替えを検知し、監視フォルダを更新しました: {0}".format(active_watch_dir))
+        except Exception as e:
+            self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
+
+    def _ensure_active_final_watched(self):
+        """アクティブなFinalサブフォルダがWatcherに登録済みか確認し、
+        未登録(＝SP側でプロジェクトが切り替わり新しいサブフォルダが
+        誕生した、または初回)であればフォルダを作成して監視に加える。
+        3秒間隔の軽量ポーリングタイマーからのみ呼ばれる。
+        """
+        if not self.enabled:
+            return
+        active_final_dir = self._active_final_dir()
+        if not active_final_dir:
+            return
+        active_final_dir = os.path.normpath(active_final_dir)
+        if active_final_dir in self.fs_watcher.directories():
+            return
+        try:
+            os.makedirs(active_final_dir, exist_ok=True)
+            ok = self.fs_watcher.addPath(active_final_dir)
+            if ok:
+                self._emit_status("プロジェクトの切り替えを検知し、Finalフォルダの監視先を更新しました: {0}".format(active_final_dir))
+        except Exception as e:
+            self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
+
+    def _ensure_active_dirs_watched(self):
+        """Live/Preview・Final両方のアクティブサブフォルダ追従をまとめて
+        行う。project_poll_timer からはこちらを呼ぶ。
+
+        呼び出しの最初に _refresh_dynamic_config() で active_watch_
+        subfolder 等をディスクから読み直す。これを行わないと、
+        SP側が共有設定ファイルへ書き込んだ新しいサブフォルダ名を
+        Mayaのメモリ上の self.config が一切拾えず、いつまでも
+        watch_dir/final_export_dir 直下のままフォルダ追跡が止まって
+        しまう(実機で確認された不具合)。
+        """
+        self._refresh_dynamic_config()
+        self._ensure_active_watch_watched()
+        self._ensure_active_final_watched()
+
     def start(self):
         other = _check_other_session()
         if other:
@@ -428,7 +629,27 @@ class LiveSyncWatcher(QtCore.QObject):
         # Finalフォルダも監視対象に加える(表示品質をFinalにしたまま
         # SP側で保存しても自動反映されない不具合の修正。プレビュー
         # フォルダと同様、更新を検知したら再読込のトリガーにする)。
-        for d in (watch_dir, final_dir):
+        #
+        # 複数プロジェクト対応: SP側は Final を final_export_dir 直下では
+        # なく <final_export_dir>/<アクティブなサブフォルダ>/ に書き出す
+        # ため、直下だけでなくアクティブなサブフォルダも監視対象に含める。
+        # サブフォルダ自体がまだ存在しない場合(一度もFinalを書き出して
+        # いない)は作成してから監視に加える。
+        # 2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
+        # <watch_dir>/<アクティブなサブフォルダ>/ へ書き出されるように
+        # なったため、Final同様にアクティブサブフォルダも監視対象に含める。
+        watch_targets = [watch_dir, final_dir]
+        active_watch_dir = self._active_watch_dir()
+        if active_watch_dir:
+            active_watch_dir = os.path.normpath(active_watch_dir)
+            os.makedirs(active_watch_dir, exist_ok=True)
+            watch_targets.append(active_watch_dir)
+        active_final_dir = self._active_final_dir()
+        if active_final_dir:
+            active_final_dir = os.path.normpath(active_final_dir)
+            os.makedirs(active_final_dir, exist_ok=True)
+            watch_targets.append(active_final_dir)
+        for d in watch_targets:
             if d not in self.fs_watcher.directories():
                 ok = self.fs_watcher.addPath(d)
                 if not ok:
@@ -437,7 +658,7 @@ class LiveSyncWatcher(QtCore.QObject):
         _write_session_lock()
         save_config({"watch_enabled": True})
         self.config["watch_enabled"] = True
-        self._emit_status("監視を開始しました: {0}".format(watch_dir))
+        self._emit_status("監視を開始しました: {0}".format(active_watch_dir or watch_dir))
 
     def stop(self):
         for d in list(self.fs_watcher.directories()):
@@ -459,8 +680,37 @@ class LiveSyncWatcher(QtCore.QObject):
         self.debounce_timer.start()
 
     def _process_pending_changes(self):
-        watch_dir = os.path.normpath(self.config["watch_dir"])
-        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): Live/Preview
+        # も固定の watch_dir 直下ではなく、SP側のプロジェクト切り替えに
+        # 応じて変わるアクティブなサブフォルダを指す。Finalと同じ理由で、
+        # ここで最新の値を読み直し、まだ監視対象に入っていなければ
+        # 動的に追加する。
+        active_watch_dir = self._active_watch_dir()
+        watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
+            self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        if self.enabled and watch_dir not in self.fs_watcher.directories():
+            try:
+                os.makedirs(watch_dir, exist_ok=True)
+                self.fs_watcher.addPath(watch_dir)
+            except Exception as e:
+                self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
+
+        # 複数プロジェクト対応: 「Finalフォルダ」は固定の final_export_dir
+        # 直下ではなく、SP側のプロジェクト切り替えに応じて変わる
+        # アクティブなサブフォルダを指す。ここで最新の値を読み直し、
+        # まだ監視対象に入っていなければ動的に追加する
+        # (start() は監視開始時の1回しか対象を確定しないため、開始後に
+        # SP側でプロジェクトを切り替えて新しいサブフォルダができた場合、
+        # ここで追従しないと新フォルダの変更を一切検知できない)。
+        active_final_dir = self._active_final_dir()
+        final_dir = os.path.normpath(active_final_dir) if active_final_dir else os.path.normpath(
+            self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        if self.enabled and final_dir not in self.fs_watcher.directories():
+            try:
+                os.makedirs(final_dir, exist_ok=True)
+                self.fs_watcher.addPath(final_dir)
+            except Exception as e:
+                self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
 
         watch_flag = os.path.join(watch_dir, "_sync_complete.flag")
         if os.path.isfile(watch_flag):
@@ -489,7 +739,15 @@ class LiveSyncWatcher(QtCore.QObject):
     # -- 再読込処理 ---------------------------------------------------------
 
     def reload_textures(self):
-        watch_dir = os.path.normpath(self.config["watch_dir"])
+        # 単独呼び出し(手動リロード等)でも最新のサブフォルダ名を
+        # 確実に掴めるよう、念のためここでも読み直す。
+        self._refresh_dynamic_config()
+        # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): file ノードは
+        # <watch_dir>/<アクティブサブフォルダ>/ を参照しているはずなので、
+        # 判定にもそちらを使う。
+        active_watch_dir = self._active_watch_dir()
+        watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
+            self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
             self._emit_status("シーン内に file ノードが見つかりません。")
@@ -555,8 +813,14 @@ class LiveSyncWatcher(QtCore.QObject):
         往復切り替えしなくても自動的に反映されるようにするためのもの。
         呼び出し元(_process_pending_changes)でusing_final_qualityが
         True の場合のみ呼ばれる想定。
+
+        複数プロジェクト対応: 「Finalフォルダ」は final_export_dir 直下
+        ではなく、現在アクティブなプロジェクトのサブフォルダ
+        (_active_final_dir())を指す。
         """
-        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        final_dir = self._active_final_dir()
+        final_dir = os.path.normpath(final_dir) if final_dir else os.path.normpath(
+            self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
             return
@@ -642,15 +906,64 @@ class LiveSyncWatcher(QtCore.QObject):
         プレビューフォルダ・保存時の高画質Finalフォルダ)の集合を返す。
         Phase 6: 品質切り替え後もマッピング状況・孤立ノード判定が
         正しく機能するよう、両方のフォルダを対象にする。
+
+        複数プロジェクト対応: Final は <final_export_dir> 直下ではなく
+        <final_export_dir>/<active_final_subfolder>/ に書き出されるため、
+        後者も対象に含める(直下のみだと、サブフォルダを参照している
+        file ノードが「孤立ノード」や「切り替え対象」として認識されない)。
+        2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
+        <watch_dir>/<active_watch_subfolder>/ へ書き出されるようになった
+        ため、Finalと同じくアクティブサブフォルダも対象に含める。
         """
         dirs = set()
         watch_dir = self.config.get("watch_dir")
         if watch_dir:
             dirs.add(os.path.normpath(watch_dir))
+            active_watch = self._active_watch_dir()
+            if active_watch:
+                dirs.add(os.path.normpath(active_watch))
         final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
         if final_dir:
             dirs.add(os.path.normpath(final_dir))
+            active_dir = self._active_final_dir()
+            if active_dir:
+                dirs.add(os.path.normpath(active_dir))
         return dirs
+
+    def _active_watch_dir(self):
+        """現在アクティブなプロジェクトのLive(プレビュー)書き出し先の
+        実パスを返す。_active_final_dir() と対になる関数。
+
+        複数プロジェクト対応(所有権問題回避、2026.07.14-02): SP側は
+        Live/Preview も <watch_dir>/<active_watch_subfolder>/ に書き出す。
+        active_watch_subfolder が共有設定に無ければ(未対応の古いSP側や、
+        まだ一度もプレビュー書き出しをしていない場合)、後方互換として
+        watch_dir 直下を返す。
+        """
+        watch_dir = self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"]
+        if not watch_dir:
+            return None
+        subfolder = self.config.get("active_watch_subfolder")
+        if subfolder:
+            return os.path.join(watch_dir, subfolder)
+        return watch_dir
+
+    def _active_final_dir(self):
+        """現在アクティブなプロジェクトのFinal書き出し先の実パスを返す。
+
+        複数プロジェクト対応: SP側は Final を
+        <final_export_dir>/<active_final_subfolder>/ に書き出す。
+        active_final_subfolder が共有設定に無ければ(未対応の古いSP側や、
+        まだ一度もFinalを書き出していない場合)、後方互換として
+        final_export_dir 直下を返す。
+        """
+        final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
+        if not final_dir:
+            return None
+        subfolder = self.config.get("active_final_subfolder")
+        if subfolder:
+            return os.path.join(final_dir, subfolder)
+        return final_dir
 
     def is_texture_set_mapped(self, name):
         """このテクスチャセットに対応するシェーディンググループが
@@ -716,9 +1029,27 @@ class LiveSyncWatcher(QtCore.QObject):
         戻り値: Finalのみを参照していればTrue、監視フォルダのみを参照
         していればFalse、fileノードが無い/両方混在している等で判別
         できない場合はNone。
+
+        複数プロジェクト対応: Finalは final_export_dir 直下だけでなく
+        現在アクティブなプロジェクトのサブフォルダ(_active_final_dir())
+        にも書き出される。直下しか見ないと、サブフォルダを参照している
+        (=switch_texture_qualityで正しく用いた)ノードが「Finalではない」
+        と誤判定され、Maya再起動後にボタンの見た目がプレビューに戻って
+        しまう。両方を「Final」として扱う。
+        2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
+        <watch_dir>/<active_watch_subfolder>/ へ書き出されるようになった
+        ため、Watch側も直下+アクティブサブフォルダの両方を対象にする。
         """
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        active_final_dir = self._active_final_dir()
+        final_dirs = {final_dir}
+        if active_final_dir:
+            final_dirs.add(os.path.normpath(active_final_dir))
         watch_dir = os.path.normpath(self.config.get("watch_dir") or "")
+        watch_dirs = {watch_dir} if watch_dir else set()
+        active_watch_dir = self._active_watch_dir()
+        if active_watch_dir:
+            watch_dirs.add(os.path.normpath(active_watch_dir))
         found_final = False
         found_watch = False
         for node in cmds.ls(type="file") or []:
@@ -729,9 +1060,9 @@ class LiveSyncWatcher(QtCore.QObject):
             if not tex_path:
                 continue
             d = os.path.normpath(os.path.dirname(tex_path))
-            if d == final_dir:
+            if d in final_dirs:
                 found_final = True
-            elif d == watch_dir:
+            elif d in watch_dirs:
                 found_watch = True
         if found_final and not found_watch:
             return True
@@ -745,19 +1076,47 @@ class LiveSyncWatcher(QtCore.QObject):
         (prefix_suffix.ext)は共通のため、フォルダ部分だけを付け替える。
         自動切り替えは行わない(切り替わったタイミングが分かりにくく
         なることを避けるため、常にGUIのボタン操作からのみ呼び出される)。
+
+        複数プロジェクト対応: 「Final」は final_export_dir 直下ではなく
+        現在アクティブなプロジェクトのサブフォルダ(_active_final_dir())を
+        指す。旧バージョンで final_export_dir 直下に書き出されたノードや、
+        別プロジェクトのサブフォルダを参照したままのノードも、切り替え
+        対象として拾えるよう managed_dirs には両方を含める。
+        2026.07.14-02: 「プレビュー」側も同様に、固定の watch_dir 直下
+        ではなく現在アクティブなプロジェクトのサブフォルダ
+        (_active_watch_dir())を指すようにした。共有PC環境で、watch_dir
+        直下に過去の別Windowsユーザーが残したファイルが混在していると、
+        NTFSの所有権(ACL)により別ユーザーからは読めず
+        (PermissionError)、プレビューへ切り替えてもテクスチャが
+        表示されない不具合として実機で確認された。切り替え先を必ず
+        「自分が今回新規作成したサブフォルダ」にすることで、この種の
+        所有権衝突を回避する。
+
         戻り値: 実際に切り替えたノード数。
         """
+        # ユーザーがボタンを押した瞬間、直近のタイマー実行(最大3秒前)から
+        # SP側でプロジェクトが切り替わっている可能性があるため、ここでも
+        # 念のため最新のactive_watch_subfolder/active_final_subfolderを
+        # 読み直しておく(_ensure_active_dirs_watchedのタイマー任せだと
+        # 最大3秒のズレが生じうるため)。
+        self._refresh_dynamic_config()
+
         watch_dir = os.path.normpath(self.config["watch_dir"])
+        active_watch_dir = self._active_watch_dir()
+        active_watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else watch_dir
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
-        dest_dir = final_dir if use_final else watch_dir
-        managed_dirs = {watch_dir, final_dir}
+        active_final_dir = self._active_final_dir()
+        active_final_dir = os.path.normpath(active_final_dir) if active_final_dir else final_dir
+        dest_dir = active_final_dir if use_final else active_watch_dir
+        managed_dirs = {watch_dir, active_watch_dir, final_dir, active_final_dir}
 
         # Phase 6不具合修正: 以前はボタンの状態から推測した「切り替え元」
         # フォルダのノードだけを対象にしていたが、Maya再起動でボタンの
         # 見た目は初期化されてもシーン内のfileノードのパスはそのまま
         # 保存されているため、両者がズレて一切切り替えられなくなる
-        # 不具合があった。監視フォルダ・Finalフォルダのどちらを参照して
-        # いるノードも対象に含め、常に希望の状態(dest_dir)へ収束させる。
+        # 不具合があった。監視フォルダ・Finalフォルダ(直下・アクティブ
+        # サブフォルダの両方)のどれかを参照しているノードも対象に含め、
+        # 常に希望の状態(dest_dir)へ収束させる。
         nodes = []
         for node in cmds.ls(type="file") or []:
             try:
@@ -863,7 +1222,12 @@ class LiveSyncWatcher(QtCore.QObject):
                 "手動で整理してから再実行してください。".format(mat_name, sg_name)
             )
 
-        watch_dir = os.path.normpath(self.config["watch_dir"])
+        # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): 生成する
+        # file ノードは、固定の watch_dir 直下ではなく現在アクティブな
+        # プロジェクトのサブフォルダを参照するようにする。
+        active_watch_dir = self._active_watch_dir()
+        watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
+            self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
         ext = self.config.get("file_format", "png")
         raw_suffixes = set(self.config.get("raw_colorspace_suffixes", []))
 
@@ -1150,8 +1514,10 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super(LiveSyncWindow, self).__init__(parent=parent)
-        self.setObjectName("MayaLiveSyncWindow")
-        self.setWindowTitle("SP Live Sync")
+        self.setObjectName(WINDOW_OBJECT_NAME)
+        # ウィンドウタイトルにもバージョンを出し、Script Editorのログを
+        # 遡らなくても現在動作中のバージョンが一目で分かるようにする。
+        self.setWindowTitle("SP Live Sync  (v{0})".format(__version__))
 
         self.watcher = LiveSyncWatcher(self)
         self.channel_checkboxes = {}
@@ -1521,6 +1887,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
 def show_ui():
     global _window_instance
+    print("[maya_live_sync] show_ui() called - version {0}".format(__version__))
     first_creation = False
     if _window_instance is None:
         _window_instance = LiveSyncWindow()
@@ -1529,6 +1896,27 @@ def show_ui():
         _window_instance.show(dockable=True)
     except Exception:
         pass
+
+    # 2回目以降の呼び出し(≒シェルフボタンの再クリック)で、過去に
+    # ウィンドウを閉じた/隠した際にworkspaceControlがvisible=Falseの
+    # まま残ることがある。MayaQWidgetDockableMixin の .show(dockable=True)
+    # だけではこの状態から復帰しないことがあるため(Autodeskコミュニティ
+    # でも報告されている既知の挙動)、workspaceControl コマンドで
+    # 明示的に visible=True にして確実に表示させる。
+    # 実機で、Shelfボタンを押しても何も起きない(エラーも出ない)ように
+    # 見える不具合として確認された原因がこれだった。
+    try:
+        if cmds.workspaceControl(WORKSPACE_CONTROL_NAME, query=True, exists=True):
+            if not cmds.workspaceControl(WORKSPACE_CONTROL_NAME, query=True, visible=True):
+                cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, visible=True)
+                print("[maya_live_sync] workspaceControl was hidden; forced visible=True.")
+            # 最前面に持ってくる(タブの奥に隠れているだけのケースにも対応)。
+            cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, restore=True)
+        # ウィジェット自身も前面化しておく(他タブの裏に隠れているケースの保険)。
+        _window_instance.raise_()
+    except Exception as e:
+        print("[maya_live_sync] Could not force-show workspaceControl: {0}".format(e))
+
     if first_creation:
         if not _window_instance.watcher.config.get("setup_wizard_completed"):
             _window_instance.open_setup_wizard()

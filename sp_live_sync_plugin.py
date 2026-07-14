@@ -40,9 +40,41 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
       含むテクスチャセット名で発生しうる)を根本的に解消した。
     - 初回セットアップウィザード(QWizard)を追加し、他人に共有した際にも
       フォルダ設定等を対話形式で迷わず行えるようにした。
+
+複数プロジェクト対応(2026.07.14):
+    - Final書き出し先を final_export_dir 直下から
+      <final_export_dir>/<プロジェクト別サブフォルダ>/ に変更した。
+      サブフォルダ名は「ファイル名+ハッシュ6桁」の併用方式
+      (_project_subfolder_name())で、人が見て判別できることと、
+      別の場所にある同名プロジェクト同士の衝突回避を両立している。
+    - Maya側(aiSSボタン)が現在アクティブなプロジェクトのFinalフォルダを
+      自動入力できるよう、共有設定に active_final_subfolder を書き込む
+      ようにした。
+    - Maya側とバージョンがズレたまま(片方だけ更新)で運用してしまい、
+      「Finalにサブフォルダが作られない」という不具合として実機で誤認
+      されたことがあったため、SP側・Maya側の双方に __version__ を追加。
+      Substance Painterの起動時に Python ログへ必ずバージョンを出力する
+      ようにした。今後この付近を変更する際は日付を上げること。
+
+2026.07.14-02:
+    - Live/Preview も Final と同じく <watch_dir>/<プロジェクト別
+      サブフォルダ>/ へ書き出すよう変更した(_do_export の preview分岐)。
+      共有設定に active_watch_subfolder を追加し、Maya側が追従できる
+      ようにした。
+    - 背景: 学校の共用PC環境で、watch_dir 直下に過去の別Windowsユーザー
+      が残したファイルが混在していると、NTFSの所有権(ACL)により別
+      ユーザーからは読めず(PermissionError)、Maya側でプレビュー
+      テクスチャが一切表示されない不具合が実機で確認された。Finalは
+      既にプロジェクト別サブフォルダ化されていたため発生しておらず、
+      同じ方式をLiveにも適用することで解消した。
 """
 
+# バージョン情報。SP起動時に必ずPythonログへ出力し、「今動いているのが
+# どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
+__version__ = "2026.07.14-02"
+
 import os
+import re
 import json
 import time
 import shutil
@@ -94,6 +126,14 @@ DEFAULT_CONFIG = {
     # 「どのプロジェクトのテクスチャセット一覧を見ればよいか」を機械的に
     # 判別できるよう、現在アクティブなプロジェクトのキーを共有する。
     "active_project_key": None,
+    # 複数プロジェクト対応: Final は <final_export_dir>/<subfolder>/ に
+    # 書き出す。現在アクティブなプロジェクトの Final サブフォルダ名を
+    # 共有し、Maya側(aiSSボタン)が正しい取り込み先を自動入力できるようにする。
+    "active_final_subfolder": None,
+    # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): Live/Preview は
+    # <watch_dir>/<subfolder>/ に書き出す。現在アクティブなプロジェクトの
+    # 監視先サブフォルダ名を共有し、Maya側(監視処理)が追従できるようにする。
+    "active_watch_subfolder": None,
     # Phase 3: SP側が実際に書き出したファイル名のprefixを記録する。
     # Maya側はテクスチャセット名を自前で安全化(_safe_name)して予測する
     # 代わりに、この値があれば最優先で使うことで、スペースや日本語を
@@ -209,6 +249,30 @@ def _current_project_key():
     except Exception:
         path = None
     return path or "__unsaved__"
+
+
+def _project_subfolder_name():
+    """現在のプロジェクト用の Final サブフォルダ名を返す。
+
+    形式: <ファイル名(拡張子なし)>_<フルパスのハッシュ先頭6文字>
+      例: C:/work/ProjectA/proA.spp -> "proA_a1b2c3"
+
+    - ファイル名部分で人が見て判別でき、ハッシュ部分で「別の場所にある
+      同名プロジェクト」同士の衝突を防ぐ(両立方式)。
+    - 未保存プロジェクトはキーが "__unsaved__" 固定のため、フォルダ名も
+      "__unsaved__" になる(未保存同士は区別できないという既存の制限を
+      そのまま引き継ぐ)。この場合ファイル名部分は付けない。
+    - ファイル名部分は、フォルダ名として使えない文字を除去して安全化する。
+    """
+    key = _current_project_key()
+    if key == "__unsaved__":
+        return "__unsaved__"
+
+    stem = os.path.splitext(os.path.basename(key))[0]
+    # フォルダ名に使えない文字を除去(Windows/一般で不正な文字を _ に)
+    safe_stem = re.sub(r'[<>:"/\\|?*\s]', "_", stem).strip("_") or "project"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:6]
+    return "{0}_{1}".format(safe_stem, digest)
 
 
 def _duplicate_folder_warning(staging_dir, watch_dir, final_export_dir):
@@ -517,7 +581,33 @@ class LiveSyncEngine(QtCore.QObject):
 
     def _do_export(self, preview=True, dirty_stack_ids=None):
         cfg = self.config
-        dest_root = cfg["watch_dir"] if preview else cfg["final_export_dir"]
+        subfolder = _project_subfolder_name()
+        if preview:
+            # 複数プロジェクト対応(所有権問題の回避、2026.07.14-02):
+            # 当初はライブプレビューを watch_dir 直下に一律で書き出して
+            # いたが、共有PC環境では、過去に別のWindowsユーザーが
+            # watch_dir 直下に残したファイルにNTFSの所有権(ACL)が付いて
+            # おり、別ユーザーからは PermissionError で読み込めなくなる
+            # 実害が確認された。Finalと同じ「プロジェクト別サブフォルダ」
+            # 方式にすることで、常に自分が新規作成したフォルダ配下だけを
+            # 使うことになり、この種の所有権衝突が原理上起こらなくなる。
+            # 例: <watch_dir>/proA_a1b2c3/
+            dest_root = os.path.join(cfg["watch_dir"], subfolder)
+            # Maya 側(監視処理)が「現在アクティブなプロジェクトの監視先
+            # サブフォルダ」を追従できるよう、共有設定に記録する。
+            if cfg.get("active_watch_subfolder") != subfolder:
+                cfg["active_watch_subfolder"] = subfolder
+                save_config({"active_watch_subfolder": subfolder})
+        else:
+            # Final は複数プロジェクトが同じフォルダに混在・上書きするのを
+            # 防ぐため、プロジェクトごとのサブフォルダへ書き出す。
+            # 例: <final_export_dir>/proA_a1b2c3/
+            dest_root = os.path.join(cfg["final_export_dir"], subfolder)
+            # Maya 側(aiSSボタン)が「現在アクティブなプロジェクトのFinal
+            # フォルダ」を自動入力できるよう、サブフォルダ名を共有設定に記録。
+            if cfg.get("active_final_subfolder") != subfolder:
+                cfg["active_final_subfolder"] = subfolder
+                save_config({"active_final_subfolder": subfolder})
         stage_root = cfg["staging_dir"]
         os.makedirs(stage_root, exist_ok=True)
         os.makedirs(dest_root, exist_ok=True)
@@ -852,7 +942,10 @@ class LiveSyncPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.engine = engine
         self.setObjectName("SPMayaLiveSyncPanel")
-        self.setWindowTitle("Live Sync to Maya")
+        # パネルのタイトルにもバージョンを出し、ログを遡らなくても
+        # 現在動作中のバージョンが一目で分かるようにする
+        # (maya_live_sync.py のウィンドウタイトルと同じ方式)。
+        self.setWindowTitle("Live Sync to Maya  (v{0})".format(__version__))
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -1079,6 +1172,11 @@ _panel = None
 
 def start_plugin():
     global _engine, _panel
+    # SP側・Maya側でバージョンがズレたまま運用してしまい、片方だけ古い
+    # ロジックで動いていることに気付けなかった経緯があるため、起動の
+    # 最初に必ずバージョンをログへ出す(Pythonログに出力される)。
+    _log("info", "[sp_live_sync_plugin] loaded version: {0}  (file: {1})".format(
+        __version__, os.path.abspath(__file__)))
     try:
         _engine = LiveSyncEngine()
         _panel = LiveSyncPanel(_engine)
