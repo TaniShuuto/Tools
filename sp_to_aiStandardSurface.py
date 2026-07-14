@@ -182,6 +182,27 @@ def scan_prefixes(tex_dir):
 # ============================================================
 
 def _set_colorspace(node, space_key):
+    """file ノードの colorSpace を明示的に設定する。
+
+    Maya本体には、fileTextureName の設定/リロード時に
+    colorManagementFileRules(拡張子ベースのルール)を再適用し、
+    こちらが明示的に設定した colorSpace を勝手に上書きしてしまう
+    既知の挙動がある(2017年から報告されている: Autodeskコミュニティ
+    "Reload texture resetting color space attribute bug still in 2020")。
+    このプロジェクトの環境では .png 拡張子に対するルールが登録されて
+    おらず "Default" ルール(=sRGBにフォールバック)が適用されるため、
+    Height/Metallic/Normal/Roughness のような Raw であるべきチャンネル
+    まで sRGB に戻ってしまい、Arnoldでの見た目が破綻する不具合として
+    実機で確認された。
+    ignoreColorSpaceFileRules を先に True にしておくことで、この
+    自動再適用そのものを無効化し、明示的に設定した colorSpace を
+    確実に維持させる。
+    """
+    try:
+        cmds.setAttr(f"{node}.ignoreColorSpaceFileRules", True)
+    except Exception:
+        pass  # 属性が無いMayaバージョンでも致命的ではないため握りつぶす
+
     for alias in COLORSPACE_ALIASES.get(space_key, [space_key]):
         try:
             cmds.setAttr(f"{node}.colorSpace", alias, type="string")
@@ -217,7 +238,15 @@ def _connect_place2d(place_node, file_node):
 
 def _create_file_node(tex_path, space_key, place_node):
     node = cmds.shadingNode("file", asTexture=True, isColorManaged=True)
+    # 先に ignoreColorSpaceFileRules を立てて colorSpace を確定させてから
+    # fileTextureName を設定する。逆順(先にファイルパスを設定)だと、
+    # そのタイミングで colorManagementFileRules が一度 colorSpace を
+    # 決定してしまい、後から Raw に設定してもリロード等のはずみで
+    # sRGBへ再び戻ることがある(_set_colorspace のコメント参照)。
+    _set_colorspace(node, space_key)
     cmds.setAttr(f"{node}.fileTextureName", tex_path, type="string")
+    # fileTextureName 設定できっかけになる自動ルール適用に備え、直後に
+    # もう一度確定させておく(念のための保険)。
     _set_colorspace(node, space_key)
     _connect_place2d(place_node, node)
     return node
@@ -269,6 +298,53 @@ def _connect_displacement(mat, fn):
     return disp
 
 
+def _verify_and_fix_colorspaces(file_nodes):
+    """
+    生成済みの file ノード群に対し、期待される colorSpace になっているかを
+    最後にもう一度検証し、ズレていれば直す「最終防衛ライン」。
+
+    _create_file_node() 内で ignoreColorSpaceFileRules を立てた上で
+    colorSpace を設定しているため通常は不要なはずだが、Maya本体には
+    fileTextureName の設定/リロード時に colorManagementFileRules を
+    再適用し明示的に設定した colorSpace を上書きしてしまう既知の挙動が
+    ある(Autodeskコミュニティで2017年から報告)。万一それでも上書きが
+    起きた場合に備え、ファイル名から再度チャンネル種別を判定し直し、
+    実際の colorSpace が想定と異なっていれば強制的に直す。
+    """
+    fixed = []
+    for node in file_nodes:
+        try:
+            path = cmds.getAttr(f"{node}.fileTextureName")
+        except Exception:
+            continue
+        if not path:
+            continue
+        base_lower = os.path.splitext(os.path.basename(path))[0].lower()
+        tex_type, info, _pattern = _detect_texture_type(base_lower)
+        if tex_type is None:
+            continue
+        # 対象の node 自体は常に file ノード(呼び出し元でfile_like_nodesとして
+        # 絞り込み済み)。info["nodeType"] は「このチャンネルが最終的に
+        # 何のノードとしてシェーダーへ繋がるか」(aiNormalMap/
+        # displacementShader等)を表すものであり、fileノードの種別とは
+        # 別物のため、ここでは判定に使わない(以前は誤って除外条件に
+        # 使っており、Normalチャンネルが検証対象から漏れていた)。
+        expected = info["colorSpace"]
+        try:
+            current = cmds.getAttr(f"{node}.colorSpace")
+        except Exception:
+            continue
+        aliases = COLORSPACE_ALIASES.get(expected, [expected])
+        if current not in aliases:
+            _set_colorspace(node, expected)
+            fixed.append((node, current, expected))
+    if fixed:
+        print(f"[SP-to-aiSS] colorSpaceのズレを{len(fixed)}件検出し修正しました:")
+        for node, before, after in fixed:
+            print(f"    {node}: '{before}' -> '{after}'系")
+    return fixed
+
+
 def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
                                 ao_multiply=True, assign_to_selected=False):
     """
@@ -281,6 +357,12 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
 
     assigned = {}
     ao_node  = None
+    # 生成した file ノードを漏れなく記録する。assigned はチャンネルの
+    # 最終接続ノード(aiNormalMap/displacementShader等、file自体ではない
+    # 場合がある)を保持する辞書であり、そこから file ノードだけを後から
+    # 辿ることはできないため、別途ここで直接収集する
+    # (colorSpace最終検証で全チャンネルを漏れなく対象にするため)。
+    created_file_nodes = []
 
     for fpath in files:
         fname      = os.path.basename(fpath)
@@ -294,6 +376,7 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
         # --- Normal ---
         if info["nodeType"] == "aiNormalMap":
             fn = _create_file_node(fpath, "Raw", place)
+            created_file_nodes.append(fn)
             nm = cmds.shadingNode("aiNormalMap", asUtility=True)
             cmds.connectAttr(f"{fn}.outColor",  f"{nm}.input",       force=True)
             cmds.connectAttr(f"{nm}.outValue",  f"{mat}.normalCamera", force=True)
@@ -303,17 +386,20 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
         # v2.1: re-centering + conservative scale moved into a helper.
         elif info["attr"] == "__displacement__":
             fn   = _create_file_node(fpath, "Raw", place)
+            created_file_nodes.append(fn)
             disp = _connect_displacement(mat, fn)
             assigned[tex_type] = disp
 
         # --- AO ---
         elif info["attr"] == "__ao__":
             ao_node = _create_file_node(fpath, "Raw", place)
+            created_file_nodes.append(ao_node)
             assigned[tex_type] = ao_node
 
         # --- Standard ---
         else:
             fn = _create_file_node(fpath, info["colorSpace"], place)
+            created_file_nodes.append(fn)
             base_lower2 = os.path.splitext(os.path.basename(fpath))[0].lower()
             is_gloss = bool(re.search(r"gloss", base_lower2))
 
@@ -355,6 +441,11 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
             sg = cmds.listConnections(f"{mat}.outColor", d=True, type="shadingEngine")
             if sg:
                 cmds.sets(sel, edit=True, forceElement=sg[0])
+
+    # --- 最終防衛ライン: colorSpaceのズレを再検証・修正 ---
+    # created_file_nodes には生成した file ノードが Normal/Height/AO も
+    # 含めて漏れなく記録されているため、これをそのまま渡す。
+    _verify_and_fix_colorspaces(created_file_nodes)
 
     return mat
 
