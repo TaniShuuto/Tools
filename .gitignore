@@ -1,0 +1,35 @@
+# ===== IDE / Editor =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Maya =====
+*.mb.swatches
+*.ma.swatches
+fileCache/
+autosave/
+
+# ===== ローカル設定・秘匿情報 =====
+*.local
+.env
+config.local.json
+
+# ===== 一時ファイル・バックアップ =====
+*.bak
+*.tmp
+*.orig
