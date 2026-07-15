@@ -67,11 +67,21 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
       テクスチャが一切表示されない不具合が実機で確認された。Finalは
       既にプロジェクト別サブフォルダ化されていたため発生しておらず、
       同じ方式をLiveにも適用することで解消した。
+
+2026.07.15-01:
+    - texture_set_export_prefix をプロジェクトキーでネストした構造
+      (texture_set_export_prefix_by_project)に変更した。以前はテクスチャ
+      セット名だけをキーにしたフラットな辞書だったため、別プロジェクトに
+      同名のテクスチャセット(例: 複数プロジェクトで共通して使う "Body"
+      など)が存在すると、Maya側が誤ったprefixでファイル名を予測して
+      しまう可能性があった。Maya側の対応する変更と対になっている。
+    - texture_set_shading_engine_map はMaya側専用のデータ(SP側は元々
+      書き込んでいない)だったため、SP側のDEFAULT_CONFIGからは削除した。
 """
 
 # バージョン情報。SP起動時に必ずPythonログへ出力し、「今動いているのが
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
-__version__ = "2026.07.14-02"
+__version__ = "2026.07.15-01"
 
 import os
 import re
@@ -121,7 +131,11 @@ DEFAULT_CONFIG = {
     # 分けて保持する。キーはプロジェクトファイルパス(未保存の場合は
     # "__unsaved__")。
     "known_texture_sets_by_project": {},
-    "texture_set_shading_engine_map": {},
+    # 2026.07.15-01: 以前はテクスチャセット名だけをキーにしたフラットな
+    # 辞書 "texture_set_shading_engine_map" だったが、これはMaya側専用の
+    # データ(SP側は書き込まない)であるため、SP側のDEFAULT_CONFIGからは
+    # 削除した(旧キーがMaya側の設定ファイルに残っていても、Maya側の
+    # load_config()が自動移行する)。
     # Phase 3: 複数SPプロジェクトを横断して作業した場合に、Maya側が
     # 「どのプロジェクトのテクスチャセット一覧を見ればよいか」を機械的に
     # 判別できるよう、現在アクティブなプロジェクトのキーを共有する。
@@ -138,7 +152,11 @@ DEFAULT_CONFIG = {
     # Maya側はテクスチャセット名を自前で安全化(_safe_name)して予測する
     # 代わりに、この値があれば最優先で使うことで、スペースや日本語を
     # 含む名前でのズレを防ぐ。
-    "texture_set_export_prefix": {},
+    # 2026.07.15-01: known_texture_sets_by_project と同様、プロジェクト
+    # キーでネストする形式に変更した(別プロジェクトの同名テクスチャ
+    # セットでprefixを取り違える不具合の対策):
+    #   { project_key: { texture_set_name: prefix文字列 } }
+    "texture_set_export_prefix_by_project": {},
     # Phase 3: 初回セットアップウィザードを完了したかどうか。
     "setup_wizard_completed": False,
 }
@@ -503,19 +521,24 @@ class LiveSyncEngine(QtCore.QObject):
             save_partial = {"known_texture_sets_by_project": by_project}
 
             # Phase 3 最適化: 削除が確定したテクスチャセットについては、
-            # texture_set_export_prefix に残ったままだと不要なエントリが
-            # 溜まり続けるため、あわせて掃除する(実害は無いが、設定
-            # ファイルが際限なく肥大化するのを防ぐ)。
+            # texture_set_export_prefix_by_project に残ったままだと不要な
+            # エントリが溜まり続けるため、あわせて掃除する(実害は無いが、
+            # 設定ファイルが際限なく肥大化するのを防ぐ)。
+            # 2026.07.15-01: プロジェクトキーでネストした構造に変更した
+            # ため、対象は by_project[key] のみに限定する(他プロジェクトの
+            # 同名エントリを誤って消さないため)。
             if confirmed_removed:
-                prefix_map = dict(self.config.get("texture_set_export_prefix", {}))
+                prefix_by_project = dict(self.config.get("texture_set_export_prefix_by_project", {}))
+                prefix_map = dict(prefix_by_project.get(key, {}))
                 removed_any_prefix = False
                 for name in confirmed_removed:
                     if name in prefix_map:
                         del prefix_map[name]
                         removed_any_prefix = True
                 if removed_any_prefix:
-                    self.config["texture_set_export_prefix"] = prefix_map
-                    save_partial["texture_set_export_prefix"] = prefix_map
+                    prefix_by_project[key] = prefix_map
+                    self.config["texture_set_export_prefix_by_project"] = prefix_by_project
+                    save_partial["texture_set_export_prefix_by_project"] = prefix_by_project
 
             save_config(save_partial)
             for name in confirmed_removed:
@@ -660,11 +683,18 @@ class LiveSyncEngine(QtCore.QObject):
                                 break
 
             if export_prefix_updates:
-                current_map = dict(self.config.get("texture_set_export_prefix", {}))
+                # 2026.07.15-01: 別プロジェクトの同名テクスチャセットに
+                # prefixを取り違えて上書きしないよう、プロジェクトキーで
+                # ネストした構造(texture_set_export_prefix_by_project)に
+                # 保存する。
+                project_key = _current_project_key()
+                prefix_by_project = dict(self.config.get("texture_set_export_prefix_by_project", {}))
+                current_map = dict(prefix_by_project.get(project_key, {}))
                 if any(current_map.get(k) != v for k, v in export_prefix_updates.items()):
                     current_map.update(export_prefix_updates)
-                    self.config["texture_set_export_prefix"] = current_map
-                    save_config({"texture_set_export_prefix": current_map})
+                    prefix_by_project[project_key] = current_map
+                    self.config["texture_set_export_prefix_by_project"] = prefix_by_project
+                    save_config({"texture_set_export_prefix_by_project": prefix_by_project})
 
             if preview:
                 if moved_any:

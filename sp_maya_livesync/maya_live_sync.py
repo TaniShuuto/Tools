@@ -121,10 +121,13 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 import os
 import re
 import json
+import time
 import datetime
+import subprocess
 
 import maya.cmds as cmds
 import maya.OpenMayaUI as omui
+import maya.OpenMaya as om
 
 try:
     from PySide2 import QtCore, QtWidgets
@@ -146,7 +149,122 @@ from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 #  それを即座に確認できるよう、import された時点で必ずバージョンを
 #  Script Editor に出力する。日付を上げ忘れないよう、変更のたびに
 #  ここを更新すること。
-__version__ = "2026.07.14-04"
+#
+#  2026.07.15-01 変更点(まとめて実施):
+#    1. セッションロックの残骸対策: プロセス生存確認(Windows: tasklist)
+#       と経過時間フォールバックを追加。Maya終了時(kMayaExiting)に自分の
+#       ロックを確実に解除するようにし、UIから手動で無視/削除もできる
+#       ようにした。
+#    2. Mayaシーン切り替え検知: MSceneMessage の kAfterOpen/kAfterNew に
+#       コールバックを追加し、シーンが切り替わったら監視を自動停止する
+#       ようにした(切り替え前のシーンを追い続ける不具合の対策)。
+#    3. texture_set_export_prefix / texture_set_shading_engine_map を
+#       known_texture_sets_by_project と同様、SPプロジェクトキーで
+#       分離したネスト構造に変更(同名テクスチャセットが別プロジェクトに
+#       存在する場合の誤判定・誤上書きを防ぐ)。旧形式(フラット辞書)の
+#       設定ファイルは初回読み込み時に自動移行する。
+#    4. Mayaシーン ⇔ SPプロジェクトの紐付けを追加。シーンファイルの
+#       fileInfo に紐付け先のSPプロジェクトキーを保存し、シーンを開く
+#       たびにその紐付けを見て自動的に対応プロジェクトを判定できる
+#       ようにした。
+#    5. known_texture_sets_by_project を _refresh_dynamic_config() の
+#       対象に追加し、3秒ポーリングでテクスチャセット一覧・マテリアル
+#       構造タブが自動更新されるようにした。
+#    6. 同期タブ最上部に状態バーを新設(シーン⇔SPプロジェクト対応表示、
+#       他セッション警告、一覧の最終更新時刻)。
+#
+#  2026.07.15-02 緊急修正:
+#    project_poll_timer が生成・シグナル接続はされているのに、どこからも
+#    start() されておらず一度もタイムアウトが発火しない不具合があった
+#    (2026.07.15-01より前から存在した既存バグ)。この結果、上記2〜5が
+#    依存する _refresh_dynamic_config() の定期実行が行われず、実質的に
+#    機能していなかった。具体的には以下の症状として実機で確認された:
+#      - SP側でプロジェクトを切り替えても状態バーの「シーン⇔SP
+#        プロジェクト」表示が古いまま追従しない
+#      - 同名テクスチャセットが別プロジェクトに存在する場合、
+#        active_project_key が古いままシェーダー割当マップを参照して
+#        しまい、意図しない(別プロジェクトの)マテリアルが誤って
+#        「対応済み」と判定され、そちらが適用されてしまうことがあった
+#    watcher.start() で project_poll_timer.start()、watcher.stop() で
+#    project_poll_timer.stop() するよう修正した。
+#
+#  2026.07.15-03 緊急修正:
+#    reload_textures() / reload_final_textures() が「fileノードが今まさに
+#    現在のアクティブサブフォルダを完全一致で参照しているか」でしか
+#    対象を判定しておらず、以下の手順で自動反映が効かなくなる不具合が
+#    あった:
+#      1. シェーダー生成時点のSPプロジェクト向けサブフォルダを参照する
+#         fileノードが作られる
+#      2. SP側で別プロジェクトに切り替わり、アクティブなサブフォルダが
+#         変わる
+#      3. 古いサブフォルダを参照したままのfileノードは、以後
+#         「今のwatch_dir/final_dirと不一致」として永久にスキップされ、
+#         SP側が更新しても自動反映されなくなる
+#    switch_texture_quality()ボタンを押すと直るように見えていたのは、
+#    あちらが古いサブフォルダも含めて対象を拾い、パスを強制的に現在の
+#    サブフォルダへ書き換える実装だったため(副作用的に直っていた)。
+#    reload_textures() / reload_final_textures() 側にも、watch_dir /
+#    final_export_dir 直下にある「現在アクティブではないサブフォルダ」を
+#    検出し、該当ノードのパスを現在のサブフォルダへ補正してから再読込する
+#    処理を追加した。
+#
+#  2026.07.15-04 安全性の見直し(全体の再監査で発見):
+#    上記2026.07.15-03の補正ロジックは、当初 watch_dir/final_export_dir
+#    直下の「現在アクティブでない全サブフォルダ」を無差別に補正対象と
+#    していた。これだと、同一シーン内に(過去の作業等で)別の無関係な
+#    プロジェクト向けのfileノードが混在していた場合、そちらのパスまで
+#    誤って現在のプロジェクトのサブフォルダへ書き換えてしまう危険が
+#    あった。
+#    対策として、_ensure_active_watch_watched() / _ensure_active_
+#    final_watched() が「サブフォルダが切り替わる直前に自分が監視して
+#    いたサブフォルダ」を記録するようにし(_last_active_watch_dir /
+#    _last_active_final_dir)、reload_textures() 側の補正対象はこの
+#    「直前の自分自身のサブフォルダ」1つだけに限定するよう変更した。
+#    これにより、他プロジェクトのサブフォルダを誤って巻き込むことなく、
+#    2026.07.15-03が解決した「プロジェクト切り替え直後の取りこぼし」
+#    問題だけを安全に救済する。
+#
+#  2026.07.15-05 緊急修正(2件):
+#    1. 状態バーの「シーン⇔SPプロジェクト」表示で、SP側が未起動/
+#       未検出(active_project_keyがNone)の場合でも「一致している」と
+#       誤判定して緑色表示になってしまうバグを修正した。SP未起動は
+#       一致/不一致とは別の、独立した灰色表示に変更した。
+#    2. reload_textures()/reload_final_textures() の古いサブフォルダ
+#       補正(2026.07.15-03で追加、07.15-04で「直前の1つに限定」と
+#       安全性を見直したもの)が、sp_to_aiStandardSurface.py(aiSS)
+#       経由で生成されたfileノードを救済できていなかった。aiSSは
+#       シェルフボタンを押した瞬間のFinalフォルダパスを一度だけ
+#       自動入力する設計のため、その後SP側でプロジェクトが切り替わると
+#       古いプロジェクトのフォルダを参照するノードが生成されてしまう。
+#       これは本ウォッチャーの _last_active_watch_dir/
+#       _last_active_final_dir(自分が監視した直前のフォルダのみを記録)
+#       の追跡対象外だったため、07.15-04時点では補正できなかった。
+#       対策として、補正対象を watch_dir/final_export_dir 直下の
+#       「現在アクティブでない全サブフォルダ」に戻しつつ、新設した
+#       _matches_known_texture_set_prefix() で「ファイル名が現在の
+#       プロジェクトの既知テクスチャセットのprefixと一致するか」を
+#       確認してから補正するようにした。ディレクトリの一致ではなく
+#       ファイル名で安全性を担保するため、無関係な他プロジェクトの
+#       サブフォルダを誤って巻き込む心配がない。
+#
+#  2026.07.15-06 緊急修正:
+#    _last_flag_mtime_watch / _last_flag_mtime_final(SP側の書き出し
+#    完了フラグ _sync_complete.flag のmtimeを見て、新しい変更が
+#    あったかを判定する比較値)が、「どのフォルダを最後に見たか」を
+#    区別しない単一のグローバル値だった。SP側でプロジェクトを
+#    切り替えて watch_dir/final_dir の実体(アクティブサブフォルダ)が
+#    変わっても、この比較値はリセットされないままだったため、
+#    新しいプロジェクトの完了フラグの方が(ファイルとしては新しくても)
+#    mtime自体は前のプロジェクトで記録した値より小さいことがあり、
+#    「まだ古い」と誤判定されて自動反映(reload_textures/
+#    reload_final_textures)が一切トリガーされない不具合があった。
+#    この状態は表示品質を手動で切り替えることでしか解消されず、
+#    「一度直ってもすぐ手動操作頼みに戻る」という体感の不具合として
+#    現れていた。
+#    対策として、_process_pending_changes() で監視中のフォルダ自体が
+#    変わったことを検知したら、対応するmtime比較値を0にリセットする
+#    ようにした。
+__version__ = "2026.07.15-06"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -171,7 +289,16 @@ DEFAULT_CONFIG = {
     "file_format": "png",
     "raw_colorspace_suffixes": ["Roughness", "Metallic", "Normal", "Height", "AO"],
     "known_texture_sets_by_project": {},
-    "texture_set_shading_engine_map": {},
+    # 2026.07.15-01: 以前はテクスチャセット名をキーにしたフラットな
+    # 辞書だったため、別プロジェクトに同名のテクスチャセット(例:
+    # "Body")が存在すると、シェーダーの割当状況を誤判定したり、
+    # 書き出しファイル名のprefixを取り違えたりする不具合があった。
+    # known_texture_sets_by_project と同様、SPプロジェクトキーで
+    # 一段ネストする形式に変更した:
+    #   { project_key: { texture_set_name: shading_engine_name } }
+    # 旧形式(フラット辞書)の設定ファイルは load_config() が自動的に
+    # この新形式へ移行する(_migrate_legacy_flat_maps 参照)。
+    "texture_set_shading_engine_map_by_project": {},
     # Phase 3: SP側が「今開いているプロジェクト」を書き込むキー。
     # これが分かれば、複数プロジェクトを横断して作業した場合でも
     # 別プロジェクトのテクスチャセットが一覧に混在しなくなる。
@@ -190,11 +317,21 @@ DEFAULT_CONFIG = {
     # Phase 3: SP側が実際に書き出したファイル名のprefix
     # (テクスチャセット名 -> prefix文字列)。分かっていればこちらを
     # 最優先で使い、_safe_name() による予測はフォールバックとする。
-    "texture_set_export_prefix": {},
+    # 2026.07.15-01: shading_engine_map と同じ理由でプロジェクトキー
+    # ごとにネストする形式へ変更(旧キー "texture_set_export_prefix" は
+    # 後方互換のため残しつつ、読み込み時に自動移行する):
+    #   { project_key: { texture_set_name: prefix文字列 } }
+    "texture_set_export_prefix_by_project": {},
     "setup_wizard_completed": False,
     # Phase 5: 前回終了時の監視ON/OFF状態を覚えておき、次回起動時に
     # 自動的に復元する(毎回手動でONを押す手間を無くすため)。
     "watch_enabled": False,
+    # 2026.07.15-01: このMayaシーンファイルが、どのSPプロジェクトに
+    # 対応するかは本来シーンファイル自体(fileInfo)に保存するが、
+    # 未保存シーンではfileInfoを永続化できないため、直近のセッション
+    # 内での紐付けをここにも保持しておく(セッション内フォールバック用)。
+    # 恒久的な紐付けは常にシーンファイル側(fileInfo)を正とする。
+    "last_scene_project_links": {},
 }
 
 # Phase 3: file ノードのcolorSpaceに設定する値の候補。カラーマネジメント
@@ -261,11 +398,33 @@ def _append_history(source, text):
 SESSION_LOCK_PATH = os.path.join(CONFIG_DIR, "maya_session.lock")
 
 
+#  2026.07.15-01: 以前はロックファイルの削除が「監視ボタンを手動でOFFに
+#  した時」にしか行われず、Mayaを閉じる/クラッシュする/シーンを切り替える
+#  (次項の自動監視停止を参照)といったケースでロックが残り続け、次回以降の
+#  セッション開始のたびに「他のセッションが監視中」という警告が実際には
+#  誰も監視していないのに毎回出続ける不具合があった。
+#  対策として (1) Maya終了時(kMayaExiting)にも解除を試みる、
+#  (2) 起動時に前回分の生存確認を行う、(3) 生存確認できない場合は経過時間
+#  で古いロックとみなす、(4) それでも誤検知した場合にユーザーがUIから
+#  手動で無視/削除できるようにする、の4段構えとした。
+
+# 生存確認が(何らかの理由で)行えない場合に「古いロック」とみなすまでの
+# 経過時間。通常Mayaのセッションがこれより長時間放置されたまま
+# 監視だけ有効、というのは考えにくいため、十分安全側の値としている。
+_STALE_LOCK_SECONDS = 12 * 60 * 60  # 12時間
+
+
 def _write_session_lock():
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(SESSION_LOCK_PATH, "w", encoding="utf-8") as f:
-            json.dump({"pid": os.getpid(), "started_at": _now()}, f)
+            json.dump({
+                "pid": os.getpid(),
+                "started_at": _now(),
+                # 経過時間の判定にはエポック秒が必要(_now()は時刻のみで
+                # 日付情報を持たないため、日をまたぐと比較できない)。
+                "started_at_epoch": time.time(),
+            }, f)
     except Exception:
         pass
 
@@ -281,10 +440,59 @@ def _clear_session_lock_if_own():
         pass
 
 
+def _force_clear_session_lock():
+    """所有プロセスに関わらずロックファイルを削除する。UIの
+    「このロックを無視して削除」ボタンから呼ばれる、ユーザーの
+    明示的な操作専用。誤って自分の有効なロックまで消してしまう
+    ケースはUI側で「他プロセスの警告が出ている時だけボタンを表示する」
+    ことで避けている。
+    """
+    try:
+        if os.path.isfile(SESSION_LOCK_PATH):
+            os.remove(SESSION_LOCK_PATH)
+        return True
+    except Exception:
+        return False
+
+
+def _pid_is_alive(pid):
+    """Windows環境でpidが実在するプロセスかどうかを軽量に確認する。
+    tasklistコマンドの出力にpidが含まれるかで判定する(psutil等の
+    追加依存を避けるため)。判定できない場合はNoneを返し、呼び出し側で
+    経過時間ベースのフォールバックに任せる。
+    """
+    if os.name != "nt":
+        # Mac/Linuxでの利用は現状想定していないが、念のためpsコマンドで
+        # 簡易確認する(無ければ例外でNoneにフォールバック)。
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid)], capture_output=True, text=True, timeout=3)
+            return str(pid) in result.stdout
+        except Exception:
+            return None
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "PID eq {0}".format(pid), "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        return str(pid) in result.stdout
+    except Exception:
+        return None
+
+
 def _check_other_session():
     """他のMayaプロセスが既に監視中とみられる場合、その情報を返す。
-    プロセスが実際に生きているかまでは確認しない軽量な実装であり、
-    誤検知があっても単なる通知であって動作をブロックすることはない。
+
+    2026.07.15-01: 以前はpidが自分と違うというだけで無条件に警告して
+    いたが、Mayaの異常終了等でロックが残り続けるケースが多く、実際には
+    誰も監視していないのに毎回警告が出る問題があった。
+    そのため (1) tasklistでpidの生存確認を試み、生きていなければ
+    残骸と判断してロックを削除しNoneを返す、 (2) 生存確認自体が
+    失敗した場合は started_at_epoch からの経過時間で古いロックとみなす、
+    という2段階のフィルタを追加した。それでも誤検知した場合のために
+    戻り値には "stale_guess"(生存確認できず経過時間でも判定できない、
+    最終的にユーザー判断に委ねるべきケース)を含めている。
     """
     try:
         if not os.path.isfile(SESSION_LOCK_PATH):
@@ -293,6 +501,23 @@ def _check_other_session():
             data = json.load(f)
         if data.get("pid") == os.getpid():
             return None
+
+        alive = _pid_is_alive(data.get("pid"))
+        if alive is False:
+            # 生存確認が取れて、かつ実在しない -> 確実に残骸。
+            # 次回以降も同じ警告を出し続けないよう、この場で削除する。
+            _force_clear_session_lock()
+            return None
+
+        started_epoch = data.get("started_at_epoch")
+        if alive is None and started_epoch is not None:
+            age = time.time() - started_epoch
+            if age > _STALE_LOCK_SECONDS:
+                # 生存確認はできなかったが、十分に古いので残骸とみなす。
+                _force_clear_session_lock()
+                return None
+
+        data["stale_guess"] = (alive is None)
         return data
     except Exception:
         return None
@@ -373,12 +598,94 @@ def register_user_setup(auto_open=False):
 
 
 
+def _migrate_legacy_flat_maps(cfg):
+    """2026.07.15-01より前の設定ファイルは texture_set_export_prefix /
+    texture_set_shading_engine_map がプロジェクトキーで分離されて
+    いない、テクスチャセット名だけをキーにしたフラットな辞書だった。
+
+    このままだと別プロジェクトの同名テクスチャセット同士が値を
+    上書きし合ってしまう(例: BoxプロジェクトとCubeプロジェクトの両方に
+    "Body" という名前のテクスチャセットがある場合)。
+
+    移行方針: 旧フラット辞書に記録されていた内容は「どのプロジェクトの
+    ものか分からない」ため、安全側に倒して active_project_key (無ければ
+    known_texture_sets_by_project 内で該当テクスチャセット名を含む
+    最初のプロジェクト)に割り当てる。判別できないキーは移行せずに
+    捨てる(誤って別プロジェクトに紐付くよりは、生成し直してもらう方が
+    安全なため)。
+
+    この関数は破壊的に cfg を書き換えず、移行後のcfgを新たに返す。
+    移行が発生した場合は cfg["_migrated_legacy_maps"] = True を立てる
+    (呼び出し側が保存要否を判断できるようにするための内部マーカー)。
+    """
+    legacy_prefix = cfg.get("texture_set_export_prefix")
+    legacy_sg = cfg.get("texture_set_shading_engine_map")
+    has_legacy = bool(legacy_prefix) or bool(legacy_sg)
+    if not has_legacy:
+        return cfg
+
+    by_project = cfg.get("known_texture_sets_by_project", {})
+
+    def _guess_project_key(name):
+        active_key = cfg.get("active_project_key")
+        if active_key and name in by_project.get(active_key, []):
+            return active_key
+        for key, names in by_project.items():
+            if name in names:
+                return key
+        # プロジェクトが特定できない場合は active_project_key があれば
+        # そこへ、無ければ移行を諦める(None を返す)。
+        return active_key
+
+    prefix_by_project = dict(cfg.get("texture_set_export_prefix_by_project", {}))
+    if legacy_prefix:
+        for name, prefix in legacy_prefix.items():
+            key = _guess_project_key(name)
+            if not key:
+                continue
+            prefix_by_project.setdefault(key, {})
+            prefix_by_project[key][name] = prefix
+        cfg["texture_set_export_prefix_by_project"] = prefix_by_project
+
+    sg_by_project = dict(cfg.get("texture_set_shading_engine_map_by_project", {}))
+    if legacy_sg:
+        for name, sg in legacy_sg.items():
+            key = _guess_project_key(name)
+            if not key:
+                continue
+            sg_by_project.setdefault(key, {})
+            sg_by_project[key][name] = sg
+        cfg["texture_set_shading_engine_map_by_project"] = sg_by_project
+
+    # 旧キーは移行後に空へリセットしておく(次回以降は新形式のみを
+    # 正として扱うため。SP側/古いMaya側が万一まだ旧キーへ書き込んで
+    # いても、次のload_config()で改めて拾われる)。
+    cfg["texture_set_export_prefix"] = {}
+    cfg["texture_set_shading_engine_map"] = {}
+    cfg["_migrated_legacy_maps"] = True
+    return cfg
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         cfg = dict(DEFAULT_CONFIG)
         cfg.update(loaded)
+        cfg = _migrate_legacy_flat_maps(cfg)
+        if cfg.pop("_migrated_legacy_maps", False):
+            # 移行結果をディスクへ書き戻す(次回以降は移行処理をスキップ
+            # できるようにするため)。保存に失敗しても致命的ではないので
+            # 例外は握りつぶす。
+            try:
+                save_config({
+                    "texture_set_export_prefix_by_project": cfg["texture_set_export_prefix_by_project"],
+                    "texture_set_shading_engine_map_by_project": cfg["texture_set_shading_engine_map_by_project"],
+                    "texture_set_export_prefix": {},
+                    "texture_set_shading_engine_map": {},
+                })
+            except Exception:
+                pass
         return cfg
     except Exception:
         return dict(DEFAULT_CONFIG)
@@ -428,15 +735,127 @@ def _active_texture_sets(cfg):
     return _all_known_texture_sets(cfg)
 
 
-def _export_prefix(cfg, texture_set_name):
+# ---------------------------------------------------------------------------
+# 2026.07.15-01: Mayaシーン ⇔ SPプロジェクトの紐付け
+# ---------------------------------------------------------------------------
+#
+# 背景: これまでMaya側は「SP側が今どのプロジェクトを開いているか
+# (active_project_key)」だけを見ており、「今Mayaで開いているシーンが
+# そもそもどのSPプロジェクトと対応するべきか」という期待値を一切
+# 持っていなかった。そのため、Box.maを開いたままSP側でCube.sppに
+# 切り替えても、Maya側はそれに気づかずBoxの監視設定のままCubeの
+# テクスチャを反映しようとする、といった事故が起こり得た。
+#
+# 対策として、Mayaシーンファイル自体(cmds.fileInfo、シーン保存時に
+# 一緒に保存される永続的なキー値ストア)に、対応するSPプロジェクトキー
+# (_current_project_key() 相当、SP側の .spp フルパス)を記録する。
+# シーンファイル側に持たせることで、別PCで同じシーンを開いても
+# 対応関係が失われない(共有設定ファイルだけに持たせると、PCを
+# 変えた時点で情報が失われてしまうため)。
+#
+# 未保存シーンはfileInfoを永続化できないため、その場合のみ
+# DEFAULT_CONFIG["last_scene_project_links"](共有設定ファイル側、
+# セッション内フォールバック)を使う。この場合は「未保存の間だけ」
+# 有効で、保存すれば自動的にfileInfo側へ引き継がれる。
+
+_SCENE_LINK_FILEINFO_KEY = "sp_live_sync_project_key"
+
+
+def _get_current_scene_project_link():
+    """現在Mayaで開いているシーンに紐付けられたSPプロジェクトキーを
+    返す。紐付けが無ければNone。
+    """
+    try:
+        scene_path = cmds.file(query=True, sceneName=True)
+    except Exception:
+        scene_path = ""
+
+    if scene_path:
+        try:
+            info = cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, query=True)
+        except Exception:
+            info = None
+        if info:
+            # cmds.fileInfoは値をリストで返す。保存時にエスケープされる
+            # 特殊文字(タブ等)を元に戻す。
+            value = info[0]
+            try:
+                value = value.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+            return value or None
+        return None
+
+    # 未保存シーン: セッション内フォールバックを見る。シーンを一意に
+    # 識別できないため、"__unsaved__" 固定のキーで代用する(SP側の
+    # _current_project_key() が未保存プロジェクトを区別できないのと
+    # 同じ既知の制限)。
+    cfg = load_config()
+    links = cfg.get("last_scene_project_links", {})
+    return links.get("__unsaved__")
+
+
+def _set_current_scene_project_link(sp_project_key):
+    """現在Mayaで開いているシーンに、対応するSPプロジェクトキーを
+    紐付けて保存する。保存済みシーンならfileInfo(次回保存時に
+    シーンファイルへ永続化される)、未保存シーンなら共有設定ファイルの
+    last_scene_project_links に一時的に記録する。
+    """
+    try:
+        scene_path = cmds.file(query=True, sceneName=True)
+    except Exception:
+        scene_path = ""
+
+    if scene_path:
+        try:
+            cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, sp_project_key or "")
+            return True
+        except Exception:
+            return False
+
+    cfg = load_config()
+    links = dict(cfg.get("last_scene_project_links", {}))
+    links["__unsaved__"] = sp_project_key
+    save_config({"last_scene_project_links": links})
+    return True
+
+
+def _scene_display_name():
+    """状態バー表示用の、今開いているシーンの短い名前を返す。"""
+    try:
+        scene_path = cmds.file(query=True, sceneName=True)
+    except Exception:
+        scene_path = ""
+    if not scene_path:
+        return "(未保存のシーン)"
+    return os.path.basename(scene_path)
+
+
+def _project_display_name(project_key):
+    """状態バー表示用の、SPプロジェクトキーの短い名前を返す。"""
+    if not project_key:
+        return None
+    if project_key == "__unsaved__":
+        return "(未保存のSPプロジェクト)"
+    return os.path.basename(project_key)
+
+
+def _export_prefix(cfg, texture_set_name, project_key=None):
     """テクスチャセット名から、実際のエクスポートファイル名のprefixを
     求める。SP側が実際に書き出した結果から記録したprefix
-    (texture_set_export_prefix)が分かっていればそれを最優先で使い、
-    まだ一度もエクスポートされていない場合のみ _safe_name() による
+    (texture_set_export_prefix_by_project)が分かっていればそれを最優先で
+    使い、まだ一度もエクスポートされていない場合のみ _safe_name() による
     予測値にフォールバックする(スペースや日本語を含む名前でのズレを
     防ぐため)。
+
+    2026.07.15-01: プロジェクトキーごとに分離した構造に変更した。
+    project_key を省略した場合は cfg["active_project_key"] を使う。
+    別プロジェクトに同名のテクスチャセットが存在しても、prefixを
+    取り違えないようにするための変更。
     """
-    prefix_map = cfg.get("texture_set_export_prefix", {})
+    key = project_key if project_key is not None else cfg.get("active_project_key")
+    by_project = cfg.get("texture_set_export_prefix_by_project", {})
+    prefix_map = by_project.get(key, {}) if key else {}
     return prefix_map.get(texture_set_name) or _safe_name(texture_set_name)
 
 
@@ -448,13 +867,45 @@ class LiveSyncWatcher(QtCore.QObject):
 
     status_changed = QtCore.Signal(str)
     stats_changed = QtCore.Signal(dict)
+    # 2026.07.15-01: 状態バー用に新設したシグナル群。
+    # other_session_changed: dict(他セッション情報) または None
+    other_session_changed = QtCore.Signal(object)
+    # scene_link_changed: 現在のシーン⇔SPプロジェクトの紐付け状態が
+    # 変わった(シーン切替・紐付け設定・SP側プロジェクト切替を含む)
+    scene_link_changed = QtCore.Signal()
+    # structure_changed: known_texture_sets_by_project 等、一覧表示に
+    # 関わる動的設定がディスク上で更新された(3秒ポーリングで検知)
+    structure_changed = QtCore.Signal()
 
     def __init__(self, parent=None):
         super(LiveSyncWatcher, self).__init__(parent)
         self.config = load_config()
         self.enabled = False
+        self.other_session_info = None
+        # 2026.07.15-01: シーン切り替えを検知して監視を自動停止した場合に
+        # 立てるフラグ。ユーザーが手動でOFFにした場合と区別することで、
+        # UI側で「シーンが切り替わったため自動停止しました」という
+        # 案内を出し分けられるようにする。
+        self._auto_stopped_by_scene_change = False
+        self._last_known_texture_sets_snapshot = None
         self._last_flag_mtime_watch = 0.0
         self._last_flag_mtime_final = 0.0
+        # 2026.07.15-06: _last_flag_mtime_watch/_final は元々「どの
+        # フォルダを最後に見たか」を区別しない単一のグローバル比較値
+        # だったため、SP側のプロジェクト切り替えでフォルダ自体が変わる
+        # と、フラグの新旧判定を誤ることがあった。フォルダが変わったこと
+        # 自体を検知してmtime比較値をリセットできるよう、直近チェックした
+        # フォルダパスを記録しておく(詳細は _process_pending_changes()
+        # 参照)。
+        self._last_watch_dir_for_flag = None
+        self._last_final_dir_for_flag = None
+        # 2026.07.15-04: reload_textures()/reload_final_textures() の
+        # 古いサブフォルダ補正を、無関係な他プロジェクトのサブフォルダ
+        # まで巻き込まないよう「直前に自分が監視していたサブフォルダ」
+        # だけに限定するための記録(詳細は _ensure_active_watch_watched()
+        # 参照)。
+        self._last_active_watch_dir = None
+        self._last_active_final_dir = None
         # Phase 6: 現在file ノードがプレビュー(監視フォルダ)と高画質版
         # (Finalフォルダ)のどちらを参照しているか。自動切り替えは行わず、
         # switch_texture_quality() の明示的な呼び出しでのみ変化する。
@@ -517,20 +968,55 @@ class LiveSyncWatcher(QtCore.QObject):
         3秒間隔の project_poll_timer から呼ばれる想定のため、
         reload_config() と違いログは出さない(頻度が高くログが
         埋もれてしまうため)。
+
+        2026.07.15-01追加:
+          - known_texture_sets_by_project / texture_set_export_prefix_by_project /
+            texture_set_shading_engine_map_by_project も対象に追加した。
+            以前はこれらがdynamic_keysに含まれておらず、SP側で新しい
+            テクスチャセットが検出されてもMaya側UIが手動更新するまで
+            反映されなかった(マテリアル構造タブが古いまま、という
+            体感の分かりにくさにつながっていた)。
+          - active_project_key の変化を検知したら scene_link_changed
+            シグナルを発火し、状態バーの「シーン⇔SPプロジェクト」表示を
+            即座に更新できるようにした。
+          - known_texture_sets_by_project の中身が変化したら
+            structure_changed シグナルを発火し、UIの一覧テーブルと
+            最終更新時刻を自動的に更新できるようにした。
         """
         try:
             latest = load_config()
         except Exception:
             return
+
+        prev_active_project_key = self.config.get("active_project_key")
+        prev_texture_sets = self.config.get("known_texture_sets_by_project")
+
         dynamic_keys = (
             "active_watch_subfolder",
             "active_final_subfolder",
             "active_project_key",
-            "texture_set_export_prefix",
+            "texture_set_export_prefix_by_project",
+            "texture_set_shading_engine_map_by_project",
+            "known_texture_sets_by_project",
         )
         for key in dynamic_keys:
             if key in latest:
                 self.config[key] = latest[key]
+
+        if self.config.get("active_project_key") != prev_active_project_key:
+            self.scene_link_changed.emit()
+
+        if self.config.get("known_texture_sets_by_project") != prev_texture_sets:
+            self.structure_changed.emit()
+
+        # 他セッションの状態も定期的に再確認する(残骸ロックが後から
+        # 実プロセス終了で解消されたケースなどをUIに反映するため)。
+        current_other = _check_other_session()
+        prev_other_pid = (self.other_session_info or {}).get("pid") if self.other_session_info else None
+        current_other_pid = (current_other or {}).get("pid") if current_other else None
+        if current_other_pid != prev_other_pid:
+            self.other_session_info = current_other
+            self.other_session_changed.emit(current_other)
 
     def apply_and_save_config(self, new_values):
         """ユーザー操作(監視フォルダ変更等)による保存。監視の再起動を伴う。"""
@@ -548,6 +1034,28 @@ class LiveSyncWatcher(QtCore.QObject):
         """
         self.config.update(new_values)
         save_config(new_values)
+
+    def save_shading_engine_mapping(self, texture_set_name, shading_engine_name, project_key=None):
+        """2026.07.15-01: テクスチャセット名 -> シェーディングエンジン名の
+        対応を、現在アクティブなSPプロジェクトにスコープして保存する。
+        別プロジェクトの同名テクスチャセットを誤って上書きしないよう、
+        texture_set_shading_engine_map_by_project[project_key] にのみ
+        書き込む。project_key が特定できない(未保存プロジェクト等)場合は
+        何もしない(誤った紐付けを残すよりは記録しない方が安全)。
+        """
+        key = project_key if project_key is not None else self.config.get("active_project_key")
+        if not key:
+            self._emit_status(
+                "警告: SPプロジェクトが未特定のため、'{0}' のシェーダー割当を"
+                "記録できませんでした(次回SP側のプロジェクト情報が"
+                "共有されると再検出されます)。".format(texture_set_name)
+            )
+            return
+        by_project = dict(self.config.get("texture_set_shading_engine_map_by_project", {}))
+        project_map = dict(by_project.get(key, {}))
+        project_map[texture_set_name] = shading_engine_name
+        by_project[key] = project_map
+        self.save_mapping_only({"texture_set_shading_engine_map_by_project": by_project})
 
     # -- 開始/停止 --------------------------------------------------------
 
@@ -567,6 +1075,16 @@ class LiveSyncWatcher(QtCore.QObject):
         active_watch_dir = os.path.normpath(active_watch_dir)
         if active_watch_dir in self.fs_watcher.directories():
             return
+        # 2026.07.15-04: サブフォルダが切り替わった瞬間の「直前の
+        # アクティブサブフォルダ」を記録しておく。reload_textures() が
+        # 「古いサブフォルダを参照したまま取り残されたノード」を補正する
+        # 際、watch_dir 直下の全サブフォルダ(＝他の無関係なプロジェクトの
+        # ものも含む)を対象にすると誤爆の危険があるため、対象は
+        # この「直前に自分が監視していたサブフォルダ」だけに限定する。
+        prev_dirs = [d for d in self.fs_watcher.directories()
+                     if os.path.dirname(d) == os.path.normpath(self.config.get("watch_dir") or "")]
+        if prev_dirs:
+            self._last_active_watch_dir = prev_dirs[0]
         try:
             os.makedirs(active_watch_dir, exist_ok=True)
             ok = self.fs_watcher.addPath(active_watch_dir)
@@ -589,6 +1107,13 @@ class LiveSyncWatcher(QtCore.QObject):
         active_final_dir = os.path.normpath(active_final_dir)
         if active_final_dir in self.fs_watcher.directories():
             return
+        # 2026.07.15-04: reload_final_textures() の古いサブフォルダ補正が
+        # 対象を絞り込めるよう、直前のアクティブFinalサブフォルダを
+        # 記録しておく(詳細は _ensure_active_watch_watched() 参照)。
+        prev_dirs = [d for d in self.fs_watcher.directories()
+                     if os.path.dirname(d) == os.path.normpath(self.config.get("final_export_dir") or "")]
+        if prev_dirs:
+            self._last_active_final_dir = prev_dirs[0]
         try:
             os.makedirs(active_final_dir, exist_ok=True)
             ok = self.fs_watcher.addPath(active_final_dir)
@@ -607,19 +1132,44 @@ class LiveSyncWatcher(QtCore.QObject):
         Mayaのメモリ上の self.config が一切拾えず、いつまでも
         watch_dir/final_export_dir 直下のままフォルダ追跡が止まって
         しまう(実機で確認された不具合)。
+
+        2026.07.15-01: このシーンに紐付けられたSPプロジェクトと、SP側が
+        今実際に開いているプロジェクトが食い違っている場合は、監視を
+        安全のため自動停止する。これは「Box.maを開いたままSP側で
+        Cube.sppを開いてしまう」といった事故的な組み合わせのまま
+        テクスチャが誤反映される/シェーダーが誤って「対応済み」と
+        判定されるのを防ぐための、最終防御ライン。
         """
         self._refresh_dynamic_config()
+
+        if self.enabled:
+            linked_key = _get_current_scene_project_link()
+            active_key = self.config.get("active_project_key")
+            if linked_key and active_key and linked_key != active_key:
+                self.stop(reason="scene_change")
+                self._emit_status(
+                    "警告: このシーンの対応先SPプロジェクトと、SP側が今開いている"
+                    "プロジェクトが異なるため、事故防止のため監視を自動停止しました。"
+                    "SP側で正しいプロジェクトを開くか、状態バーから紐付けを"
+                    "設定し直してください。"
+                )
+                return
+
         self._ensure_active_watch_watched()
         self._ensure_active_final_watched()
 
     def start(self):
         other = _check_other_session()
+        self.other_session_info = other
+        self.other_session_changed.emit(other)
         if other:
+            confidence = "(生存確認できず、経過時間からの推定です)" if other.get("stale_guess") else ""
             self._emit_status(
                 "警告: 他のMayaセッション(PID {0}, 開始 {1})も同時に監視している"
-                "可能性があります。二重に同じフォルダを監視すると反映処理が"
-                "重複するだけで実害はありませんが、念のためご確認ください。".format(
-                    other.get("pid"), other.get("started_at")
+                "可能性があります{2}。二重に同じフォルダを監視すると反映処理が"
+                "重複するだけで実害はありませんが、身に覚えが無ければ状態バーの"
+                "「無視して削除」から消せます。".format(
+                    other.get("pid"), other.get("started_at"), confidence
                 )
             )
         watch_dir = os.path.normpath(self.config["watch_dir"])
@@ -658,17 +1208,48 @@ class LiveSyncWatcher(QtCore.QObject):
         _write_session_lock()
         save_config({"watch_enabled": True})
         self.config["watch_enabled"] = True
+        # 2026.07.15-02(緊急修正): project_poll_timer がどこからも
+        # start() されておらず、生成・シグナル接続はされているのに
+        # 一度もタイムアウトが発火しない不具合があった。これにより
+        # _ensure_active_dirs_watched() ひいては _refresh_dynamic_config()
+        # が定期実行されず、以下の症状が実機で確認された:
+        #   - SP側で active_project_key が切り替わっても状態バーの
+        #     「シーン⇔SPプロジェクト」表示が追従しない
+        #   - シーン紐付け不一致時の自動停止(安全装置)が効かない
+        #   - 同名テクスチャセットの新規検出がUIの一覧に反映されない
+        # 監視ONの間だけ動けばよいポーリングのため、start()で起動し
+        # stop()で停止する。
+        self.project_poll_timer.start()
         self._emit_status("監視を開始しました: {0}".format(active_watch_dir or watch_dir))
 
-    def stop(self):
+    def stop(self, reason="manual"):
+        """監視を停止する。
+
+        reason:
+            "manual"       - ユーザーがOFFボタンを押した(従来通り)。
+            "scene_change" - 2026.07.15-01で追加。Mayaのシーンが
+                              切り替わったことを検知しての自動停止。
+                              この場合はセッションロックを解除しない
+                              (Mayaプロセス自体は生きており、別の
+                              シーンで改めて監視を始める可能性が
+                              あるため)。
+        """
         for d in list(self.fs_watcher.directories()):
             self.fs_watcher.removePath(d)
         self.debounce_timer.stop()
+        self.project_poll_timer.stop()
         self.enabled = False
-        _clear_session_lock_if_own()
+        if reason == "manual":
+            _clear_session_lock_if_own()
+            self._emit_status("監視を停止しました。")
+        else:
+            self._auto_stopped_by_scene_change = True
+            self._emit_status(
+                "Mayaのシーンが切り替わったため、監視を自動的に停止しました。"
+                "このシーンに対応するSPプロジェクトを設定すると、再開できます。"
+            )
         save_config({"watch_enabled": False})
         self.config["watch_enabled"] = False
-        self._emit_status("監視を停止しました。")
 
     # -- イベントハンドラ ---------------------------------------------------
 
@@ -712,6 +1293,29 @@ class LiveSyncWatcher(QtCore.QObject):
             except Exception as e:
                 self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
 
+        # 2026.07.15-06(緊急修正): _last_flag_mtime_watch/_final は
+        # 「どのフォルダの完了フラグを最後に見たか」を区別しない、
+        # 単一のグローバルなmtime比較値だった。SP側でプロジェクトが
+        # 切り替わって watch_dir/final_dir(実体はサブフォルダ)が
+        # 変わっても、この比較値はリセットされないため、以下の不具合が
+        # あった:
+        #   - 前のプロジェクトで記録したmtimeの方が新しい値だった場合、
+        #     新しいプロジェクトの完了フラグの方が(ファイルとしては
+        #     新しく作られていても)mtime自体は小さいことがあり、
+        #     「まだ古い」と誤判定されて自動反映が一切トリガーされない
+        #   - この状態は表示品質を手動で切り替える(switch_texture_
+        #     quality)ことでしか解消されず、「一度直ってもすぐ手動
+        #     操作頼みに戻る」という体感の不具合として現れていた
+        # 対策として、監視中のフォルダ自体が変わったことを検知したら、
+        # 対応するmtime比較値を0にリセットし、新しいフォルダの完了
+        # フラグを確実に「新しい」と判定できるようにした。
+        if watch_dir != self._last_watch_dir_for_flag:
+            self._last_watch_dir_for_flag = watch_dir
+            self._last_flag_mtime_watch = 0.0
+        if final_dir != self._last_final_dir_for_flag:
+            self._last_final_dir_for_flag = final_dir
+            self._last_flag_mtime_final = 0.0
+
         watch_flag = os.path.join(watch_dir, "_sync_complete.flag")
         if os.path.isfile(watch_flag):
             try:
@@ -748,6 +1352,58 @@ class LiveSyncWatcher(QtCore.QObject):
         active_watch_dir = self._active_watch_dir()
         watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
             self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        watch_root = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+
+        # 2026.07.15-03(緊急修正): 以前は「fileノードが今まさに現在の
+        # watch_dir を参照しているか」の完全一致でしか対象を拾えず、
+        # 以下の手順で自動反映が効かなくなる不具合があった。
+        #   1. シェーダー生成時点のSPプロジェクト(例: Box)向けの
+        #      サブフォルダを参照するfileノードが作られる
+        #   2. SP側で別プロジェクト(例: Cube)に切り替わり、
+        #      active_watch_subfolder がCube用に変わる
+        #   3. Box用のfileノードは古いサブフォルダを参照したままなので
+        #      tex_dir(Box用) != watch_dir(Cube用) となり、以後
+        #      一切自動反映されなくなる(SP側が更新しても永久にスキップ)
+        # switch_texture_quality() ボタンを押すと直ることがあったのは、
+        # あちらは managed_dirs(旧watch_dir/Final含む全関連フォルダ)を
+        # 対象に含めた上で、パスを強制的に現在のdest_dirへ書き換える
+        # 実装だったため。reload_textures() 側にも同様に
+        # 「古いプロジェクト別サブフォルダを参照しているノードを検出し、
+        # 現在のサブフォルダへパスを補正してから再読込する」処理を
+        # 追加した。
+        #
+        # 2026.07.15-04(安全性の見直し): 当初は watch_dir 直下の
+        # 「現在アクティブでない全サブフォルダ」を補正対象にしていたが、
+        # これだと同一シーン内に(過去の作業等で)別の無関係なプロジェクト
+        # 向けのfileノードが混在していた場合、そちらのパスまで誤って
+        # 現在のプロジェクトのサブフォルダへ書き換えてしまう危険が
+        # あったため、対象を「直前に自分が監視していたサブフォルダ」
+        # 1つに限定した。
+        #
+        # 2026.07.15-05(再修正): しかし直前1つへの限定では、
+        # sp_to_aiStandardSurface.py(aiSS)経由で生成されたfileノードの
+        # ように、そもそも本ウォッチャーの監視追従(_last_active_watch_dir)
+        # の対象外で作られたノードの古いパスを救済できない不具合が残って
+        # いた。aiSSはシェルフボタンを押した瞬間の active_watch_subfolder
+        # を一度だけフォルダ欄に自動入力する設計のため、ボタンを押した後に
+        # SP側でプロジェクトを切り替えると、古いプロジェクト向けの
+        # フォルダを参照するノードが生成されてしまう。
+        # 対策として、対象を watch_dir 直下の「現在アクティブでない
+        # 全サブフォルダ」に戻しつつ、_matches_known_texture_set_prefix()
+        # で「本当に現在のプロジェクトが書き出したファイル名か」を
+        # 確認してから補正するようにした。ディレクトリの一致ではなく
+        # ファイル名のprefixで安全性を担保するため、無関係な他
+        # プロジェクトのサブフォルダを巻き込む心配がない。
+        stale_subfolder_dirs = set()
+        try:
+            if os.path.isdir(watch_root):
+                for entry in os.listdir(watch_root):
+                    candidate = os.path.normpath(os.path.join(watch_root, entry))
+                    if os.path.isdir(candidate) and candidate != watch_dir:
+                        stale_subfolder_dirs.add(candidate)
+        except OSError:
+            pass
+
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
             self._emit_status("シーン内に file ノードが見つかりません。")
@@ -764,6 +1420,7 @@ class LiveSyncWatcher(QtCore.QObject):
         # 壊さないようにするため、決め打ちのTrueには戻さない)。
         prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
+        corrected = []
         try:
             for node in file_nodes:
                 try:
@@ -773,7 +1430,20 @@ class LiveSyncWatcher(QtCore.QObject):
                 if not tex_path:
                     continue
                 tex_dir = os.path.normpath(os.path.dirname(tex_path))
-                if tex_dir != watch_dir:
+                if tex_dir == watch_dir:
+                    pass  # 既に最新のサブフォルダを参照している通常ケース
+                elif tex_dir in stale_subfolder_dirs and self._matches_known_texture_set_prefix(
+                        os.path.basename(tex_path)):
+                    # 古いプロジェクト用サブフォルダを参照したまま取り残
+                    # されたノード。ファイル名が現在のプロジェクトの
+                    # 既知テクスチャセットのprefixと一致することを確認
+                    # した上で(2026.07.15-05: 無関係な他プロジェクトを
+                    # 誤補正しないための安全確認)、現在のサブフォルダへ
+                    # パスを補正する。
+                    new_path = os.path.join(watch_dir, os.path.basename(tex_path))
+                    tex_path = new_path
+                    corrected.append(node)
+                else:
                     continue
                 try:
                     # AEfileTextureReloadCmd (MEL) はアトリビュートエディタが
@@ -789,6 +1459,12 @@ class LiveSyncWatcher(QtCore.QObject):
                     reloaded.append(node)
                 except Exception as e:
                     self._emit_status("再読込に失敗: {0} ({1})".format(node, e))
+
+            if corrected:
+                self._emit_status(
+                    "{0} 個のノードが古いプロジェクト用フォルダを参照していたため、"
+                    "現在のフォルダへ参照先を補正しました。".format(len(corrected))
+                )
 
             if reloaded:
                 self._flush_renderer_caches()
@@ -817,10 +1493,40 @@ class LiveSyncWatcher(QtCore.QObject):
         複数プロジェクト対応: 「Finalフォルダ」は final_export_dir 直下
         ではなく、現在アクティブなプロジェクトのサブフォルダ
         (_active_final_dir())を指す。
+
+        2026.07.15-03(緊急修正): reload_textures() と同じ理由で、
+        シェーダー生成時点の古いプロジェクト別サブフォルダを参照した
+        ままのノードが自動反映から漏れる不具合があったため、同様に
+        古いサブフォルダを検出してパスを補正する処理を追加した。
+
+        2026.07.15-04(安全性の見直し): reload_textures() と同じ理由で、
+        補正対象は「直前に自分が監視していたFinalサブフォルダ」1つに
+        限定していた。
+
+        2026.07.15-05(再修正): sp_to_aiStandardSurface.py(aiSS)経由で
+        生成されたfileノードは本ウォッチャーの監視追従の対象外で
+        作られるため、直前1つへの限定では救済できない不具合が残って
+        いた。reload_textures() と同様、対象を final_export_dir 直下の
+        「現在アクティブでない全サブフォルダ」に戻しつつ、
+        _matches_known_texture_set_prefix() でファイル名の安全確認を
+        行うことで、無関係な他プロジェクトを巻き込まずに救済範囲を
+        広げた(詳細は reload_textures() のコメント参照)。
         """
         final_dir = self._active_final_dir()
         final_dir = os.path.normpath(final_dir) if final_dir else os.path.normpath(
             self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        final_root = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+
+        stale_subfolder_dirs = set()
+        try:
+            if os.path.isdir(final_root):
+                for entry in os.listdir(final_root):
+                    candidate = os.path.normpath(os.path.join(final_root, entry))
+                    if os.path.isdir(candidate) and candidate != final_dir:
+                        stale_subfolder_dirs.add(candidate)
+        except OSError:
+            pass
+
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
             return
@@ -830,6 +1536,7 @@ class LiveSyncWatcher(QtCore.QObject):
         # 保存してから復帰させる(詳細は reload_textures() のコメント参照)。
         prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
+        corrected = []
         try:
             for node in file_nodes:
                 try:
@@ -839,7 +1546,18 @@ class LiveSyncWatcher(QtCore.QObject):
                 if not tex_path:
                     continue
                 tex_dir = os.path.normpath(os.path.dirname(tex_path))
-                if tex_dir != final_dir:
+                if tex_dir == final_dir:
+                    pass
+                elif tex_dir in stale_subfolder_dirs and self._matches_known_texture_set_prefix(
+                        os.path.basename(tex_path)):
+                    # 2026.07.15-05: ファイル名が現在のプロジェクトの
+                    # 既知テクスチャセットのprefixと一致することを
+                    # 確認した上で補正する(無関係な他プロジェクトを
+                    # 誤補正しないための安全確認)。
+                    new_path = os.path.join(final_dir, os.path.basename(tex_path))
+                    tex_path = new_path
+                    corrected.append(node)
+                else:
                     continue
                 try:
                     cmds.setAttr(node + ".fileTextureName", "", type="string")
@@ -847,6 +1565,12 @@ class LiveSyncWatcher(QtCore.QObject):
                     reloaded.append(node)
                 except Exception as e:
                     self._emit_status("再読込に失敗: {0} ({1})".format(node, e))
+
+            if corrected:
+                self._emit_status(
+                    "{0} 個のノードが古いプロジェクト用Finalフォルダを参照していたため、"
+                    "現在のフォルダへ参照先を補正しました。".format(len(corrected))
+                )
 
             if reloaded:
                 self._flush_renderer_caches()
@@ -890,16 +1614,59 @@ class LiveSyncWatcher(QtCore.QObject):
         """マテリアル構造タブに表示する「今どのプロジェクトの一覧を
         見ているか」の説明文を返す。SP側が未対応(active_project_keyが
         無い)場合はその旨を明示し、誤解を防ぐ。
+
+        2026.07.15-01: このシーンに紐付けられたSPプロジェクトと、
+        SP側が今実際に開いているプロジェクトが食い違っている場合は
+        その旨も明示する(状態バー上部の表示と合わせて、一覧が
+        「別プロジェクトのものかもしれない」と気づけるようにするため)。
         """
         by_project = self.config.get("known_texture_sets_by_project", {})
         active_key = self.config.get("active_project_key")
+        linked_key = _get_current_scene_project_link()
+
         if active_key and active_key in by_project:
             name = os.path.basename(active_key) if active_key != "__unsaved__" else "(未保存のプロジェクト)"
-            return "現在のSPプロジェクト: {0}".format(name)
+            label = "現在のSPプロジェクト: {0}".format(name)
+            if linked_key and linked_key != active_key:
+                label += "  ※このシーンの紐付け先とは異なります"
+            return label
         return "SP側のプロジェクト情報が未取得のため、記録済み全プロジェクト分を表示中"
 
-    def get_shading_engine_map(self):
-        return dict(self.config.get("texture_set_shading_engine_map", {}))
+    def get_shading_engine_map(self, project_key=None):
+        """現在アクティブなSPプロジェクトに対応するシェーダー割当マップを
+        返す。2026.07.15-01: 別プロジェクトの同名テクスチャセットと
+        混同しないよう、プロジェクトキーでスコープする。project_key を
+        省略した場合は self.config["active_project_key"] を使う。
+        紐付けが無い(未対応の古いSP側、または未保存プロジェクト)場合は
+        空の辞書を返す(従来の「全部混ぜて返す」フォールバックは、
+        誤って別プロジェクトのシェーダーを「対応済み」と誤判定する
+        危険の方が大きいため、あえて行わない)。
+        """
+        key = project_key if project_key is not None else self.config.get("active_project_key")
+        if not key:
+            return {}
+        by_project = self.config.get("texture_set_shading_engine_map_by_project", {})
+        return dict(by_project.get(key, {}))
+
+    def _matches_known_texture_set_prefix(self, filename):
+        """ファイル名が、現在アクティブなSPプロジェクトの既知テクスチャ
+        セットのいずれかのprefixと一致するかを確認する。
+
+        2026.07.15-05: reload_textures()/reload_final_textures() の
+        古いサブフォルダ補正を、無関係な他プロジェクトを巻き込まずに
+        より広い範囲(sp_to_aiStandardSurface.py 経由で生成され、
+        _last_active_watch_dir/_last_active_final_dir の追跡対象外に
+        あるノードも含む)に安全に適用できるようにするための判定。
+        ディレクトリの一致ではなくファイル名のprefixで判定するため、
+        「本当にこのプロジェクトが書き出したファイルか」をより確実に
+        確認できる。
+        """
+        known = self.get_known_texture_sets()
+        for name in known:
+            prefix = _export_prefix(self.config, name) + "_"
+            if filename.startswith(prefix):
+                return True
+        return False
 
     def _managed_dirs(self):
         """ライブ同期パイプラインが把握しているフォルダ(監視用の
@@ -969,6 +1736,11 @@ class LiveSyncWatcher(QtCore.QObject):
         """このテクスチャセットに対応するシェーディンググループが
         シーン内に既に存在するかどうかを判定する(副作用として監視を
         再起動しない: Phase 2最適化で save_mapping_only() に変更済み)。
+
+        2026.07.15-01: get_shading_engine_map() が現在アクティブな
+        SPプロジェクトにスコープされたため、別プロジェクトの同名
+        テクスチャセット(例: 別プロジェクトの "Body")に割り当てられた
+        シェーダーを誤って「対応済み」と判定することが無くなった。
         """
         mapping = self.get_shading_engine_map()
         sg_name = mapping.get(name)
@@ -990,8 +1762,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 sgs = cmds.listConnections(node, type="shadingEngine") or []
                 found_sg = sgs[0] if sgs else None
                 if found_sg:
-                    mapping[name] = found_sg
-                    self.save_mapping_only({"texture_set_shading_engine_map": mapping})
+                    self.save_shading_engine_mapping(name, found_sg)
                 return True, found_sg
         return False, None
 
@@ -1347,9 +2118,7 @@ class LiveSyncWatcher(QtCore.QObject):
                     pass
             raise
 
-        mapping = self.get_shading_engine_map()
-        mapping[texture_set_name] = sg
-        self.save_mapping_only({"texture_set_shading_engine_map": mapping})
+        self.save_shading_engine_mapping(texture_set_name, sg)
 
         self._emit_status(
             "'{0}' 用のシェーダーを生成しました({1})。"
@@ -1530,6 +2299,54 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         sync_tab = QtWidgets.QWidget()
         tabs.addTab(sync_tab, "同期")
         layout = QtWidgets.QVBoxLayout(sync_tab)
+
+        # 2026.07.15-01: 状態バー。よく使う/よく確認する情報を
+        # ウィンドウを開いて最初に目に入る最上部にまとめて常設する。
+        # 「誰でも分かりやすく、よく使う設定はクリックしやすい位置に」
+        # という方針に沿って、これらは全て operate ボタン(監視ON/OFF)
+        # より上に配置している。
+        status_bar_group = QtWidgets.QGroupBox("状態")
+        status_bar_layout = QtWidgets.QVBoxLayout(status_bar_group)
+        status_bar_layout.setSpacing(4)
+
+        # 行1: シーン ⇔ SPプロジェクトの対応表示 + 設定ボタン
+        scene_link_row = QtWidgets.QHBoxLayout()
+        self.scene_link_label = QtWidgets.QLabel("(確認中...)")
+        self.scene_link_label.setWordWrap(True)
+        self.scene_link_btn = QtWidgets.QPushButton("SPプロジェクトを設定")
+        self.scene_link_btn.setToolTip(
+            "今SPで開いているプロジェクトを、このMayaシーンの対応先として"
+            "登録します。\n登録しておくと、次回このシーンを開いた時に"
+            "自動的に同じSPプロジェクトを追跡できます。"
+        )
+        self.scene_link_btn.clicked.connect(self._on_link_scene_to_sp_project)
+        scene_link_row.addWidget(self.scene_link_label, stretch=1)
+        scene_link_row.addWidget(self.scene_link_btn)
+        status_bar_layout.addLayout(scene_link_row)
+
+        # 行2: 他セッション警告(通常は非表示、検出時のみ出す)
+        other_session_row = QtWidgets.QHBoxLayout()
+        self.other_session_label = QtWidgets.QLabel("")
+        self.other_session_label.setStyleSheet("color: #c9822a;")
+        self.other_session_label.setWordWrap(True)
+        self.other_session_clear_btn = QtWidgets.QPushButton("無視して削除")
+        self.other_session_clear_btn.setToolTip(
+            "身に覚えのないセッション警告が出続ける場合、記録されている"
+            "ロック情報を削除します。監視中の実害はありません。"
+        )
+        self.other_session_clear_btn.clicked.connect(self._on_clear_other_session)
+        other_session_row.addWidget(self.other_session_label, stretch=1)
+        other_session_row.addWidget(self.other_session_clear_btn)
+        status_bar_layout.addLayout(other_session_row)
+        self.other_session_label.setVisible(False)
+        self.other_session_clear_btn.setVisible(False)
+
+        # 行3: テクスチャセット一覧の最終更新時刻
+        self.last_structure_update_label = QtWidgets.QLabel("一覧の最終更新: -")
+        self.last_structure_update_label.setStyleSheet("color: #888888; font-size: 10px;")
+        status_bar_layout.addWidget(self.last_structure_update_label)
+
+        layout.addWidget(status_bar_group)
 
         self.enable_btn = QtWidgets.QPushButton("監視（自動反映）: OFF")
         self.enable_btn.setCheckable(True)
@@ -1724,13 +2541,32 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         self.watcher.status_changed.connect(self.log_view.appendPlainText)
         self.watcher.stats_changed.connect(self._on_stats_changed)
+        self.watcher.other_session_changed.connect(self._on_other_session_changed)
+        self.watcher.scene_link_changed.connect(self._refresh_scene_link_label)
+        self.watcher.structure_changed.connect(self._on_structure_changed)
 
         self._refresh_material_table()
+        self._refresh_scene_link_label()
+        self._on_other_session_changed(_check_other_session())
+
+        # 2026.07.15-01: Mayaのシーンが切り替わった(New Scene / Open Scene)
+        # ことを検知するコールバックを登録する。以前はこれが存在せず、
+        # シーンを切り替えても直前のシーン向けの監視が動き続け、今開いて
+        # いるシーンのfileノードを無差別に上書きしようとする不具合が
+        # あった。ウィンドウが閉じられてインスタンスが破棄される際に
+        # 確実に解除できるよう、コールバックIDをインスタンスに保持する。
+        self._scene_callback_ids = [
+            om.MSceneMessage.addCallback(om.MSceneMessage.kAfterOpen, self._on_scene_changed),
+            om.MSceneMessage.addCallback(om.MSceneMessage.kAfterNew, self._on_scene_changed),
+        ]
 
         # Phase 5: 前回終了時に監視がONだった場合は自動的に再開する
         # (毎回手動でONを押す手間を無くすため)。setChecked(True)が
         # _on_toggle経由でwatcher.start()を呼ぶ。
-        if self.watcher.config.get("watch_enabled"):
+        # 2026.07.15-01: ただし、このシーンに紐付いたSPプロジェクトが
+        # 無い場合は自動再開しない(前のシーン向けの設定のまま監視を
+        # 始めてしまう事故を防ぐため)。
+        if self.watcher.config.get("watch_enabled") and _get_current_scene_project_link() is not None:
             self.enable_btn.setChecked(True)
 
     def _load_values_from_config(self):
@@ -1751,7 +2587,165 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         if checked:
             self.watcher.start()
         else:
-            self.watcher.stop()
+            self.watcher.stop(reason="manual")
+
+    # -- 2026.07.15-01: 状態バー関連 -------------------------------------
+
+    def _refresh_scene_link_label(self):
+        """状態バー上部の「シーン ⇔ SPプロジェクト」表示を更新する。
+
+        2026.07.15-05(緊急修正): active_key(SP側が今開いているプロジェクト)
+        が None の場合(SPが未起動、またはプロジェクトを何も開いていない)
+        でも、`if active_key and active_key != linked_key` という判定が
+        False になるため else節(緑=正常)に落ちてしまい、「SP未起動なのに
+        正常」と誤表示するバグがあった。SP未起動と「紐付け先と一致」は
+        明確に区別し、SP未起動の場合は独立した表示にする。
+        """
+        scene_name = _scene_display_name()
+        linked_key = _get_current_scene_project_link()
+        active_key = self.watcher.config.get("active_project_key")
+
+        if linked_key is None:
+            self.scene_link_label.setText(
+                "このシーン「{0}」のSPプロジェクトは未設定です。".format(scene_name)
+            )
+            self.scene_link_label.setStyleSheet("color: #c9822a;")
+            self.scene_link_btn.setText("SPプロジェクトを設定")
+            self.scene_link_btn.setEnabled(True)
+            return
+
+        linked_name = _project_display_name(linked_key)
+
+        if not active_key:
+            # SP側が起動していない、またはプロジェクトを何も開いていない。
+            # 紐付け自体は設定済みなので、それを踏まえた文言にする
+            # (緑=正常でも赤=不一致でもない、独立した状態)。
+            self.scene_link_label.setText(
+                "このシーン「{0}」の対応先は {1} です(SP側は現在未起動/"
+                "未検出のため一致確認はできません)。".format(scene_name, linked_name)
+            )
+            self.scene_link_label.setStyleSheet("color: #888888;")
+            self.scene_link_btn.setText("SPプロジェクトを設定し直す")
+            self.scene_link_btn.setEnabled(True)
+            return
+
+        if active_key != linked_key:
+            # SP側は今、紐付け先とは別のプロジェクトを開いている。
+            active_name = _project_display_name(active_key)
+            self.scene_link_label.setText(
+                "「{0}」の対応先は {1} ですが、SP側は今 {2} を開いています。".format(
+                    scene_name, linked_name, active_name
+                )
+            )
+            self.scene_link_label.setStyleSheet("color: #c94a2a; font-weight: bold;")
+        else:
+            self.scene_link_label.setText(
+                "このシーン「{0}」 ⇔ SPプロジェクト「{1}」".format(scene_name, linked_name)
+            )
+            self.scene_link_label.setStyleSheet("color: #2a9c4a;")
+        self.scene_link_btn.setText("SPプロジェクトを設定し直す")
+        self.scene_link_btn.setEnabled(True)
+
+    def _on_link_scene_to_sp_project(self):
+        """「SPプロジェクトを設定」ボタン: SP側が今開いているプロジェクトを
+        ワンクリックで現在のMayaシーンに紐付ける。
+        """
+        active_key = self.watcher.config.get("active_project_key")
+        if not active_key:
+            QtWidgets.QMessageBox.information(
+                self, "Live Sync",
+                "SP側で今開いているプロジェクトが確認できません。\n"
+                "Substance Painterでプロジェクトを開いてから、もう一度お試しください。"
+            )
+            return
+        active_name = _project_display_name(active_key)
+        scene_name = _scene_display_name()
+        reply = QtWidgets.QMessageBox.question(
+            self, "Live Sync",
+            "このシーン「{0}」の対応先として\nSPプロジェクト「{1}」を設定します。"
+            "よろしいですか？".format(scene_name, active_name),
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        ok = _set_current_scene_project_link(active_key)
+        if ok:
+            self.watcher._emit_status(
+                "シーン「{0}」をSPプロジェクト「{1}」に紐付けました。".format(scene_name, active_name)
+            )
+        else:
+            self.watcher._emit_status("紐付けの保存に失敗しました。")
+        self._refresh_scene_link_label()
+
+    def _on_other_session_changed(self, other):
+        """他セッション警告の表示/非表示を切り替える。"""
+        if other:
+            confidence = "(推定)" if other.get("stale_guess") else ""
+            self.other_session_label.setText(
+                "他のMayaセッション(PID {0}){1}が同時に監視している可能性があります。"
+                "実害はありませんが、身に覚えが無ければ削除できます。".format(
+                    other.get("pid"), confidence
+                )
+            )
+            self.other_session_label.setVisible(True)
+            self.other_session_clear_btn.setVisible(True)
+        else:
+            self.other_session_label.setVisible(False)
+            self.other_session_clear_btn.setVisible(False)
+
+    def _on_clear_other_session(self):
+        _force_clear_session_lock()
+        self.watcher.other_session_info = None
+        self._on_other_session_changed(None)
+        self.watcher._emit_status("他セッションのロック情報を削除しました。")
+
+    def _on_structure_changed(self):
+        """known_texture_sets_by_project 等の動的設定が更新されたときに
+        呼ばれる。一覧テーブルと最終更新時刻を再描画する。
+        """
+        self._refresh_material_table()
+        self.last_structure_update_label.setText(
+            "一覧の最終更新: {0}".format(_now())
+        )
+
+    def _on_scene_changed(self, *_args):
+        """2026.07.15-01: MSceneMessage(kAfterOpen/kAfterNew)から呼ばれる。
+        シーンが切り替わったら、直前のシーン向けの監視を安全に停止し、
+        新しいシーンの状態(紐付け・一覧)でUIを更新する。監視の自動再開は
+        行わない(紐付いたSPプロジェクトが無いまま再開すると、前のシーンの
+        設定を引き継いでしまう危険があるため、ユーザーの一手を挟む)。
+        """
+        try:
+            if self.watcher.enabled:
+                self.watcher.stop(reason="scene_change")
+                self.enable_btn.blockSignals(True)
+                self.enable_btn.setChecked(False)
+                self.enable_btn.setText("監視（自動反映）: OFF")
+                self.enable_btn.blockSignals(False)
+            self._refresh_scene_link_label()
+            self._refresh_material_table()
+        except Exception as e:
+            # コールバック内で例外を外に漏らすとMaya本体が不安定になる
+            # ことがあるため、ここでは握りつぶしてログにのみ残す。
+            print("[maya_live_sync] _on_scene_changed でエラー: {0}".format(e))
+
+    def closeEvent(self, event):
+        """2026.07.15-01: ウィンドウが実際に閉じられる(workspaceControlごと
+        破棄される)際に、登録済みのシーンコールバックを解除する。
+        解除し忘れると、コールバックが解放済みのPythonオブジェクトを
+        参照し続けてMaya側でエラーが出る可能性があるため。
+        通常はワークスペースを隠すだけ(hide)でこのイベントは発生しない
+        想定だが、念のため安全に倒す。
+        """
+        try:
+            for cb_id in getattr(self, "_scene_callback_ids", []):
+                try:
+                    om.MMessage.removeCallback(cb_id)
+                except Exception:
+                    pass
+            self._scene_callback_ids = []
+        except Exception:
+            pass
+        super(LiveSyncWindow, self).closeEvent(event)
 
     def _on_quality_toggled(self, checked):
         switched = self.watcher.switch_texture_quality(checked)
@@ -1921,3 +2915,32 @@ def show_ui():
         if not _window_instance.watcher.config.get("setup_wizard_completed"):
             _window_instance.open_setup_wizard()
     return _window_instance
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.15-01: Maya終了時のセッションロック解放
+# ---------------------------------------------------------------------------
+#
+# 背景: 従来 _clear_session_lock_if_own() は「監視ボタンを手動でOFFに
+# した時」にしか呼ばれず、Mayaをそのまま終了する(×ボタン/タスクマネージャ
+# 終了/クラッシュ)ケースではロックファイルが残り続けていた。これが
+# 「次回起動時に毎回、他セッション警告が出る」不具合の主因だった
+# (_check_other_session() 側のpid生存確認・経過時間フォールバックと
+# 合わせて、正常終了時はこちらで確実に解消することを狙う)。
+#
+# このコールバックはモジュールが import された時点(＝maya_live_sync が
+# 一度でも使われた時点)で一度だけ登録する。show_ui() を呼んだかどうかに
+# 関わらず登録するのは、監視を開始した後にウィンドウだけ閉じてMayaは
+# そのまま使い続ける、といった操作でもロックが残っていること自体は
+# 変わらないため。
+def _on_maya_exiting(*_args):
+    try:
+        _clear_session_lock_if_own()
+    except Exception:
+        pass
+
+
+try:
+    om.MSceneMessage.addCallback(om.MSceneMessage.kMayaExiting, _on_maya_exiting)
+except Exception as _e:
+    print("[maya_live_sync] Could not register exit callback: {0}".format(_e))
