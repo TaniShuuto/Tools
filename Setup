@@ -1,2 +1,0 @@
-import maya_live_sync
-maya_live_sync.show_ui()
