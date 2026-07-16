@@ -132,11 +132,52 @@ import maya.OpenMaya as om
 try:
     from PySide2 import QtCore, QtWidgets
     from shiboken2 import wrapInstance
+    from shiboken2 import isValid as _shiboken_is_valid
 except ImportError:
     from PySide6 import QtCore, QtWidgets
     from shiboken6 import wrapInstance
+    from shiboken6 import isValid as _shiboken_is_valid
 
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
+
+
+# --- [DIAG-C1] -----------------------------------------------------------
+# 一次切り分け用: install.py 側の _destroy_stale_livesync_window() が
+# 「Internal C++ object (QFileSystemWatcher) already deleted」を出す
+# 不具合の原因確定用ヘルパー。cmds.deleteUI(workspaceControl, control=True)
+# の直後、Python側の window / watcher / fs_watcher 各オブジェクトの
+# Qt C++実体がまだ生きているか(shiboken.isValid)を個別に確認できるようにする。
+# 「deleteUIの時点で子オブジェクトも道連れで破棄される」という仮説を
+# 実機で裏付けるための計装であり、まだ修正はしていない。
+def diag_c1_check_qobject_validity(window):
+    """window / watcher / fs_watcher それぞれの Qt C++ 実体の生存状態を
+    dict で返す。install.py の _destroy_stale_livesync_window() から
+    deleteUI直後・watcher.stop()呼び出し直前に呼ぶ想定。
+    """
+    result = {}
+    try:
+        result["window_valid"] = _shiboken_is_valid(window) if window is not None else None
+    except Exception as e:
+        result["window_valid"] = "check_error: {0}".format(e)
+    try:
+        watcher = getattr(window, "watcher", None)
+        result["watcher_exists_in_python"] = watcher is not None
+        result["watcher_valid"] = _shiboken_is_valid(watcher) if watcher is not None else None
+    except Exception as e:
+        result["watcher_valid"] = "check_error: {0}".format(e)
+    try:
+        fs_watcher = getattr(watcher, "fs_watcher", None) if watcher is not None else None
+        result["fs_watcher_exists_in_python"] = fs_watcher is not None
+        result["fs_watcher_valid"] = _shiboken_is_valid(fs_watcher) if fs_watcher is not None else None
+    except Exception as e:
+        result["fs_watcher_valid"] = "check_error: {0}".format(e)
+    try:
+        poll_timer = getattr(watcher, "project_poll_timer", None) if watcher is not None else None
+        result["project_poll_timer_valid"] = _shiboken_is_valid(poll_timer) if poll_timer is not None else None
+    except Exception as e:
+        result["project_poll_timer_valid"] = "check_error: {0}".format(e)
+    print("[DIAG-C1] QObject生存確認: {0}".format(result))
+    return result
 
 
 # ============================================================
@@ -264,7 +305,113 @@ from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 #    対策として、_process_pending_changes() で監視中のフォルダ自体が
 #    変わったことを検知したら、対応するmtime比較値を0にリセットする
 #    ようにした。
-__version__ = "2026.07.15-06"
+#
+#  2026.07.16 緊急修正:
+#    Mayaシーン⇔SPプロジェクトの紐付け機能で、実際には同じプロジェクト
+#    (例: aaaaa.spp)を指しているのに、状態バーが「対応先とSP側の
+#    プロジェクトが異なります」という赤字の不一致警告を出し続ける
+#    不具合があった。
+#    原因は、紐付け情報の読み取り(_get_current_scene_project_link)で
+#    行っていた value.encode("utf-8").decode("unicode_escape") という
+#    変換が、Windowsパスのバックスラッシュ区切りを破壊していたこと。
+#    "\B" のような並びが制御文字に化けてしまい、cmds.fileInfo に
+#    実際に保存された値は正しいのに、読み取り時だけ壊れた文字列に
+#    なり、SP側から来る生パス(active_project_key)との文字列比較で
+#    常に不一致と判定されていた。
+#    対策として、危険な unicode_escape 変換を撤去し、代わりに
+#    保存・比較の双方でスラッシュ区切りへの正規化
+#    (_normalize_project_key_for_compare)を行うようにした。これにより
+#    Windowsのバックスラッシュ区切りパスとSlashパスのどちらが来ても
+#    正しく同一と判定できるようになった。
+#
+#  2026.07.16-02 緊急修正:
+#    シミュレーションにより、v01/v02(SP側)の修正後もなお「監視フォルダ名
+#    は正しいのに、Maya側の紐付け表示だけがテンプレート名/__unsaved__の
+#    まま」という矛盾が起こり得ることが判明した。
+#    真因は _set_current_scene_project_link() が「ボタンを押した瞬間の
+#    active_project_keyを一度きり書き込むだけ」の設計であること。SP側の
+#    プロジェクトがまだ未保存("__unsaved__")の段階で「SPプロジェクトを
+#    設定」ボタンを押すと、"__unsaved__"という値がシーンに永久に
+#    焼き付けられ、その後SP側で実際に保存してactive_project_keyが
+#    正しい値に更新されても、一度焼き付けられた紐付け情報だけは
+#    自動更新されずに取り残されていた。
+#    対策として (1) active_project_keyが"__unsaved__"の間はボタンでの
+#    紐付けをブロックし、先にSP側で保存するよう案内する、(2) 既に
+#    "__unsaved__"が焼き付いてしまっている場合は状態バーで明示し、
+#    再設定を促す、の2段構えとした。
+#
+#  2026.07.16-03 追加修正(他箇所へのシミュレーション横展開で発見):
+#    create_shader_network() に、SP側プロジェクトが未保存
+#    ("__unsaved__")の間はシェーダー生成をブロックするガードを追加した。
+#    シミュレーションにより、未保存の段階でシェーダーを生成すると、
+#    生成されるfileノードが "__unsaved__" 用の一時サブフォルダを参照
+#    したまま、SP側で保存後もパスが更新されず、is_texture_set_mapped()
+#    のフォールバック走査にも該当しなくなる(「対応済みのはずが未対応と
+#    誤判定され続ける」「再生成しようとすると名前衝突でエラーになる」)
+#    ことが判明したため。シーンの紐付け機能(_on_link_scene_to_sp_
+#    project)で採用したのと同じ「未保存の間はブロックする」方針を
+#    横展開した。
+#    なお、同時に実施した他箇所へのシミュレーション(missing_streakの
+#    プロジェクト切り替え時リセット、セッションロックのpid照合による
+#    多重セッション保護)はいずれも問題なしと確認された。
+#    _last_active_watch_dir/_last_active_final_dir は既にv05の設計変更で
+#    参照されなくなったデッドコードであることも判明したため、その旨を
+#    コメントで明記した(実害なし、削除は任意)。
+#
+#  2026.07.16-04 緊急修正:
+#    register_user_setup() が「マーカーが既に存在する場合は無条件に
+#    スキップする」設計だったため、過去に一度でも登録したユーザーは
+#    install.py を何度再実行しても userSetup.py の中身(自動起動
+#    ロジック)が永久に更新されないという不具合があった。
+#    実機で以下の2症状として確認された:
+#      1. Maya起動中、メインウィンドウの構築が終わる前にLiveSyncの
+#         ウィンドウだけが先行して表示されてしまう(旧バージョンで
+#         auto_open=Trueかつ lowestPriority 遅延処理が無い状態のまま
+#         登録されていたため)
+#      2. シェルフから何度起動し直しても古いバージョンの挙動のまま
+#         に見える(userSetup.py経由の起動時importで、古いロジックの
+#         ままの状態がセッションを通じて影響し続けていたため)
+#    対策として、マーカーが既に存在する場合は「スキップ」ではなく
+#    「一致するブロックを取り除いてから、新しい内容で書き直す」方式に
+#    変更した(uninstall.pyの_remove_autostart_block()と同じ抽出
+#    ロジックを流用)。バックアップの取得対象が「削除後」の内容に
+#    なっていた見落としも合わせて修正した。
+#    なお install.py 自体は auto_open=False で登録するため、この修正が
+#    適用されると次回install.py実行時に「先行して開く」設定自体が
+#    除去される(importのみのシンプルなブロックに置き換わる)。
+#
+#  2026.07.16-05 緊急修正:
+#    v2026.07.16-04で「マーカーがあれば書き直す」方式に変更した結果、
+#    install.pyを実行するたびに毎回 userSetup.py への書き込みが発生
+#    するようになった。これにより、Maya 2026のセキュリティ機能
+#    (Secure UserSetup Checksum verification)が毎回反応し、
+#    「userSetup.pyの内容が変わりましたが良いですか」という確認
+#    ポップアップが再インストールのたびに表示されるようになってしまった
+#    (過去のセッションで、このポップアップに正しく応答しないまま
+#    作業を進めるとUndo初期化等の起動シーケンスが乱れる不具合が
+#    確認されている)。
+#    対策として、既存の登録ブロックと、今回生成しようとしている内容が
+#    完全に一致する場合は、ファイルへの書き込み自体を行わないように
+#    した。これにより、実際にロジックが変わった場合(バージョンアップ
+#    等)のみ書き込みが発生し、チェックサム確認ポップアップも本当に
+#    必要な時にしか出なくなる。
+#
+#  2026.07.16-06 緊急修正(PBRテンプレート表示問題の再発を追跡して発見):
+#    self.watcher.config(active_project_keyを含む)は、これまで
+#    project_poll_timer(3秒間隔)経由の _refresh_dynamic_config() でのみ
+#    ディスクから読み直されていた。しかし project_poll_timer は
+#    watcher.enabled(監視ON)の間だけ動作するため、監視をOFFにしたまま
+#    (あるいは一度もONにしないまま)SP側でプロジェクトを保存しても、
+#    Maya側のメモリ上の active_project_key はいつまでも更新されず、
+#    状態バーがテンプレート名や古いプロジェクト名を表示し続ける不具合が
+#    あった。「監視をONにしたら直った」という報告はこれと一致する。
+#    対策として、_refresh_scene_link_label() の呼び出し時には毎回
+#    _refresh_dynamic_config() を明示的に呼ぶようにし、状態バーの表示が
+#    監視のON/OFFに関わらず常に最新のディスク上の値を反映するようにした
+#    (シグナル発火による再入は軽量なフラグで防止)。
+#    同じ理由で _refresh_material_table() (マテリアル構造タブ)にも
+#    同様の明示的読み直しを追加した。
+__version__ = "2026.07.16-06"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -536,9 +683,28 @@ def _user_setup_path():
 
 def register_user_setup(auto_open=False):
     """userSetup.pyに maya_live_sync の import を追記する。
-    既に登録済み(マーカーコメントが存在する)場合は二重登録しない。
-    既存ファイルがある場合は、追記前にタイムスタンプ付きでバックアップ
-    してから追記する(ユーザーの既存userSetup.py内容を壊さないため)。
+
+    2026.07.16(緊急修正): 以前は「マーカーコメントが既に存在する場合は
+    無条件にスキップする」設計だった。これにより、過去(kMayaInitialized
+    による遅延起動対策が入る前の旧バージョン等)に一度でも登録した
+    ユーザーは、install.py を何度再実行しても userSetup.py の中身が
+    永久に更新されず、以下の症状が実機で確認された:
+      - Maya起動中に、メインウィンドウの構築が終わる前にLiveSyncの
+        ウィンドウだけが先行して表示されてしまう(旧バージョンには
+        lowestPriorityでの遅延処理が無かったため)
+      - install.py を再実行してシェルフボタンを押し直しても、
+        起動時に旧userSetup.pyのロジックで一度importされた古い
+        モジュールキャッシュの影響で、古いバージョンの挙動のまま
+        に見えることがある
+    対策として、マーカーが既に存在する場合は「スキップ」ではなく
+    「一致するブロックを取り除いてから、新しい内容で書き直す」方式に
+    変更した(uninstall.py の _remove_autostart_block() と同じ抽出
+    ロジックを使う)。これにより、install.py を再実行するたびに
+    userSetup.py 内の自動起動ロジックも常に最新の内容へ更新される。
+
+    既存ファイルがある場合は、書き換え前にタイムスタンプ付きで
+    バックアップしてから書き換える(ユーザーの既存userSetup.py内容を
+    壊さないため)。
 
     auto_open=True の場合、ウィンドウを開くタイミングには
     OpenMaya.MSceneMessage.kMayaInitialized コールバックを使う。
@@ -560,14 +726,43 @@ def register_user_setup(auto_open=False):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         existing = ""
+        was_updated = False
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as f:
                 existing = f.read()
+            # バックアップ用に、今回の書き換えで一切手を加えていない
+            # 「削除前の完全な内容」を別途保持しておく(existing自体は
+            # この後、登録ブロック削除後の値に置き換わるため)。
+            original_content = existing
+
+            existing_block = None
             if REGISTER_MARKER in existing:
-                return False, "既に登録済みです: {0}".format(path)
+                # 既存の登録ブロックを取り除く(uninstall.pyの
+                # _remove_autostart_block()と同じ抽出方式)。
+                start = existing.index(REGISTER_MARKER)
+                block_start = start  # マーカー自体の開始位置(前の空行は含まない)
+                if start > 0 and existing[start - 1] == "\n":
+                    start -= 1
+                end_marker = "except Exception:\n    pass\n"
+                end_idx = existing.find(end_marker, start)
+                if end_idx == -1:
+                    # ブロックの終端が見つからない(手動編集された等)場合は
+                    # 安全のため書き換えを諦め、従来通りスキップする。
+                    return False, "既存の登録ブロックの終端が見つからないため、安全のため更新をスキップしました: {0}".format(path)
+                end = end_idx + len(end_marker)
+                # 2026.07.16-05: 既存ブロックの中身(マーカー〜末尾)を
+                # 後で新しい生成内容と比較するために保持しておく。
+                existing_block = existing[block_start:end]
+                existing = existing[:start] + existing[end:]
+                was_updated = True
+
             backup_path = "{0}.bak_{1}".format(path, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
             with open(backup_path, "w", encoding="utf-8") as f:
-                f.write(existing)
+                # バックアップには必ず「削除前の完全な内容」を残す
+                # (2026.07.16: 以前はここで既にブロック削除後の existing を
+                # 書いてしまっており、バックアップとして不完全だった見落とし
+                # を修正)。
+                f.write(original_content)
 
         lines = ["\n", REGISTER_MARKER + "\n", "try:\n", "    import maya_live_sync\n"]
         if auto_open:
@@ -589,9 +784,30 @@ def register_user_setup(auto_open=False):
                 "        _sp_live_sync_on_initialized)\n",
             ]
         lines += ["except Exception:\n", "    pass\n"]
+        # existing_block はマーカー行から始まる(先頭の空行を含まない)ため、
+        # 新しく生成する側も同じ基準(マーカー行始まり)で比較できるよう、
+        # lines[0](先頭の"\n")を除いた形に揃える。
+        new_block_for_compare = "".join(lines[1:])
 
-        with open(path, "a", encoding="utf-8") as f:
+        # 2026.07.16-05(緊急修正): userSetup.pyを書き換えるたびに、
+        # Maya 2026のセキュリティ機能(Secure UserSetup Checksum
+        # verification)が反応し、内容変更の確認ポップアップが毎回
+        # 表示されるようになった。このポップアップに正しく応答しないまま
+        # 作業を始めると、Undo初期化等の起動シーケンスが乱れる不具合が
+        # 過去に確認されている。前回登録した内容と今回生成する内容が
+        # 完全に一致する(＝実質的な変更が無い)場合は、ファイルへの
+        # 書き込み自体を行わないことで、無用なチェックサム再検証の
+        # 発生を防ぐ。
+        if was_updated and existing_block is not None and existing_block == new_block_for_compare:
+            return True, "userSetup.pyは既に最新の内容のため、書き換えをスキップしました(不要な確認ダイアログの発生を防ぐため): {0}".format(path)
+
+        with open(path, "w" if was_updated else "a", encoding="utf-8") as f:
+            if was_updated:
+                f.write(existing)
             f.writelines(lines)
+
+        if was_updated:
+            return True, "userSetup.pyの登録内容を最新化しました: {0}".format(path)
         return True, "userSetup.pyに登録しました: {0}".format(path)
     except Exception as e:
         return False, "登録に失敗しました: {0}".format(e)
@@ -761,9 +977,36 @@ def _active_texture_sets(cfg):
 _SCENE_LINK_FILEINFO_KEY = "sp_live_sync_project_key"
 
 
+def _normalize_project_key_for_compare(key):
+    """
+    2026.07.16(緊急修正): SPプロジェクトキーの比較・保存で使う正規化。
+
+    背景: sp_project_key(SPの.sppフルパス)はWindows環境では
+    バックスラッシュ区切り("C:\\Work\\aaaaa.spp")で渡ってくる。
+    これをそのまま cmds.fileInfo() に保存すると、Mayaが内部的に
+    行うエスケープと、読み取り側で「エスケープを元に戻すため」に
+    行っていた value.encode("utf-8").decode("unicode_escape") の
+    組み合わせにより、"\\B" のような並びが制御文字(ベル文字 \\x07 等)
+    に化けてパスが破壊される不具合があった。結果として、実際に
+    保存された値は正しいのに、読み取り時だけ壊れた文字列になり、
+    「同じプロジェクトのはずなのに紐付け先とSP側の表示が一致しない」
+    という矛盾したエラー表示が起きていた(状態バーがSP未起動でない
+    のに不一致警告を出し続ける症状として確認された)。
+
+    対策として、fileInfoへの保存・比較の両方でスラッシュ区切りに
+    正規化した文字列を使うようにし、危険な unicode_escape 変換自体を
+    撤去した。SP側から来る active_project_key(正規化していない生の
+    パス)と比較する際も、必ずこの関数を通してから比較する。
+    """
+    if not key:
+        return key
+    return key.replace("\\", "/")
+
+
 def _get_current_scene_project_link():
     """現在Mayaで開いているシーンに紐付けられたSPプロジェクトキーを
-    返す。紐付けが無ければNone。
+    返す。紐付けが無ければNone。戻り値は常にスラッシュ区切りに
+    正規化済み(_normalize_project_key_for_compare参照)。
     """
     try:
         scene_path = cmds.file(query=True, sceneName=True)
@@ -776,14 +1019,14 @@ def _get_current_scene_project_link():
         except Exception:
             info = None
         if info:
-            # cmds.fileInfoは値をリストで返す。保存時にエスケープされる
-            # 特殊文字(タブ等)を元に戻す。
+            # 2026.07.16: 以前ここで行っていた
+            # value.encode("utf-8").decode("unicode_escape") は、
+            # Windowsパスのバックスラッシュ区切りを破壊する不具合の
+            # 原因だったため撤去した。保存側(_set_current_scene_
+            # project_link)が既にスラッシュ区切りで保存するため、
+            # 読み取り側で特別なデコードは不要。
             value = info[0]
-            try:
-                value = value.encode("utf-8").decode("unicode_escape")
-            except Exception:
-                pass
-            return value or None
+            return _normalize_project_key_for_compare(value) or None
         return None
 
     # 未保存シーン: セッション内フォールバックを見る。シーンを一意に
@@ -792,7 +1035,7 @@ def _get_current_scene_project_link():
     # 同じ既知の制限)。
     cfg = load_config()
     links = cfg.get("last_scene_project_links", {})
-    return links.get("__unsaved__")
+    return _normalize_project_key_for_compare(links.get("__unsaved__"))
 
 
 def _set_current_scene_project_link(sp_project_key):
@@ -800,7 +1043,12 @@ def _set_current_scene_project_link(sp_project_key):
     紐付けて保存する。保存済みシーンならfileInfo(次回保存時に
     シーンファイルへ永続化される)、未保存シーンなら共有設定ファイルの
     last_scene_project_links に一時的に記録する。
+
+    2026.07.16: 保存前にスラッシュ区切りへ正規化してから書き込む
+    (詳細は _normalize_project_key_for_compare のコメント参照)。
     """
+    normalized_key = _normalize_project_key_for_compare(sp_project_key)
+
     try:
         scene_path = cmds.file(query=True, sceneName=True)
     except Exception:
@@ -808,14 +1056,14 @@ def _set_current_scene_project_link(sp_project_key):
 
     if scene_path:
         try:
-            cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, sp_project_key or "")
+            cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, normalized_key or "")
             return True
         except Exception:
             return False
 
     cfg = load_config()
     links = dict(cfg.get("last_scene_project_links", {}))
-    links["__unsaved__"] = sp_project_key
+    links["__unsaved__"] = normalized_key
     save_config({"last_scene_project_links": links})
     return True
 
@@ -902,8 +1150,19 @@ class LiveSyncWatcher(QtCore.QObject):
         # 2026.07.15-04: reload_textures()/reload_final_textures() の
         # 古いサブフォルダ補正を、無関係な他プロジェクトのサブフォルダ
         # まで巻き込まないよう「直前に自分が監視していたサブフォルダ」
-        # だけに限定するための記録(詳細は _ensure_active_watch_watched()
-        # 参照)。
+        # だけに限定するための記録として導入した。
+        #
+        # 2026.07.15-05で、aiSS経由で生成されたノードを救済できない
+        # 問題への対処として、補正対象は watch_root/final_export_dir
+        # 直下の全サブフォルダ + _matches_known_texture_set_prefix() に
+        # よるファイル名安全確認、という方式に置き換えたため、この2つの
+        # 変数は現在どこからも参照されない(書き込まれるだけの)デッド
+        # コードになっている。
+        # 2026.07.16: シミュレーションで、プロジェクトをA->B->Aと複数回
+        # 切り替えた場合にこの値が正しい「直前のフォルダ」を追跡できなく
+        # なる(fs_watcher.directories()に複数の過去フォルダが蓄積される
+        # ため)不具合も見つかったが、実害は無い(参照箇所が無いため)。
+        # 実害はないため残しているが、削除しても動作に影響しない。
         self._last_active_watch_dir = None
         self._last_active_final_dir = None
         # Phase 6: 現在file ノードがプレビュー(監視フォルダ)と高画質版
@@ -933,9 +1192,31 @@ class LiveSyncWatcher(QtCore.QObject):
         # (鶏と卵の問題)。そのため、フォルダ変化とは独立に、数秒おきで
         # 「アクティブなFinalサブフォルダがWatcher登録済みか」だけを
         # 軽量に確認するポーリングタイマーを別途持つ。
+        #
+        # 2026.07.17 根治修正(B-1): 以前は watcher.start()/stop() から
+        # このタイマーも連動してstart/stopしていた(2026.07.15-02の
+        # 意図)。これにより、監視ボタンがOFFの間は
+        # _refresh_dynamic_config() が一切定期実行されず、SP側が
+        # active_project_key 等を共有設定ファイルへ書き込んでも
+        # Maya側のメモリに反映されないまま放置される不具合があった。
+        # 実機ログ(DIAG-B1計装)で、監視OFF中に呼び出し間隔が148秒に
+        # 達することを確認して確定した。
+        # 対策として、project_poll_timer は監視ON/OFFに関わらず
+        # ウィンドウ生成時(このインスタンス生成時)に常時起動する
+        # ことにした。_ensure_active_dirs_watched() 内部の
+        # self.enabled チェック(シーン紐付け不一致時の自動停止判定等)
+        # は enabled=False の間はスキップされる安全設計のままなので、
+        # 監視OFF中に常時回しても副作用は「設定値の読み直しと
+        # scene_link_changed/structure_changedシグナルの発火」のみに
+        # 限定される。
+        # 負荷面: load_config()はローカルJSONの同期読み込みのみで、
+        # 3秒間隔・ウィンドウを開いている間常時実行しても実測上軽微と
+        # 判断した(簡易実装を優先し、監視ON/OFFでの間隔可変は見送った)。
         self.project_poll_timer = QtCore.QTimer(self)
         self.project_poll_timer.setInterval(3000)
         self.project_poll_timer.timeout.connect(self._ensure_active_dirs_watched)
+        self.project_poll_timer.start()
+
 
     def _emit_status(self, text):
         line = "[{0}] {1}".format(_now(), text)
@@ -1002,6 +1283,27 @@ class LiveSyncWatcher(QtCore.QObject):
         for key in dynamic_keys:
             if key in latest:
                 self.config[key] = latest[key]
+
+        # --- [DIAG-B1] ---------------------------------------------------
+        # 一次切り分け用の計装: このメソッドは project_poll_timer からしか
+        # 定期的に呼ばれず、そのタイマーは watcher.enabled (=監視ON) の
+        # 間しか動いていない(B-1仮説)。ここでは「最後にこのメソッドが
+        # 呼ばれてから何秒経過したか」と「その時点でenabledかどうか」を
+        # 記録し、監視OFF中に呼び出し間隔が伸び続ける(またはゼロ回に
+        # なる)ことをログで確定させる。根治(タイマーのON/OFF分離)は
+        # まだ行わない。
+        now_ts = time.time()
+        last_ts = getattr(self, "_diag_b1_last_refresh_ts", None)
+        gap = (now_ts - last_ts) if last_ts is not None else None
+        self._diag_b1_last_refresh_ts = now_ts
+        self._diag_b1_call_count = getattr(self, "_diag_b1_call_count", 0) + 1
+        print("[DIAG-B1] _refresh_dynamic_config call#{0} watcher.enabled={1} "
+              "前回呼び出しからの経過秒={2} active_project_key={3}".format(
+                  self._diag_b1_call_count,
+                  self.enabled,
+                  ("{:.1f}".format(gap) if gap is not None else "N/A(初回)"),
+                  self.config.get("active_project_key"),
+              ))
 
         if self.config.get("active_project_key") != prev_active_project_key:
             self.scene_link_changed.emit()
@@ -1144,8 +1446,15 @@ class LiveSyncWatcher(QtCore.QObject):
 
         if self.enabled:
             linked_key = _get_current_scene_project_link()
-            active_key = self.config.get("active_project_key")
+            active_key = _normalize_project_key_for_compare(self.config.get("active_project_key"))
+            # [DIAG-B2] 一次切り分け用: 不一致判定の材料を毎回ログに残す。
+            # 「追跡できない」がここでの自動停止によるものかどうかを、
+            # linked_key(シーン紐付け)とactive_key(SP側現在値)の
+            # 実際の値を突き合わせて確定させる。
+            print("[DIAG-B2] linked_key={0!r} active_key={1!r} match={2}".format(
+                linked_key, active_key, (linked_key == active_key) if (linked_key and active_key) else "N/A"))
             if linked_key and active_key and linked_key != active_key:
+                print("[DIAG-B2] 不一致検出 -> 監視を自動停止します。これがB-2仮説の再現です。")
                 self.stop(reason="scene_change")
                 self._emit_status(
                     "警告: このシーンの対応先SPプロジェクトと、SP側が今開いている"
@@ -1208,19 +1517,21 @@ class LiveSyncWatcher(QtCore.QObject):
         _write_session_lock()
         save_config({"watch_enabled": True})
         self.config["watch_enabled"] = True
-        # 2026.07.15-02(緊急修正): project_poll_timer がどこからも
-        # start() されておらず、生成・シグナル接続はされているのに
-        # 一度もタイムアウトが発火しない不具合があった。これにより
-        # _ensure_active_dirs_watched() ひいては _refresh_dynamic_config()
-        # が定期実行されず、以下の症状が実機で確認された:
-        #   - SP側で active_project_key が切り替わっても状態バーの
-        #     「シーン⇔SPプロジェクト」表示が追従しない
-        #   - シーン紐付け不一致時の自動停止(安全装置)が効かない
-        #   - 同名テクスチャセットの新規検出がUIの一覧に反映されない
-        # 監視ONの間だけ動けばよいポーリングのため、start()で起動し
-        # stop()で停止する。
-        self.project_poll_timer.start()
+        # 2026.07.15-02(緊急修正、経緯として残す): project_poll_timer が
+        # どこからも start() されておらず、一度もタイムアウトが発火しない
+        # 不具合があったため、当時は「監視ONの間だけ動けばよい」という
+        # 前提で start()/stop() 経由の起動・停止を追加した。
+        #
+        # 2026.07.17(根治修正、B-1): 上記の前提そのものが誤りだった。
+        # 監視OFFの間 _refresh_dynamic_config() が一切実行されず、
+        # SP側のプロジェクト切り替えをMaya側が長時間(実機ログで148秒)
+        # 検知できない不具合の直接原因になっていた。
+        # project_poll_timer は __init__ で既に常時起動しているため、
+        # ここでの明示的な start() 呼び出しは撤去した(常時起動している
+        # タイマーに対して start() を呼んでも実害はないが、
+        # 「監視ONで開始する」という誤った意図をコードに残さないため)。
         self._emit_status("監視を開始しました: {0}".format(active_watch_dir or watch_dir))
+
 
     def stop(self, reason="manual"):
         """監視を停止する。
@@ -1237,7 +1548,14 @@ class LiveSyncWatcher(QtCore.QObject):
         for d in list(self.fs_watcher.directories()):
             self.fs_watcher.removePath(d)
         self.debounce_timer.stop()
-        self.project_poll_timer.stop()
+        # 2026.07.17(根治修正、B-1): project_poll_timer.stop() は撤去した。
+        # このタイマーは __init__ で常時起動する設計に変更したため、
+        # 監視OFF時にも動き続ける必要がある(そうしないと、OFF中に
+        # SP側でプロジェクトが切り替わった場合の追跡漏れ=B-1が再発する)。
+        # fs_watcher・debounce_timer はテクスチャ再読込に直結するため
+        # 従来通り監視OFF時に止める。project_poll_timer は
+        # 「設定値の読み直し」だけを担う軽量タイマーであり、
+        # 停止・再開の対象から意図的に外している。
         self.enabled = False
         if reason == "manual":
             _clear_session_lock_if_own()
@@ -1627,7 +1945,7 @@ class LiveSyncWatcher(QtCore.QObject):
         if active_key and active_key in by_project:
             name = os.path.basename(active_key) if active_key != "__unsaved__" else "(未保存のプロジェクト)"
             label = "現在のSPプロジェクト: {0}".format(name)
-            if linked_key and linked_key != active_key:
+            if linked_key and linked_key != _normalize_project_key_for_compare(active_key):
                 label += "  ※このシーンの紐付け先とは異なります"
             return label
         return "SP側のプロジェクト情報が未取得のため、記録済み全プロジェクト分を表示中"
@@ -1964,7 +2282,30 @@ class LiveSyncWatcher(QtCore.QObject):
         戻り値: 作成した shadingEngine 名。
         どのジオメトリに割り当てるかはここでは行わない(手動作業)。
         失敗時には作成済みのノードをロールバック(削除)する。
+
+        2026.07.16(緊急修正、シミュレーションで発見): SP側のプロジェクトが
+        まだ未保存("__unsaved__")の段階でシェーダーを生成すると、
+        生成されるfileノードは "__unsaved__" 用の一時サブフォルダを
+        参照する。その後SP側で実際に名前を付けて保存すると、
+        active_watch_subfolder は正しいプロジェクト名のサブフォルダに
+        切り替わるが、既に生成済みのfileノードのパスは自動更新されず、
+        is_texture_set_mapped() のフォールバック走査(managed_dirsとの
+        一致判定)にも該当しなくなるため、「対応済みのはずなのに未対応と
+        誤判定され続ける」「再度シェーダー生成を試みると名前衝突で
+        RuntimeErrorになる」という不具合が起こり得る。
+        シーンの紐付け機能(_on_link_scene_to_sp_project)で既に採用して
+        いるのと同じ方針で、未保存の間はシェーダー生成自体をブロックし、
+        先にSP側で保存するよう案内する。
         """
+        active_key = self.config.get("active_project_key")
+        if active_key == "__unsaved__":
+            raise RuntimeError(
+                "SP側のプロジェクトがまだ保存されていません。"
+                "この状態でシェーダーを生成すると、後で保存した際にテクスチャの"
+                "参照先が食い違ってしまいます。SP側で一度「名前を付けて保存」して"
+                "から、もう一度お試しください。"
+            )
+
         renderer = (self.config.get("renderer") or "none").lower()
         if renderer != "arnold":
             raise RuntimeError(
@@ -2290,6 +2631,9 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         self.watcher = LiveSyncWatcher(self)
         self.channel_checkboxes = {}
+        # 2026.07.16: _refresh_scene_link_label() の再入防止フラグ
+        # (詳細はそのメソッドのコメント参照)。
+        self._refreshing_scene_link_label = False
 
         outer_layout = QtWidgets.QVBoxLayout(self)
         tabs = QtWidgets.QTabWidget()
@@ -2600,10 +2944,45 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         False になるため else節(緑=正常)に落ちてしまい、「SP未起動なのに
         正常」と誤表示するバグがあった。SP未起動と「紐付け先と一致」は
         明確に区別し、SP未起動の場合は独立した表示にする。
+
+        2026.07.16(緊急修正): active_key はSP側から来る生のパス
+        (Windowsではバックスラッシュ区切り)で、linked_key は
+        _get_current_scene_project_link() が返すスラッシュ区切りに
+        正規化済みの値だった。区切り文字が違うだけで文字列としては
+        不一致になり、実際には同じプロジェクトを指しているのに
+        赤字の不一致警告が出続ける不具合があった。比較前に
+        active_key 側も _normalize_project_key_for_compare() で
+        正規化する。
+
+        2026.07.16(緊急修正、再発分): self.watcher.config(active_project_key
+        を含む)は、これまで project_poll_timer(3秒間隔)経由の
+        _refresh_dynamic_config() でのみディスクから読み直されていた。
+        しかし project_poll_timer は watcher.enabled(監視ON)の間だけ
+        動作するため、監視をOFFにしたまま(あるいは一度もONにしないまま)
+        SP側でプロジェクトを保存しても、Maya側のメモリ上の
+        active_project_key はいつまでも更新されず、状態バーが
+        テンプレート名や古いプロジェクト名を表示し続ける不具合が
+        あった(「監視をONにしたら直った」という報告と一致する)。
+        状態バーの表示は監視のON/OFFに関わらず常に最新であるべきため、
+        このメソッドの呼び出し時には毎回 _refresh_dynamic_config() を
+        明示的に呼び、ディスク上の最新値を確実に反映する。
+
+        再入防止: _refresh_dynamic_config() が active_project_key の
+        変化を検知すると scene_link_changed シグナルを発火し、それが
+        このメソッド自身に接続されているため、そのまま呼ぶと1回の
+        更新で2回連続実行されてしまう(実害はないが無駄なため、
+        フラグで防ぐ)。
         """
+        if getattr(self, "_refreshing_scene_link_label", False):
+            return
+        self._refreshing_scene_link_label = True
+        try:
+            self.watcher._refresh_dynamic_config()
+        finally:
+            self._refreshing_scene_link_label = False
         scene_name = _scene_display_name()
         linked_key = _get_current_scene_project_link()
-        active_key = self.watcher.config.get("active_project_key")
+        active_key = _normalize_project_key_for_compare(self.watcher.config.get("active_project_key"))
 
         if linked_key is None:
             self.scene_link_label.setText(
@@ -2611,6 +2990,21 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             )
             self.scene_link_label.setStyleSheet("color: #c9822a;")
             self.scene_link_btn.setText("SPプロジェクトを設定")
+            self.scene_link_btn.setEnabled(True)
+            return
+
+        if linked_key == "__unsaved__":
+            # 2026.07.16(緊急修正): SP側が未保存の段階で紐付けボタンを
+            # 押してしまい、"__unsaved__" がそのままシーンに焼き付いた
+            # ケース。_on_link_scene_to_sp_project() 側で今後はこの状態
+            # での新規紐付けをブロックするが、既に焼き付いてしまった
+            # 過去の紐付けは自動修復できないため、再設定を明示的に促す。
+            self.scene_link_label.setText(
+                "このシーン「{0}」は未保存だったSPプロジェクトに紐付けられています。"
+                "SP側で保存後、もう一度「SPプロジェクトを設定」を押してください。".format(scene_name)
+            )
+            self.scene_link_label.setStyleSheet("color: #c9822a;")
+            self.scene_link_btn.setText("SPプロジェクトを設定し直す")
             self.scene_link_btn.setEnabled(True)
             return
 
@@ -2649,6 +3043,20 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
     def _on_link_scene_to_sp_project(self):
         """「SPプロジェクトを設定」ボタン: SP側が今開いているプロジェクトを
         ワンクリックで現在のMayaシーンに紐付ける。
+
+        2026.07.16(緊急修正): このボタンが保存する紐付け情報は、
+        押した瞬間の active_project_key を一度きり書き込むだけで、
+        その後SP側の状態が変わっても自動更新されない(fileInfoへの
+        一発書き)。そのため、SP側のプロジェクトがまだ未保存
+        ("__unsaved__")の段階でこのボタンを押すと、"__unsaved__"
+        という値がシーンに永久に焼き付けられてしまい、その後SP側で
+        実際に名前を付けて保存して active_project_key が正しい値に
+        更新されても、一度焼き付けられた紐付け情報だけは古いままに
+        取り残される不具合があった(監視フォルダ名は正しいプロジェクト
+        名になっているのに、Maya側の紐付け表示だけがテンプレート名や
+        __unsaved__のままという矛盾として実機で確認された)。
+        対策として、active_project_keyが "__unsaved__" の間はこの
+        ボタンでの紐付けをブロックし、先にSP側で保存するよう案内する。
         """
         active_key = self.watcher.config.get("active_project_key")
         if not active_key:
@@ -2656,6 +3064,15 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 self, "Live Sync",
                 "SP側で今開いているプロジェクトが確認できません。\n"
                 "Substance Painterでプロジェクトを開いてから、もう一度お試しください。"
+            )
+            return
+        if active_key == "__unsaved__":
+            QtWidgets.QMessageBox.information(
+                self, "Live Sync",
+                "SP側のプロジェクトがまだ保存されていません。\n"
+                "この状態で紐付けると「未保存」のままシーンに固定されてしまい、"
+                "後で保存しても自動更新されません。\n"
+                "SP側で一度「名前を付けて保存」してから、もう一度お試しください。"
             )
             return
         active_name = _project_display_name(active_key)
@@ -2777,6 +3194,10 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self._refresh_material_table()
 
     def _refresh_material_table(self):
+        # 2026.07.16: _refresh_scene_link_label() と同じ理由で、
+        # 監視OFFの間はディスク上の最新値がメモリに反映されない
+        # 問題があったため、こちらでも明示的に読み直す。
+        self.watcher._refresh_dynamic_config()
         self.active_project_label.setText(self.watcher.get_active_project_label())
         known = self.watcher.get_known_texture_sets()
         self.material_table.setRowCount(len(known))
@@ -2940,7 +3361,50 @@ def _on_maya_exiting(*_args):
         pass
 
 
+# --- [DIAG-A3 / 2026.07.17 根治修正] ------------------------------------
+# 経緯: このモジュールが import/reload されるたびに、下の
+# addCallback が無条件で実行され、_on_maya_exiting が重複登録される
+# ことを実機ログ(DIAG-A3計装)で確認した(再インストールのたびに
+# 1, 2, 3... と累積)。_on_maya_exiting 自体は
+# _clear_session_lock_if_own() が冪等なため直接の実害は確認されて
+# いないが、将来この中身が変わった場合にN重実行の副作用を生む
+# 構造的な問題として、予防的に対応する。
+#
+# 対策方針: 単純に「一度登録したらスキップ」にはしない。それだと
+# reload() のたびに _on_maya_exiting という名前が指す関数オブジェクト
+# 自体は新しく作り直されるのに、Maya側に登録済みなのは古い関数
+# オブジェクトのままになり、「reloadしても古いコードのまま動く」という
+# 今回調査してきた一連の不具合と同じパターンを新たに作ってしまう。
+# そのため、reload のたびに「前回登録したコールバックIDが分かれば
+# 先に解除し、そのうえで今回の(新しい)関数を登録し直す」方式にした。
+# コールバックIDはモジュールグローバル _EXITING_CALLBACK_ID に保持し、
+# globals() 経由で reload をまたいで引き継ぐ(DIAG-A3のカウンタ計装と
+# 同じ仕組み)。
+_EXITING_CALLBACK_ID = globals().get("_EXITING_CALLBACK_ID", None)
+
+if _EXITING_CALLBACK_ID is not None:
+    try:
+        om.MSceneMessage.removeCallback(_EXITING_CALLBACK_ID)
+        print("[maya_live_sync] Removed previous kMayaExiting callback (id={0}) before re-registering.".format(
+            _EXITING_CALLBACK_ID))
+    except Exception as _e:
+        # 解除に失敗しても、古いコールバックが残ったまま新しいものが
+        # 追加されるだけなので致命的ではない(従来と同じ状態に留まる)。
+        print("[maya_live_sync] Could not remove previous exit callback (id={0}): {1}".format(
+            _EXITING_CALLBACK_ID, _e))
+    _EXITING_CALLBACK_ID = None
+
 try:
-    om.MSceneMessage.addCallback(om.MSceneMessage.kMayaExiting, _on_maya_exiting)
+    _EXITING_CALLBACK_ID = om.MSceneMessage.addCallback(om.MSceneMessage.kMayaExiting, _on_maya_exiting)
 except Exception as _e:
     print("[maya_live_sync] Could not register exit callback: {0}".format(_e))
+
+# --- [DIAG-A3] (検証用ログは残す) --------------------------------------
+# 根治後も「実際に重複登録が解消されたか」を確認できるよう、
+# カウンタ計装自体はそのまま残す。冪等化が効いていれば、
+# 「登録試行回数」は増え続けても実際にMaya側に残るコールバックは
+# 常に1個(直前に必ず解除しているため)になっているはずである。
+_DIAG_A3_REGISTER_COUNT = globals().get("_DIAG_A3_REGISTER_COUNT", 0) + 1
+print("[DIAG-A3] _on_maya_exiting 登録試行 回数(このMayaセッション内の累積import/reload回数): {0} "
+      "/ 現在の有効コールバックID: {1}(冪等化により常に直前の1個のみが有効なはず)".format(
+    _DIAG_A3_REGISTER_COUNT, _EXITING_CALLBACK_ID))
