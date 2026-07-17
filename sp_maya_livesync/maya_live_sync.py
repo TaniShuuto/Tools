@@ -141,6 +141,14 @@ except ImportError:
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 
 
+# --- [DIAG-B2] -------------------------------------------------------------
+# B-2仮説(シーン⇔SPプロジェクト不一致による自動停止)の切り分け用ログの
+# 表示/非表示切り替え。仮説の再現性確認自体はまだ済んでいないため計装は
+# 残すが、通常運用時はエディタ/コンソールを圧迫しないよう既定でFalse
+# (非表示)にしておく。再度切り分けが必要になった場合はTrueにする。
+_DIAG_B2_VERBOSE = False
+
+
 # --- [DIAG-C1] -----------------------------------------------------------
 # 一次切り分け用: install.py 側の _destroy_stale_livesync_window() が
 # 「Internal C++ object (QFileSystemWatcher) already deleted」を出す
@@ -1430,10 +1438,13 @@ class LiveSyncWatcher(QtCore.QObject):
             # 「追跡できない」がここでの自動停止によるものかどうかを、
             # linked_key(シーン紐付け)とactive_key(SP側現在値)の
             # 実際の値を突き合わせて確定させる。
-            print("[DIAG-B2] linked_key={0!r} active_key={1!r} match={2}".format(
-                linked_key, active_key, (linked_key == active_key) if (linked_key and active_key) else "N/A"))
+            # (_DIAG_B2_VERBOSE = True にすると再度表示される)
+            if _DIAG_B2_VERBOSE:
+                print("[DIAG-B2] linked_key={0!r} active_key={1!r} match={2}".format(
+                    linked_key, active_key, (linked_key == active_key) if (linked_key and active_key) else "N/A"))
             if linked_key and active_key and linked_key != active_key:
-                print("[DIAG-B2] 不一致検出 -> 監視を自動停止します。これがB-2仮説の再現です。")
+                if _DIAG_B2_VERBOSE:
+                    print("[DIAG-B2] 不一致検出 -> 監視を自動停止します。これがB-2仮説の再現です。")
                 self.stop(reason="scene_change")
                 self._emit_status(
                     "警告: このシーンの対応先SPプロジェクトと、SP側が今開いている"
