@@ -122,6 +122,7 @@ import os
 import re
 import json
 import time
+import glob
 import datetime
 import subprocess
 
@@ -419,7 +420,7 @@ def diag_c1_check_qobject_validity(window):
 #    (シグナル発火による再入は軽量なフラグで防止)。
 #    同じ理由で _refresh_material_table() (マテリアル構造タブ)にも
 #    同様の明示的読み直しを追加した。
-__version__ = "2026.07.16-06"
+__version__ = "2026.07.17-02"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -1775,8 +1776,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 )
 
             if reloaded:
-                self._flush_renderer_caches()
-                self._flush_viewport_cache()
+                self._flush_with_settle(reloaded)
                 self.stats["reload_count"] += 1
                 self.stats["last_reload_at"] = _now()
                 self.stats["last_node_count"] = len(reloaded)
@@ -1881,8 +1881,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 )
 
             if reloaded:
-                self._flush_renderer_caches()
-                self._flush_viewport_cache()
+                self._flush_with_settle(reloaded)
                 self.stats["reload_count"] += 1
                 self.stats["last_reload_at"] = _now()
                 self.stats["last_node_count"] = len(reloaded)
@@ -1899,6 +1898,29 @@ class LiveSyncWatcher(QtCore.QObject):
                     cmds.arnoldFlushCache(textures=True)
                 except Exception as e:
                     self._emit_status("Arnold キャッシュフラッシュに失敗: {0}".format(e))
+                # 2026.07.17 追加: arnoldFlushCache(textures=True) は
+                # Arnold内部のテクスチャキャッシュを破棄するだけで、
+                # 既に開いて動作中の Arnold RenderView(IPR)セッションには
+                # 反映されない不具合が実機で確認された(ARVを一度閉じて
+                # 開き直すまで古いテクスチャが表示され続ける)。
+                # Arnold公式ドキュメント(Arnold for Maya User Guide)は
+                # これと同じ状況のためにRenderViewの「Update Full Scene」
+                # 機能(Ctrl-U相当)を用意しており、"This avoids to close
+                # and re-open the RenderView." と明記している。
+                # -option フラグでメニュー名を直接指定することで、
+                # スクリプトから同じ操作を発行できる(Solid Angle公式
+                # フォーラムで確認済みの構文)。
+                #
+                # 安全性について: ARVが開いていない状態(=通常のLive Sync
+                # 運用中の大半)でこの呼び出しが失敗しても、以後の同期
+                # 動作(テクスチャ再読込・ビューポート更新)には一切
+                # 影響させたくないため、例外は黙って握りつぶす
+                # (_emit_status は呼ばない = 毎回の同期のたびにステータス
+                # 欄がエラーで埋まる事態を避ける)。
+                try:
+                    cmds.arnoldRenderView(option=["Update Full Scene", "1"])
+                except Exception:
+                    pass
             else:
                 self._emit_status("mtoa 未ロードのため Arnold キャッシュフラッシュをスキップしました。")
         elif renderer == "redshift":
@@ -1906,11 +1928,70 @@ class LiveSyncWatcher(QtCore.QObject):
         elif renderer == "vray":
             self._emit_status("V-Ray: 専用フラッシュコマンド未確定。IPR再起動を推奨(要検証)。")
 
+    def _flush_with_settle(self, file_nodes):
+        """
+        _flush_renderer_caches() / _flush_viewport_cache() を呼ぶ前に、
+        Mayaのイベントループへ明示的に制御を戻す猶予を作るラッパー。
+
+        2026.07.17: 当初は「マテリアルが割り当ててあるオブジェクトを
+        選択している状態だと反映が速い」という報告から、コード側で
+        該当オブジェクトを cmds.select() する対策を試みた。しかし
+        実機検証の結果、スクリプトからの選択では効果がなく、実際に
+        人間がクリックして選択した場合(たとえ一瞬の選択でも)にのみ
+        反映が速くなることが確認された。
+
+        これは「選択されているかどうか」自体が本質ではなく、クリックと
+        いう実際のUIイベントをMayaのイベントループ(Qt)が処理する
+        タイミングが間に挟まることで、保留中のシェーディングネット
+        ワークの評価がその間に完了しているためではないか、と考え直した
+        (file_nodes 引数は現在この仮説の下では未使用だが、将来また
+        オブジェクト単位の対策に戻す可能性を考慮してシグネチャは
+        維持している)。
+
+        対策として、実際のクリック操作を模して:
+          1. cmds.refresh(force=True) でビューポートの再描画を強制する
+             (クリック時に発生する再描画パスを疑似的に再現する)
+          2. QCoreApplication.processEvents() でMayaのイベントループに
+             滞留しているイベント・遅延評価を処理させる(人間の操作の
+             後に自然に生じる「間」を、コード側で明示的に作る)
+        の2段階を、Arnoldのキャッシュフラッシュ/Update Full Sceneより
+        前に挟む。
+        """
+        try:
+            cmds.refresh(force=True)
+        except Exception:
+            pass
+        try:
+            QtCore.QCoreApplication.processEvents()
+        except Exception:
+            pass
+
+        self._flush_renderer_caches()
+        self._flush_viewport_cache()
+
     def _flush_viewport_cache(self):
         try:
             cmds.ogs(reset=True)
         except Exception as e:
             self._emit_status("ogs(reset=True) に失敗: {0}".format(e))
+        # 2026.07.17 追加: Viewport 2.0 はUDIM(複数UVタイル)のfileノードに
+        # 対して、シーンを開いた直後やテクスチャ差し替え直後はプレビュー
+        # 画像を自動生成しない(Autodesk公式ドキュメントに明記された仕様。
+        # Windows > Settings/Preferences > Preferences > Display の
+        # "Generate UV tile previews on scene load" が既定でオフ)。
+        # このためUDIM対応オブジェクトが「マテリアル未割り当て」のように
+        # 見え、実際にはオブジェクトを選択する等でMaya側のプレビュー生成が
+        # 走って初めて正しく表示される、という体感の不具合を生む。
+        # Arnoldでのレンダリング自体は無関係(Arnoldは独自にテクスチャを
+        # 読むため、この問題の影響を受けない)。
+        # generateAllUvTilePreviews は上記プレビュー生成をスクリプトから
+        # 明示的に行うMELコマンド。ここで毎回呼んでおくことで、選択操作を
+        # 挟まなくてもビューポート表示が正しく更新されるようにする。
+        try:
+            import maya.mel as mel
+            mel.eval("generateAllUvTilePreviews;")
+        except Exception as e:
+            self._emit_status("UVタイルプレビューの再生成に失敗: {0}".format(e))
         cmds.refresh(force=True)
 
     # -- Phase 2: テクスチャセット構造への対応 -------------------------------
@@ -2230,7 +2311,20 @@ class LiveSyncWatcher(QtCore.QObject):
                     continue
                 base = os.path.basename(tex_path)
                 new_path = os.path.join(dest_dir, base)
-                if not os.path.isfile(new_path):
+                # 2026.07.17 修正: UDIM対応(uvTilingMode)のfileノードは
+                # fileTextureName に実在しない <UDIM> トークン込みの文字列
+                # (例: Body_BaseColor.<UDIM>.png)を保持している。これを
+                # そのまま os.path.isfile() で存在確認すると、対応する
+                # 実タイルファイル(.1001.png 等)が実際には揃っていても
+                # 「見つからない」と誤判定され続ける不具合があった。
+                # <UDIM> を含む場合は、4桁のタイル番号に対するワイルド
+                # カードで少なくとも1タイルが実在するかを確認する。
+                if "<UDIM>" in base:
+                    udim_glob = new_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
+                    if not glob.glob(udim_glob):
+                        missing.append(base)
+                        continue
+                elif not os.path.isfile(new_path):
                     missing.append(base)
                     continue
                 try:
@@ -2243,8 +2337,7 @@ class LiveSyncWatcher(QtCore.QObject):
             cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
         if switched or already:
-            self._flush_renderer_caches()
-            self._flush_viewport_cache()
+            self._flush_with_settle(switched)
             self.using_final_quality = use_final
             label = "高画質版(Final)" if use_final else "リアルタイムプレビュー"
             if switched and already:

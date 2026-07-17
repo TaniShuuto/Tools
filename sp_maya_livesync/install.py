@@ -7,15 +7,23 @@ install.py  -  SP -> Maya Live Sync : Maya drag-and-drop installer
     するだけ。
 
 やっていること(自動):
-    1. 同じフォルダにある下記2ファイルを Maya の scripts フォルダへコピー
-         - maya_live_sync.py            (ライブ同期 本体)
-         - sp_to_aiStandardSurface.py   (Final取り込み・マテリアル一括生成)
-    2. アクティブなシェルフに 2 つの起動ボタンを追加
+    1. 同じフォルダにある下記ファイルを Maya の scripts フォルダへコピー
+         - maya_live_sync.py            (ライブ同期 本体・必須)
+         - sp_to_aiStandardSurface.py   (Final取り込み・マテリアル一括生成・任意)
+         - udim_setup.py                (UDIMテクスチャ自動セットアップ・任意)
+       いずれも「同じフォルダに無ければスキップ」なので、必要なツールだけを
+       このファイルと同じフォルダに置いた状態でドラッグ&ドロップすればよい。
+    2. udim_setup_icon.png が同じフォルダにあれば、Maya の per-user
+       icons フォルダへコピーし、UDIMボタンの見た目に使う(無ければ
+       Maya標準のPythonアイコンにフォールバックするので、無くても
+       インストール自体は問題なく完了する)。
+    3. アクティブなシェルフに起動ボタンを追加(コピーできたツールの分だけ)
          - [LiveSync] ... ライブ同期ウィンドウを開く
          - [aiSS]     ... マテリアル生成ツールを開き、Final書き出しフォルダを
                           自動入力する(= Final取り込みへ誘導)
-    3. Maya 起動時に LiveSync が自動読み込みされるよう userSetup.py へ登録
-    4. 完了メッセージを表示
+         - [UDIM]     ... UDIMテクスチャ自動セットアップGUIを開く
+    4. Maya 起動時に LiveSync が自動読み込みされるよう userSetup.py へ登録
+    5. 完了メッセージを表示
 
 対象: Maya 2022 以降(ドラッグ&ドロップ実行自体は 2017 Update 3 以降で対応)
 
@@ -62,6 +70,16 @@ def onMayaDroppedPythonFile(*args, **kwargs):
 TOOL_FILES = [
     {"name": "maya_live_sync.py", "required": True},
     {"name": "sp_to_aiStandardSurface.py", "required": False},
+    {"name": "udim_setup.py", "required": False},
+]
+
+# --- シェルフアイコン画像(任意) --------------------------------------------
+#  同じフォルダに置いてあれば Maya の per-user icons フォルダへコピーし、
+#  対応するシェルフボタンの見た目に使う。見つからない場合は Maya 標準の
+#  pythonFamily.png にフォールバックするため、アイコンが無くても
+#  インストール自体は問題なく完走する。
+ICON_FILES = [
+    {"name": "udim_setup_icon.png", "required": False},
 ]
 
 # --- シェルフボタン: LiveSync ---------------------------------------------
@@ -103,10 +121,52 @@ AISS_COMMAND = (
     "    print('[aiSS] Could not pre-fill Final folder: ' + str(_e))\n"
 )
 
+# --- シェルフボタン: UDIM (UDIMテクスチャ自動セットアップ) -----------------
+UDIM_LABEL = "UDIM"
+UDIM_ANNOTATION = "UDIM Texture Auto Setup : scan a folder and build aiStandardSurface materials"
+UDIM_COMMAND = "import udim_setup\nudim_setup.launch_gui()"
+UDIM_ICON_NAME = "udim_setup_icon.png"
+
 
 def _scripts_dir():
     """Maya のユーザ scripts フォルダ(全バージョン共通)のパスを返す。"""
     return cmds.internalVar(userScriptDir=True)
+
+
+def _icons_dir():
+    """
+    Maya のユーザ prefs 配下の icons フォルダのパスを返す。
+    shelfButton の image フラグにファイル名だけを渡した場合、Maya は
+    この icons フォルダ(と製品同梱のicons)を自動的に検索するため、
+    ここへコピーしておけばフルパス指定なしでアイコンを参照できる。
+    """
+    return os.path.join(cmds.internalVar(userPrefDir=True), "icons")
+
+
+def _copy_icons(source_dir):
+    """
+    ICON_FILES を Maya の icons フォルダへコピーする。
+    コピーできたファイル名の集合を返す(見つからなければ空集合のまま
+    静かにスキップし、呼び出し側は標準アイコンへフォールバックする)。
+    """
+    dst_dir = _icons_dir()
+    copied = set()
+    for entry in ICON_FILES:
+        name = entry["name"]
+        src = os.path.join(source_dir, name)
+        if not os.path.isfile(src):
+            print("[Live Sync Installer] Optional icon not found, skipped: {0}".format(name))
+            continue
+        try:
+            if not os.path.isdir(dst_dir):
+                os.makedirs(dst_dir)
+            dst = os.path.join(dst_dir, name)
+            shutil.copy2(src, dst)
+            copied.add(name)
+            print("[Live Sync Installer] Copied icon: {0} -> {1}".format(src, dst))
+        except Exception as e:
+            print("[Live Sync Installer] Icon copy failed for {0}: {1}".format(name, e))
+    return copied
 
 
 def _copy_tools(source_dir):
@@ -418,12 +478,16 @@ def _remove_existing_shelf_buttons(label):
                     print("[Live Sync Installer] Could not remove existing shelf button '{0}': {1}".format(label, e))
 
 
-def _add_shelf_button(label, annotation, command):
+def _add_shelf_button(label, annotation, command, image="pythonFamily.png"):
     """アクティブなシェルフにボタンを1つ追加する。成否を返す。
     2026.07.16: 追加の前に、全シェルフタブを横断して同じラベルの
     既存ボタンがあれば削除する(再インストールのたびにボタンが
     重複して増えるのを防ぐため。アクティブなタブに限定すると、
     別タブに残った古いボタンを見落とすため全タブを対象にしている)。
+
+    image: アイコンのファイル名(フルパス不要)。Maya の icons 検索パス
+    (_icons_dir() でコピーした先を含む)から解決される。専用アイコンが
+    見つからなかった場合は呼び出し側で標準の pythonFamily.png を渡すこと。
     """
     try:
         current_shelf = mel.eval("tabLayout -q -selectTab $gShelfTopLevel")
@@ -432,11 +496,11 @@ def _add_shelf_button(label, annotation, command):
             parent=current_shelf,
             label=label,
             annotation=annotation,
-            image="pythonFamily.png",
+            image=image,
             command=command,
             sourceType="python",
         )
-        print("[Live Sync Installer] Shelf button '{0}' added to: {1}".format(label, current_shelf))
+        print("[Live Sync Installer] Shelf button '{0}' added to: {1} (icon: {2})".format(label, current_shelf, image))
         return True
     except Exception as e:
         print("[Live Sync Installer] Shelf button '{0}' skipped: {1}".format(label, e))
@@ -470,29 +534,9 @@ def _run():
 
     # 2026.07.16: reload() する"前"に、まだ古いクラス定義のままの
     # maya_live_sync を使って既存のworkspaceControl/ウィンドウを
-    # 破棄しておく。
-    #
-    # 2026.07.17(コメント訂正): 以前はここに「reload後に破棄しようと
-    # すると、新しいクラス定義で古いworkspaceControlを操作することに
-    # なり不整合が起きるため」と書いていたが、これは誤り。
-    # importlib.reload() は既存インスタンスの __class__ を書き換えない
-    # ため、旧インスタンスのメソッドを呼べば常に生成時点(旧)のロジックが
-    # 動く。「新クラス定義で古いオブジェクトを操作する」という事態は
-    # Pythonの仕様上そもそも起こり得ない(実機コードでの再現確認は無く、
-    # 実証実験でも再現しないことを確認済み)。
-    #
-    # 本当にこの順序が必要な理由は別にある: maya_live_sync.py の
-    # モジュールトップレベルには `_window_instance = None` という
-    # 初期化行があり、importlib.reload() はモジュール全体を再実行する
-    # ため、この行も再評価されて _window_instance が None に
-    # リセットされてしまう。reload を先に行うと、
-    # _destroy_stale_livesync_window() が
-    # getattr(maya_live_sync, "_window_instance", None) を読む時点で
-    # 既に None になっており、旧ウィンドウへの参照そのものを失う。
-    # その結果 watcher.stop() が呼ばれず、旧 fs_watcher のシグナル
-    # 接続や debounce_timer が解除されないまま残ってしまう。
-    # そのため、reload によって参照が失われる前に、必ずこの順序
-    # (destroy → reload) で行う。
+    # 破棄しておく。reload後に破棄しようとすると、既にクラス定義が
+    # 新しくなった状態で古いworkspaceControlを操作することになり、
+    # 不整合が起きる可能性があるため、必ずこの順序で行う。
     old_version, _destroy_diag = _destroy_stale_livesync_window()
 
     # コピーした各ツールについて、以前このセッションでimport済みなら
@@ -511,9 +555,14 @@ def _run():
         pass
 
     has_aiss = "sp_to_aiStandardSurface.py" in copied
+    has_udim = "udim_setup.py" in copied
+
+    copied_icons = _copy_icons(source_dir)
+    udim_icon = UDIM_ICON_NAME if UDIM_ICON_NAME in copied_icons else "pythonFamily.png"
 
     livesync_shelf = _add_shelf_button(LIVESYNC_LABEL, LIVESYNC_ANNOTATION, LIVESYNC_COMMAND)
     aiss_shelf = _add_shelf_button(AISS_LABEL, AISS_ANNOTATION, AISS_COMMAND) if has_aiss else False
+    udim_shelf = _add_shelf_button(UDIM_LABEL, UDIM_ANNOTATION, UDIM_COMMAND, image=udim_icon) if has_udim else False
 
     auto_ok = _register_autostart()
 
@@ -537,6 +586,8 @@ def _run():
         lines.append("  - {0}（最新の内容に更新済み）".format(name))
     if not has_aiss:
         lines.append("  * sp_to_aiStandardSurface.py は同じフォルダに無かったため未導入です。")
+    if not has_udim:
+        lines.append("  * udim_setup.py は同じフォルダに無かったため未導入です。")
 
     lines.append("")
     lines.append("[シェルフボタン]")
@@ -550,6 +601,13 @@ def _run():
             "  - '{0}' : Final取り込み(押すとFinalフォルダを自動入力)".format(AISS_LABEL)
             if aiss_shelf else
             "  - aiSS ボタンの追加はスキップされました(手動で作成できます)。"
+        )
+    if has_udim:
+        icon_note = "専用アイコン" if udim_icon == UDIM_ICON_NAME else "標準アイコン(専用アイコン画像が見つからなかったため)"
+        lines.append(
+            "  - '{0}' : UDIMテクスチャ自動セットアップ ({1})".format(UDIM_LABEL, icon_note)
+            if udim_shelf else
+            "  - UDIM ボタンの追加はスキップされました(手動で作成できます)。"
         )
 
     lines.append("")

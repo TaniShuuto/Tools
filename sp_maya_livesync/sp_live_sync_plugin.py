@@ -834,25 +834,38 @@ class LiveSyncEngine(QtCore.QObject):
         else:
             target_sets = configured_sets or [ts.name() for ts in textureset.all_texture_sets()]
 
+        # 2026.07.17 修正: fileName に $udim トークンが無かったため、UDIM
+        # (複数UVタイル)を含むテクスチャセットを書き出すと、$textureSet_
+        # BaseColor のようなテンプレートが全タイルで同じ文字列に解決されて
+        # しまい、Painter側が名前衝突を避けるために独自の連番
+        # (_1, _2, ...)を末尾に付与していた。これはタイル番号(1001,
+        # 1002...)ではなく単なる重複回避カウンタのため、udim_setup.py の
+        # タイル検出(末尾の4桁UDIM番号を期待)や sp_to_aiStandardSurface.py
+        # のプレフィックス抽出が正しく機能しない原因になっていた。
+        # 括弧で囲むことで、Painter公式ドキュメントの仕様通り「UDIM
+        # タイルが複数ある場合のみ .<UDIM番号> を付与し、単一タイルの
+        # 場合は何も付与しない」条件付きトークンとして働く。
+        # (Live/Final の両方でこの _build_export_config() を共有している
+        # ため、この修正は自動的に両方に適用される)
         maps = [
-            {"fileName": "$textureSet_BaseColor", "channels": [
+            {"fileName": "$textureSet_BaseColor(.$udim)", "channels": [
                 {"destChannel": c, "srcChannel": c, "srcMapType": "documentMap", "srcMapName": "basecolor"}
                 for c in ("R", "G", "B")
             ]},
-            {"fileName": "$textureSet_Roughness", "channels": [
+            {"fileName": "$textureSet_Roughness(.$udim)", "channels": [
                 {"destChannel": "L", "srcChannel": "L", "srcMapType": "documentMap", "srcMapName": "roughness"}
             ]},
-            {"fileName": "$textureSet_Metallic", "channels": [
+            {"fileName": "$textureSet_Metallic(.$udim)", "channels": [
                 {"destChannel": "L", "srcChannel": "L", "srcMapType": "documentMap", "srcMapName": "metallic"}
             ]},
-            {"fileName": "$textureSet_Normal", "channels": [
+            {"fileName": "$textureSet_Normal(.$udim)", "channels": [
                 {"destChannel": c, "srcChannel": c, "srcMapType": "virtualMap", "srcMapName": "Normal_OpenGL"}
                 for c in ("R", "G", "B")
             ]},
-            {"fileName": "$textureSet_Height", "channels": [
+            {"fileName": "$textureSet_Height(.$udim)", "channels": [
                 {"destChannel": "L", "srcChannel": "L", "srcMapType": "documentMap", "srcMapName": "height"}
             ]},
-            {"fileName": "$textureSet_Emissive", "channels": [
+            {"fileName": "$textureSet_Emissive(.$udim)", "channels": [
                 {"destChannel": c, "srcChannel": c, "srcMapType": "documentMap", "srcMapName": "emissive"}
                 for c in ("R", "G", "B")
             ]},
@@ -867,9 +880,13 @@ class LiveSyncEngine(QtCore.QObject):
                 "sizeLog2": size_log2,
             }
         }]
+        # 2026.07.17: 上の maps 側 fileName に (.$udim) を追加したため、
+        # このフィルタも同じテンプレート文字列(UDIMトークン込み)で
+        # 指定しないと対象マップにマッチしなくなる(outputMapsは
+        # fileNameテンプレート文字列そのものを見て絞り込むため)。
         for suffix in cfg.get("raw_colorspace_suffixes", []):
             export_parameters.append({
-                "filter": {"outputMaps": ["$textureSet_{0}".format(suffix)]},
+                "filter": {"outputMaps": ["$textureSet_{0}(.$udim)".format(suffix)]},
                 "parameters": {
                     "fileFormat": cfg.get("file_format", "png"),
                     "bitDepth": cfg.get("bit_depth", "8"),
