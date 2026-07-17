@@ -1284,27 +1284,6 @@ class LiveSyncWatcher(QtCore.QObject):
             if key in latest:
                 self.config[key] = latest[key]
 
-        # --- [DIAG-B1] ---------------------------------------------------
-        # 一次切り分け用の計装: このメソッドは project_poll_timer からしか
-        # 定期的に呼ばれず、そのタイマーは watcher.enabled (=監視ON) の
-        # 間しか動いていない(B-1仮説)。ここでは「最後にこのメソッドが
-        # 呼ばれてから何秒経過したか」と「その時点でenabledかどうか」を
-        # 記録し、監視OFF中に呼び出し間隔が伸び続ける(またはゼロ回に
-        # なる)ことをログで確定させる。根治(タイマーのON/OFF分離)は
-        # まだ行わない。
-        now_ts = time.time()
-        last_ts = getattr(self, "_diag_b1_last_refresh_ts", None)
-        gap = (now_ts - last_ts) if last_ts is not None else None
-        self._diag_b1_last_refresh_ts = now_ts
-        self._diag_b1_call_count = getattr(self, "_diag_b1_call_count", 0) + 1
-        print("[DIAG-B1] _refresh_dynamic_config call#{0} watcher.enabled={1} "
-              "前回呼び出しからの経過秒={2} active_project_key={3}".format(
-                  self._diag_b1_call_count,
-                  self.enabled,
-                  ("{:.1f}".format(gap) if gap is not None else "N/A(初回)"),
-                  self.config.get("active_project_key"),
-              ))
-
         if self.config.get("active_project_key") != prev_active_project_key:
             self.scene_link_changed.emit()
 
@@ -3398,13 +3377,3 @@ try:
     _EXITING_CALLBACK_ID = om.MSceneMessage.addCallback(om.MSceneMessage.kMayaExiting, _on_maya_exiting)
 except Exception as _e:
     print("[maya_live_sync] Could not register exit callback: {0}".format(_e))
-
-# --- [DIAG-A3] (検証用ログは残す) --------------------------------------
-# 根治後も「実際に重複登録が解消されたか」を確認できるよう、
-# カウンタ計装自体はそのまま残す。冪等化が効いていれば、
-# 「登録試行回数」は増え続けても実際にMaya側に残るコールバックは
-# 常に1個(直前に必ず解除しているため)になっているはずである。
-_DIAG_A3_REGISTER_COUNT = globals().get("_DIAG_A3_REGISTER_COUNT", 0) + 1
-print("[DIAG-A3] _on_maya_exiting 登録試行 回数(このMayaセッション内の累積import/reload回数): {0} "
-      "/ 現在の有効コールバックID: {1}(冪等化により常に直前の1個のみが有効なはず)".format(
-    _DIAG_A3_REGISTER_COUNT, _EXITING_CALLBACK_ID))
