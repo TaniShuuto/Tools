@@ -9,14 +9,14 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 
 ## 事前準備（1分）
 
-以下の3ファイルを、**同じフォルダ**にまとめてダウンロードしておきます。
+以下のファイルを、**同じフォルダ**にまとめてダウンロードしておきます。
 
 - `install.py` … Maya 用インストーラー
 - `maya_live_sync.py` … Maya 本体
 - `sp_live_sync_plugin.py` … Substance Painter 本体
 - `sp_to_aiStanderdSurface.py` … aiSS（自動テクスチャ割り当て機能）本体
 
-> `install.py` と `maya_live_sync.py`  `sp_to_aistanderdsurface.py`は**必ず同じフォルダ**に置いてください（インストーラーが隣のファイルを探します）。
+> `install.py` と `maya_live_sync.py`  `sp_to_aistanderdsurface.py`は**必ず同じフォルダ**に置いてください。
 
 ---
 
@@ -40,6 +40,13 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 > maya_live_sync.show_ui()
 > ```
 
+## tips
+**もし既にインストール済みの場合**
+以下の手順を踏むことで確実に動作します。
+1. `Uninstall.py`をドラッグ&ドロップします。
+2. シェルフにある起動ボタンを右クリック-Deleteから削除します。
+3. **通常のインストール手順を行ってください。**
+
 ---
 
 ## ② Substance Painter 側（ファイルを1つ置くだけ）
@@ -53,26 +60,33 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
    → **すべて初期値のまま進めてOK**です（Maya 側と自動で一致します）。
 
 ---
+## ③　SP_to_AIstanderdSurface（AISS)の使い方
 
-## ③ 使ってみる
+**AISS**はSPでエクスポートしたテクスチャをスキャンして自動的にAistanderdSurfaceとして作成する機能です。
+1. **AISS**のシェルフボタンを押して起動する（2つ追加されたボタンの内の右側です）。
+2. ウィンドウが開くのでFileを入力する箇所にエクスポートしたテクスチャのファイルパスを指定します。
+3. Scanボタンを押すと自動的にそのファイルに含まれるテクスチャの名前、テクスチャの数を表示します。
+4. 一覧の中でAistanderdSurfaceとして生成したいテクスチャにチェックを入れます。
+5. Create Checked Materials(緑のボタン)で作成します
 
-1. **Maya**：`LiveSync` ボタンでウィンドウを開き、**監視を開始**します。
-2. **SP**：プロジェクトを開き、Live Sync パネルで**同期を開始**します。
-3. SP で少し塗ると、数秒後に Maya 側へ反映されます。
 
 ---
 
-## ⚠️ 凹凸（Height / ディスプレイスメント）を使うときだけ必要な設定
+## ④ 実際に使ってみる
 
-Height（変位）を使うと、箱などが**歪む・膨らむ・球になる**ことがあります。
-これは正常な仕様で、**メッシュ側に1つ設定を足す**だけで直ります。
+1. モデルにAistanderdSurfaceを割り当てた状態でエクスポート
+2. SP側でインポート
+3. SPのプロジェクトを保存
+4. AISSを起動してテクスチャを読み込み
+5. MayaLiveSyncウィンドウを開いて状態の部分がもし未設定ならSPプロジェクトを設定を押してリンク
+6. Maya、SP両方とも監視をONにすることで同期が開始
 
-対象メッシュを選び、アトリビュートエディタの **shape ノード > Arnold > Subdivision** で：
+## Tips
+品質表示がプレビューである場合テクスチャの画質が低いです。高画質にするには表示品質を高画質にしてください
 
-- **Type** を `linear`（箱・平面）または `catclark`（岩・布などの有機物）に変更
-- **Iterations** を `2`〜`3` に設定
+表示品質が高画質の場合はSP側で保存を行った場合にのみ同期されます。
+---
 
-> それでも全体が膨らむ場合は、同じ shape の **Displacement Attributes > Zero Value** を `0.5` にしてください。
 
 ---
 
