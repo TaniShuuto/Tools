@@ -470,9 +470,29 @@ def _run():
 
     # 2026.07.16: reload() する"前"に、まだ古いクラス定義のままの
     # maya_live_sync を使って既存のworkspaceControl/ウィンドウを
-    # 破棄しておく。reload後に破棄しようとすると、既にクラス定義が
-    # 新しくなった状態で古いworkspaceControlを操作することになり、
-    # 不整合が起きる可能性があるため、必ずこの順序で行う。
+    # 破棄しておく。
+    #
+    # 2026.07.17(コメント訂正): 以前はここに「reload後に破棄しようと
+    # すると、新しいクラス定義で古いworkspaceControlを操作することに
+    # なり不整合が起きるため」と書いていたが、これは誤り。
+    # importlib.reload() は既存インスタンスの __class__ を書き換えない
+    # ため、旧インスタンスのメソッドを呼べば常に生成時点(旧)のロジックが
+    # 動く。「新クラス定義で古いオブジェクトを操作する」という事態は
+    # Pythonの仕様上そもそも起こり得ない(実機コードでの再現確認は無く、
+    # 実証実験でも再現しないことを確認済み)。
+    #
+    # 本当にこの順序が必要な理由は別にある: maya_live_sync.py の
+    # モジュールトップレベルには `_window_instance = None` という
+    # 初期化行があり、importlib.reload() はモジュール全体を再実行する
+    # ため、この行も再評価されて _window_instance が None に
+    # リセットされてしまう。reload を先に行うと、
+    # _destroy_stale_livesync_window() が
+    # getattr(maya_live_sync, "_window_instance", None) を読む時点で
+    # 既に None になっており、旧ウィンドウへの参照そのものを失う。
+    # その結果 watcher.stop() が呼ばれず、旧 fs_watcher のシグナル
+    # 接続や debounce_timer が解除されないまま残ってしまう。
+    # そのため、reload によって参照が失われる前に、必ずこの順序
+    # (destroy → reload) で行う。
     old_version, _destroy_diag = _destroy_stale_livesync_window()
 
     # コピーした各ツールについて、以前このセッションでimport済みなら
