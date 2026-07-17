@@ -81,7 +81,34 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 
 # バージョン情報。SP起動時に必ずPythonログへ出力し、「今動いているのが
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
-__version__ = "2026.07.15-01"
+#
+# 2026.07.16-01 緊急修正:
+#     _current_project_key() が project.file_path() の戻り値をそのまま
+#     信頼していたため、テンプレートから新規プロジェクトを作成した
+#     直後(まだ一度も保存していない状態)に、公式ドキュメントの契約
+#     ("未保存ならNoneを返す")に反してテンプレートファイル(.spt)の
+#     パスが返ってくるケースで、それをプロジェクトキーとして採用して
+#     しまう不具合があった。Maya側の紐付けUIに実際のプロジェクト名
+#     ("TEST_1"等)ではなくテンプレート名が表示される、という形で
+#     顕在化した。
+#     対策として、公式に「未保存なら確実にNoneを返す」と明記されている
+#     project.name() を先に確認し、これがNoneであれば file_path() の
+#     値を信頼しない(必ず "__unsaved__" にフォールバックする)よう
+#     二段構えの判定に変更した。
+#
+# 2026.07.16-02 緊急修正:
+#     v2026.07.16-01の修正(project.name()での二段構え判定)は「未保存の
+#     間に誤ったキーを掴む」ケースは解決したが、別の見落としが残って
+#     いた: on_project_edition_entered() はプロジェクトを開いた/作成
+#     した"その瞬間"の active_project_key しか記録せず、その後
+#     実際に名前を付けて保存しても再計算されない。一方 _do_export()
+#     内の active_watch_subfolder はエクスポートのたびに都度再計算
+#     されるため、「監視フォルダ名(TEST_1_5b5599等)は正しいのに、
+#     Maya側の状態バーの紐付け表示だけがテンプレート名や__unsaved__の
+#     まま」という矛盾が実機で確認された。
+#     対策として、on_project_saved() でも active_project_key を
+#     明示的に再計算・保存するようにした。
+__version__ = "2026.07.16-02"
 
 import os
 import re
@@ -261,7 +288,32 @@ def _current_project_key():
     """現在のプロジェクトを一意に識別するキーを返す。
     未保存プロジェクトの場合は固定文字列を使う(この場合、複数の未保存
     プロジェクトを区別できない点は既知の制限とする)。
+
+    2026.07.16(緊急修正): project.file_path() は公式ドキュメント上
+    「プロジェクトが未保存ならNoneを返す」とされているが、実機では
+    テンプレートから新規プロジェクトを作成した直後、一度も保存して
+    いない状態で、Noneではなく作成元テンプレート(.spt)のパスを
+    返すケースが確認された。この値をそのままプロジェクトキーとして
+    使うと、Maya側の紐付けUIに「TEST_1」ではなく
+    「PBR - Metallic Roughness Alpha-blend.spt」のようなテンプレート名が
+    表示されてしまい、実際のプロジェクトと異なるキーで紐付けが行われる
+    (ドキュメントに明記されていない、実装依存の挙動と考えられる)。
+
+    対策として、公式に「未保存なら確実にNoneを返す」と明記されている
+    project.name() を先に確認し、これがNoneであれば file_path() の値を
+    信頼せず "__unsaved__" にフォールバックするようにした。
     """
+    try:
+        name = project.name()
+    except Exception:
+        name = None
+
+    if not name:
+        # project.name() がNoneを返す = 公式仕様上、確実に未保存。
+        # file_path() が(ドキュメントの契約に反して)何らかのパスを
+        # 返していても、それは信頼できないため無視する。
+        return "__unsaved__"
+
     try:
         path = project.file_path()
     except Exception:
@@ -435,6 +487,27 @@ class LiveSyncEngine(QtCore.QObject):
         self.debounce_timer.start(interval_ms)
 
     def on_project_saved(self, evt):
+        # 2026.07.16(緊急修正): on_project_edition_entered() は
+        # プロジェクトを開いた/作成した"その瞬間"の _current_project_key()
+        # しか記録しない。テンプレートから新規プロジェクトを作成した
+        # 直後はまだ未保存("__unsaved__")のため、その後実際に名前を
+        # 付けて保存しても、active_project_key はここを更新する処理が
+        # 無ければ "__unsaved__" のまま(または不正確な値のまま)取り
+        # 残される。
+        # 一方 _do_export() 内の active_watch_subfolder は、エクスポート
+        # のたびに _project_subfolder_name() 経由で _current_project_key()
+        # を都度再計算していたため、保存後は正しいプロジェクト名を
+        # 反映していた。この非対称性により、「監視フォルダ名は正しい
+        # プロジェクト名になっているのに、Maya側の状態バー(紐付け表示)
+        # だけがテンプレート名や__unsaved__のまま」という矛盾が
+        # 実機で確認された。
+        # 対策として、保存イベントのタイミングでも active_project_key を
+        # 明示的に再計算・保存するようにした。
+        key = _current_project_key()
+        if self.config.get("active_project_key") != key:
+            self.config["active_project_key"] = key
+            save_config({"active_project_key": key})
+
         if not self.enabled:
             return
         # 保存直後はPainter内部の保存処理がまだロックを保持していることが
