@@ -1,6 +1,31 @@
 """
-udim_setup.py  v1.0  ―  SP → Maya UDIM テクスチャ自動セットアップツール
+udim_setup.py  v5  ―  SP → Maya UDIM テクスチャ自動セットアップツール
 ==========================================================================
+2026-07-18 修正: ヘッダーが "v1.0" のまま据え置かれていたが、実際には
+下記 v4 の内容が既に反映済みだったため、実態に合わせて v5 に更新した
+（v1.0 → v4 の間のバージョン番号の付け忘れ）。
+
+改善点 (v5):
+  ・不具合修正
+      - Emissive/Emission 接続時に emission（発光強度）属性が未設定で
+        レンダーに反映されない不具合を修正（also_set 機構を追加）
+      - UDIM タイル検出が範囲チェックなしで任意の 4 桁数字を拾ってしまう
+        誤検知を防止（1001-9999 の妥当範囲チェックを追加）
+      - モデル 1 件の処理失敗がバッチ全体を中断させる問題を修正
+        （モデル単位の try/except を追加、失敗分は集計して継続）
+      - 既存 File ノード再利用時、place2dTexture 接続が実際に生きて
+        いるかを検証していなかった問題を修正
+  ・機能追加（sp_to_aiStandardSurface.py v2.1 と挙動を統一）
+      - Height/Displacement を remapValue 経由で自動接続
+        （0-1 → -0.5〜0.5 再マッピングによる "パフ" 現象対策）
+      - Glossiness/Gloss チャンネルに対応（reverse ノードで反転接続）
+      - マテリアル名プレフィックスの既定値を "M_" から空文字に変更し、
+        sp_to_aiStandardSurface.py と同じ命名（ファイル名そのまま）を
+        既定の挙動にした（プレフィックス欄自体は残し任意入力は可能）
+  ・堅牢性向上
+      - テクスチャフォルダの存在確認を追加（存在しないパス指定時に
+        分かりやすい警告を表示）
+
 改善点 (v4):
   ・検知エンジン全面刷新
       - _ / . 区切りを自動判別（タイル番号前・チャンネル名前の両方）
@@ -77,8 +102,13 @@ CHANNEL_VARIANTS = {
     "Normal_OpenGL":    {"attr": "normalCamera",      "colorSpace": "Raw",  "outChannel": "outColor", "useNormal": True},
     "Normal_DirectX":   {"attr": "normalCamera",      "colorSpace": "Raw",  "outChannel": "outColor", "useNormal": True, "invertY": True},
     # Emissive
-    "Emissive":         {"attr": "emissionColor",     "colorSpace": "sRGB", "outChannel": "outColor"},
-    "Emission":         {"attr": "emissionColor",     "colorSpace": "sRGB", "outChannel": "outColor"},
+    # Fix(v5): also_set で emission（発光強度）を自動設定。
+    # emissionColor だけ繋いでも emission weight が既定 0 のままだと
+    # レンダーに何も映らないため。
+    "Emissive":         {"attr": "emissionColor",     "colorSpace": "sRGB", "outChannel": "outColor",
+                         "also_set": {"emission": 1.0}},
+    "Emission":         {"attr": "emissionColor",     "colorSpace": "sRGB", "outChannel": "outColor",
+                         "also_set": {"emission": 1.0}},
     # AO
     "AO":               {"attr": None, "colorSpace": "Raw",  "outChannel": "outColorR",
                          "note": "LayeredTexture 等で BaseColor に手動合成してください"},
@@ -87,16 +117,23 @@ CHANNEL_VARIANTS = {
     "Mixed_AO":         {"attr": None, "colorSpace": "Raw",  "outChannel": "outColorR",
                          "note": "LayeredTexture 等で BaseColor に手動合成してください"},
     # Height / Displacement
-    "Height":           {"attr": None, "colorSpace": "Raw",  "outChannel": "outColorR",
-                         "note": "Displacement Shader に手動接続してください"},
-    "Displacement":     {"attr": None, "colorSpace": "Raw",  "outChannel": "outColorR",
-                         "note": "Displacement Shader に手動接続してください"},
+    # Fix(v5): "__displacement__" マーカーにより remapValue 経由で
+    # displacementShader へ自動接続する（sp_to_aiStandardSurface.py v2.1 の
+    # パフ対策と同じ挙動）。手動接続の note は不要になったため削除。
+    "Height":           {"attr": "__displacement__", "colorSpace": "Raw",  "outChannel": "outColorR"},
+    "Displacement":     {"attr": "__displacement__", "colorSpace": "Raw",  "outChannel": "outColorR"},
     # Opacity
     "Opacity":          {"attr": "opacity",           "colorSpace": "Raw",  "outChannel": "outColorR"},
     "Alpha":            {"attr": "opacity",           "colorSpace": "Raw",  "outChannel": "outColorR"},
     # Specular
     "Specular":         {"attr": "specular",          "colorSpace": "Raw",  "outChannel": "outColorR"},
     "SpecularColor":    {"attr": "specularColor",     "colorSpace": "sRGB", "outChannel": "outColor"},
+    # Fix(v5): Glossiness/Gloss に対応。Roughness の逆数のため
+    # invertValue: True を立て、reverse ノード経由で反転接続する。
+    "Glossiness":       {"attr": "specularRoughness", "colorSpace": "Raw",  "outChannel": "outColorR",
+                         "invertValue": True},
+    "Gloss":            {"attr": "specularRoughness", "colorSpace": "Raw",  "outChannel": "outColorR",
+                         "invertValue": True},
     # Subsurface
     "Subsurface":       {"attr": "subsurface",        "colorSpace": "Raw",  "outChannel": "outColorR"},
     "SSS":              {"attr": "subsurface",        "colorSpace": "Raw",  "outChannel": "outColorR"},
@@ -163,6 +200,12 @@ def _extract_tile(filename: str):
 
     sep       = m.group(1)
     tile_num  = int(m.group(2))
+
+    # Fix(v5): UDIM の妥当範囲(1001-9999)チェック。年号やバージョン番号
+    # 等の 4 桁数字を誤ってタイル番号として採用しないための安全網。
+    if not (1001 <= tile_num <= 9999):
+        return None
+
     stem      = name_no_ext[: m.start()]
     return stem, sep, tile_num, real_ext.lower()
 
@@ -405,10 +448,58 @@ def _connect_place2d(file_node: str, p2d: str):
                 pass
 
 
+# Fix(v5): sp_to_aiStandardSurface.py v2.1 のパフ対策(remapValue再マッピング)
+# を移植。デフォルト値も同じ 0.1 を使用する。
+DISPLACEMENT_SCALE_DEFAULT = 0.1
+
+
+def _connect_displacement(shader: str, file_node: str):
+    """
+    Height/Displacement 用 File ノードを remapValue 経由で
+    displacementShader に接続する。
+
+    0-1 のグレースケール範囲を -0.5〜0.5 に再マッピングすることで、
+    0.5(中間グレー)を変位ゼロの基準にし、直接接続した場合に生じる
+    一様な「パフ」現象を取り除く。保守的なスケール値を
+    displacementShader に初期設定するが、メッシュ側の Subdivision /
+    Bounds Padding は本関数では触らないため別途手動設定が必要。
+
+    (sp_to_aiStandardSurface.py v2.1 の _connect_displacement() を移植)
+    """
+    remap = cmds.shadingNode("remapValue", asUtility=True)
+    cmds.setAttr(f"{remap}.inputMin", 0.0)
+    cmds.setAttr(f"{remap}.inputMax", 1.0)
+    cmds.setAttr(f"{remap}.outputMin", -0.5)
+    cmds.setAttr(f"{remap}.outputMax", 0.5)
+    cmds.connectAttr(f"{file_node}.outColorR", f"{remap}.inputValue", force=True)
+
+    disp = cmds.shadingNode("displacementShader", asShader=True)
+    cmds.connectAttr(f"{remap}.outValue", f"{disp}.displacement", force=True)
+
+    if (DISPLACEMENT_SCALE_DEFAULT is not None
+            and cmds.attributeQuery("scale", node=disp, exists=True)):
+        try:
+            cmds.setAttr(f"{disp}.scale", DISPLACEMENT_SCALE_DEFAULT)
+        except Exception:
+            pass
+
+    sg = cmds.listConnections(f"{shader}.outColor", d=True, type="shadingEngine")
+    if sg:
+        cmds.connectAttr(f"{disp}.displacement", f"{sg[0]}.displacementShader", force=True)
+
+    print(
+        "[UDIM Setup]    Displacement を remapValue 経由で接続しました"
+        f"(0-1 → -0.5〜0.5, scale={DISPLACEMENT_SCALE_DEFAULT})。"
+        " メッシュ側の Subdivision (aiSubdivType) と"
+        " Bounds Padding (aiDispPadding) は別途手動設定してください。"
+    )
+    return disp
+
+
 def setup_udim_material(
     scan_results: dict,
     selected_models: list = None,
-    material_prefix: str = "M_",
+    material_prefix: str = "",  # Fix(v5): 既定を空文字に変更(AISSと同一挙動がデフォルト)
     create_tx: bool = False,
     use_relative_path: bool = False,  # プロジェクト相対パス
     layout_hypershade: bool = False,  # Hypershade 自動レイアウト
@@ -420,7 +511,7 @@ def setup_udim_material(
     ----------
     scan_results    : scan_textures() の返り値
     selected_models : 処理するモデル名リスト (None = 全モデル)
-    material_prefix : マテリアル名プレフィックス (デフォルト "M_")
+    material_prefix : マテリアル名プレフィックス (デフォルト ""＝AISSと同一挙動)
     create_tx       : True の場合 .tx 変換も実行
     """
     # ── Fix: Arnold プラグイン確認 ──────────────────────────────────────
@@ -441,6 +532,7 @@ def setup_udim_material(
 
     targets = selected_models if selected_models else list(scan_results.keys())
     created = []
+    failed: list = []     # Fix(v5): エラーで処理できなかったモデル名を集計
     tx_dirs: set = set()  # Fix: TX 変換用ユニーク dir を収集（ループ外で実行）
 
     for base_name in targets:
@@ -448,119 +540,156 @@ def setup_udim_material(
             print(f"[UDIM Setup] '{base_name}' がスキャン結果に存在しません (スキップ)")
             continue
 
-        model_data = scan_results[base_name]
+        # Fix(v5): モデル 1 件の処理失敗がバッチ全体を中断させないよう、
+        # モデル単位で try/except する。失敗しても残りのモデルは継続処理する。
+        try:
+            model_data = scan_results[base_name]
 
-        # ── Fix: mat_name のサニタイズ（ドット・空白等の不正文字を除去）───
-        mat_name_raw = f"{material_prefix}{base_name}"
-        mat_name = re.sub(r"[^A-Za-z0-9_]", "_", mat_name_raw)
-        if mat_name and mat_name[0].isdigit():
-            mat_name = "_" + mat_name  # 先頭が数字の場合はアンダースコアを補う
+            # ── Fix: mat_name のサニタイズ（ドット・空白等の不正文字を除去）───
+            mat_name_raw = f"{material_prefix}{base_name}"
+            mat_name = re.sub(r"[^A-Za-z0-9_]", "_", mat_name_raw)
+            if mat_name and mat_name[0].isdigit():
+                mat_name = "_" + mat_name  # 先頭が数字の場合はアンダースコアを補う
 
-        # マテリアル作成 / 既存取得
-        if not cmds.objExists(mat_name):
-            shader = cmds.shadingNode("aiStandardSurface", asShader=True, name=mat_name)
-            sg_name = f"{mat_name}SG"
-            sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=sg_name)
-            cmds.connectAttr(f"{shader}.outColor", f"{sg}.surfaceShader", force=True)
-            print(f"[UDIM Setup] マテリアル作成: {mat_name}")
-        else:
-            # Fix: 既存ノードが別の型でないかチェック
-            node_type = cmds.nodeType(mat_name)
-            if node_type != "aiStandardSurface":
-                print(f"[UDIM Setup] [WARN] '{mat_name}' は aiStandardSurface ではありません"
-                      f" (実際の型: {node_type})。スキップします。")
-                continue
-            shader = mat_name
-            print(f"[UDIM Setup] 既存マテリアル使用: {mat_name}")
-
-        # ── Fix: 同一 attr に接続しようとするチャンネルを事前検出 ──────────
-        # 先に登録したチャンネルを優先し、重複を警告してスキップする
-        attr_winner: dict = {}  # target_attr → 最初に登録した ch_key
-        for ch_key, ch_data in model_data["channels"].items():
-            info = ch_data.get("info")
-            if not info:
-                continue
-            attr = info.get("attr")
-            if not attr:
-                continue
-            if attr in attr_winner:
-                print(
-                    f"[UDIM Setup] [WARN] 接続競合: '{ch_key}' と '{attr_winner[attr]}' が"
-                    f" 同じ属性 '{shader}.{attr}' に接続しようとしています。"
-                    f" '{attr_winner[attr]}' を優先し '{ch_key}' をスキップします。"
-                )
+            # マテリアル作成 / 既存取得
+            if not cmds.objExists(mat_name):
+                shader = cmds.shadingNode("aiStandardSurface", asShader=True, name=mat_name)
+                sg_name = f"{mat_name}SG"
+                sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=sg_name)
+                cmds.connectAttr(f"{shader}.outColor", f"{sg}.surfaceShader", force=True)
+                print(f"[UDIM Setup] マテリアル作成: {mat_name}")
             else:
-                attr_winner[attr] = ch_key
+                # Fix: 既存ノードが別の型でないかチェック
+                node_type = cmds.nodeType(mat_name)
+                if node_type != "aiStandardSurface":
+                    print(f"[UDIM Setup] [WARN] '{mat_name}' は aiStandardSurface ではありません"
+                          f" (実際の型: {node_type})。スキップします。")
+                    continue
+                shader = mat_name
+                print(f"[UDIM Setup] 既存マテリアル使用: {mat_name}")
 
-        for ch_key, ch_data in model_data["channels"].items():
-            info      = ch_data["info"]
-            status    = ch_data["status"]
-            udim_path = ch_data["udim_path"]
-            node_id   = re.sub(r"[^A-Za-z0-9_]", "_", f"{base_name}_{ch_key}")
+            # ── Fix: 同一 attr に接続しようとするチャンネルを事前検出 ──────────
+            # 先に登録したチャンネルを優先し、重複を警告してスキップする
+            attr_winner: dict = {}  # target_attr → 最初に登録した ch_key
+            for ch_key, ch_data in model_data["channels"].items():
+                info = ch_data.get("info")
+                if not info:
+                    continue
+                attr = info.get("attr")
+                if not attr:
+                    continue
+                if attr in attr_winner:
+                    print(
+                        f"[UDIM Setup] [WARN] 接続競合: '{ch_key}' と '{attr_winner[attr]}' が"
+                        f" 同じ属性 '{shader}.{attr}' に接続しようとしています。"
+                        f" '{attr_winner[attr]}' を優先し '{ch_key}' をスキップします。"
+                    )
+                else:
+                    attr_winner[attr] = ch_key
 
-            # ── Fix: 既存 File ノードの再利用（再実行でも増殖しない）────────
-            file_node_name = f"file_{node_id}"
-            if cmds.objExists(file_node_name):
-                file_node = file_node_name
-                print(f"[UDIM Setup] {ch_key}: 既存 File ノードを更新: {file_node}")
-            else:
-                file_node = cmds.shadingNode(
-                    "file", asTexture=True, isColorManaged=True, name=file_node_name
-                )
-                p2d_name = f"p2d_{node_id}"
-                p2d = (p2d_name if cmds.objExists(p2d_name)
-                       else cmds.shadingNode("place2dTexture", asUtility=True, name=p2d_name))
-                _connect_place2d(file_node, p2d)
+            for ch_key, ch_data in model_data["channels"].items():
+                info      = ch_data["info"]
+                status    = ch_data["status"]
+                udim_path = ch_data["udim_path"]
+                node_id   = re.sub(r"[^A-Za-z0-9_]", "_", f"{base_name}_{ch_key}")
 
-            # UDIM 設定（相対パスオプションに応じてパスを切り替え）
-            cmds.setAttr(f"{file_node}.uvTilingMode", 3)   # 3 = UDIM (Mari)
-            path_to_use = (_to_project_relative(udim_path)
-                           if use_relative_path else udim_path)
-            cmds.setAttr(f"{file_node}.fileTextureName", path_to_use, type="string")
+                # ── Fix: 既存 File ノードの再利用（再実行でも増殖しない）────────
+                file_node_name = f"file_{node_id}"
+                if cmds.objExists(file_node_name):
+                    file_node = file_node_name
+                    print(f"[UDIM Setup] {ch_key}: 既存 File ノードを更新: {file_node}")
+                    # Fix(v5): 既存ノードの place2dTexture 接続が実際に生きて
+                    # いるかを検証し、切れていれば再接続する。
+                    if not cmds.listConnections(f"{file_node}.uvCoord", type="place2dTexture"):
+                        p2d_name = f"p2d_{node_id}"
+                        p2d = (p2d_name if cmds.objExists(p2d_name)
+                               else cmds.shadingNode("place2dTexture", asUtility=True, name=p2d_name))
+                        _connect_place2d(file_node, p2d)
+                        print(f"[UDIM Setup] {ch_key}: place2dTexture 接続が切れていたため再接続しました")
+                else:
+                    file_node = cmds.shadingNode(
+                        "file", asTexture=True, isColorManaged=True, name=file_node_name
+                    )
+                    p2d_name = f"p2d_{node_id}"
+                    p2d = (p2d_name if cmds.objExists(p2d_name)
+                           else cmds.shadingNode("place2dTexture", asUtility=True, name=p2d_name))
+                    _connect_place2d(file_node, p2d)
 
-            # カラースペース
-            cs = info.get("colorSpace", "Raw") if info else "Raw"
-            cmds.setAttr(f"{file_node}.colorSpace", cs, type="string")
+                # UDIM 設定（相対パスオプションに応じてパスを切り替え）
+                cmds.setAttr(f"{file_node}.uvTilingMode", 3)   # 3 = UDIM (Mari)
+                path_to_use = (_to_project_relative(udim_path)
+                               if use_relative_path else udim_path)
+                cmds.setAttr(f"{file_node}.fileTextureName", path_to_use, type="string")
 
-            # 未対応チャンネルは File ノードのみ作成
-            if status == "unknown" or info is None:
-                print(f"[UDIM Setup] [WARN] {ch_key}: 未対応チャンネル → '{file_node}' のみ作成")
-                continue
+                # カラースペース
+                cs = info.get("colorSpace", "Raw") if info else "Raw"
+                cmds.setAttr(f"{file_node}.colorSpace", cs, type="string")
 
-            target_attr = info.get("attr")
-            if target_attr is None:
-                note = info.get("note", "手動接続が必要です")
-                print(f"[UDIM Setup] {ch_key}: '{file_node}' 作成 (接続スキップ) ← {note}")
-                continue
+                # 未対応チャンネルは File ノードのみ作成
+                if status == "unknown" or info is None:
+                    print(f"[UDIM Setup] [WARN] {ch_key}: 未対応チャンネル → '{file_node}' のみ作成")
+                    continue
 
-            # Fix: 競合で負けたチャンネルはスキップ
-            if attr_winner.get(target_attr) != ch_key:
-                continue
+                target_attr = info.get("attr")
+                if target_attr is None:
+                    note = info.get("note", "手動接続が必要です")
+                    print(f"[UDIM Setup] {ch_key}: '{file_node}' 作成 (接続スキップ) ← {note}")
+                    continue
 
-            out_ch = info.get("outChannel", "color")
+                # Fix: 競合で負けたチャンネルはスキップ
+                if attr_winner.get(target_attr) != ch_key:
+                    continue
 
-            if info.get("useNormal"):
-                nmap_name = f"aiNormalMap_{node_id}"
-                # Fix: 既存 aiNormalMap の再利用
-                nmap = (nmap_name if cmds.objExists(nmap_name)
-                        else cmds.shadingNode("aiNormalMap", asUtility=True, name=nmap_name))
-                if info.get("invertY"):
-                    cmds.setAttr(f"{nmap}.invertY", 1)
-                cmds.connectAttr(f"{file_node}.outColor", f"{nmap}.input", force=True)
-                cmds.connectAttr(f"{nmap}.outValue", f"{shader}.{target_attr}", force=True)
-                print(f"[UDIM Setup] {ch_key}: → aiNormalMap → {shader}.{target_attr}")
-            else:
-                cmds.connectAttr(f"{file_node}.{out_ch}", f"{shader}.{target_attr}", force=True)
-                print(f"[UDIM Setup] {ch_key}: {file_node}.{out_ch} → {shader}.{target_attr}")
+                out_ch = info.get("outChannel", "color")
 
-        created.append(mat_name)
+                if target_attr == "__displacement__":
+                    # Fix(v5): remapValue 経由で displacementShader へ自動接続
+                    _connect_displacement(shader, file_node)
+                    print(f"[UDIM Setup] {ch_key}: → remapValue → displacementShader")
+                elif info.get("useNormal"):
+                    nmap_name = f"aiNormalMap_{node_id}"
+                    # Fix: 既存 aiNormalMap の再利用
+                    nmap = (nmap_name if cmds.objExists(nmap_name)
+                            else cmds.shadingNode("aiNormalMap", asUtility=True, name=nmap_name))
+                    if info.get("invertY"):
+                        cmds.setAttr(f"{nmap}.invertY", 1)
+                    cmds.connectAttr(f"{file_node}.outColor", f"{nmap}.input", force=True)
+                    cmds.connectAttr(f"{nmap}.outValue", f"{shader}.{target_attr}", force=True)
+                    print(f"[UDIM Setup] {ch_key}: → aiNormalMap → {shader}.{target_attr}")
+                else:
+                    if info.get("invertValue"):
+                        # Fix(v5): Glossiness 等、Roughness の逆数を扱うチャンネルは
+                        # reverse ノードを挟んで反転接続する。
+                        rev_name = f"reverse_{node_id}"
+                        rev = (rev_name if cmds.objExists(rev_name)
+                               else cmds.shadingNode("reverse", asUtility=True, name=rev_name))
+                        cmds.connectAttr(f"{file_node}.{out_ch}", f"{rev}.inputX", force=True)
+                        cmds.connectAttr(f"{rev}.outputX", f"{shader}.{target_attr}", force=True)
+                        print(f"[UDIM Setup] {ch_key}: → reverse → {shader}.{target_attr}")
+                    else:
+                        cmds.connectAttr(f"{file_node}.{out_ch}", f"{shader}.{target_attr}", force=True)
+                        print(f"[UDIM Setup] {ch_key}: {file_node}.{out_ch} → {shader}.{target_attr}")
 
-        # Fix: TX dir を収集（ループ内では変換しない）
-        if create_tx:
-            for ch_data in model_data["channels"].values():
-                tx_dirs.add(
-                    os.path.dirname(ch_data["representative"]).replace("\\", "/")
-                )
+                    # Fix(v5): also_set（例: Emissive → emission=1.0）を適用
+                    for extra_attr, val in info.get("also_set", {}).items():
+                        try:
+                            cmds.setAttr(f"{shader}.{extra_attr}", val)
+                        except Exception:
+                            pass
+
+            created.append(mat_name)
+
+            # Fix: TX dir を収集（ループ内では変換しない）
+            if create_tx:
+                for ch_data in model_data["channels"].values():
+                    tx_dirs.add(
+                        os.path.dirname(ch_data["representative"]).replace("\\", "/")
+                    )
+
+        except Exception as e:
+            print(f"[UDIM Setup] [NG] '{base_name}' の処理中にエラーが発生しました: {e}")
+            failed.append(base_name)
+            continue
 
     # ── Fix: TX 変換をループ外で一括実行（同一 dir は 1 回のみ）─────────
     if create_tx:
@@ -571,6 +700,9 @@ def setup_udim_material(
     # ── Hypershade 自動レイアウト ──────────────────────────────────────
     if layout_hypershade and created:
         _layout_hypershade_nodes(created)
+
+    if failed:
+        print(f"\n[UDIM Setup] [WARN] 以下のモデルはエラーのため処理できませんでした: {failed}")
 
     print(f"\n[UDIM Setup] 完了。作成/更新: {created}")
     return created
@@ -605,6 +737,46 @@ def batch_tx_convert(texture_dir: str, skip_existing: bool = True) -> None:
 # ===========================================================================
 # 追加機能ユーティリティ
 # ===========================================================================
+
+# Fix(v5 / フェーズ3): maya_live_sync.py の live_sync_config.json と同じ設定
+# ファイルを直接読み込み、現在アクティブなプロジェクトの Final 書き出し先を
+# 検出する。maya_live_sync.py 側の LiveSyncEngine は生きたインスタンスとして
+# しか self.config を持てないため、udim_setup.py 側は設定ファイルを直接
+# パースする形で同等のロジックを再現する。
+_SP_LIVE_SYNC_CONFIG_PATH = "C:/SPMayaLiveSync/live_sync_config.json"
+_SP_LIVE_SYNC_DEFAULT_FINAL_DIR = "C:/SPMayaLiveSync/final"
+
+
+def _detect_sp_final_dir() -> str:
+    """
+    maya_live_sync.py の _active_final_dir() と同じロジックで、
+    現在アクティブな SP プロジェクトの Final 書き出し先の実パスを返す。
+
+    設定ファイルが存在しない・キーが無い・パースに失敗した場合は
+    静かに空文字を返す（エラーにせず、GUI 側は従来通り空欄のままにする）。
+    """
+    try:
+        if not os.path.isfile(_SP_LIVE_SYNC_CONFIG_PATH):
+            return ""
+        import json
+        with open(_SP_LIVE_SYNC_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return ""
+
+    final_dir = cfg.get("final_export_dir") or _SP_LIVE_SYNC_DEFAULT_FINAL_DIR
+    if not final_dir:
+        return ""
+
+    subfolder = cfg.get("active_final_subfolder")
+    result = os.path.join(final_dir, subfolder) if subfolder else final_dir
+    result = result.replace("\\", "/")
+
+    # 実際に存在するフォルダの場合のみ採用する。存在しない場合、
+    # フォルダ選択ダイアログの初期位置として使うと分かりにくいため
+    # 空欄のままにしておく方が安全。
+    return result if os.path.isdir(result) else ""
+
 
 def _to_project_relative(abs_path: str) -> str:
     """
@@ -812,6 +984,25 @@ _STATUS_LABEL = {
     "unknown": "[NG] 未対応",
 }
 
+# Fix(v5 / フェーズ2 ①): AISS の _tex_type_label() 相当。モデル行に
+# 「一行要約」（例: "Base, Rough, Metal, Nrm, Disp"）を出すための短縮名。
+_CH_SHORT_LABEL = {
+    "BaseColor": "Base", "Base_Color": "Base", "Albedo": "Base", "Diffuse": "Base",
+    "Roughness": "Rough", "Rough": "Rough",
+    "Metallic": "Metal", "Metalness": "Metal", "Metal": "Metal",
+    "Normal": "Nrm", "Normal_OpenGL": "Nrm", "Normal_DirectX": "Nrm(DX)",
+    "Emissive": "Emis", "Emission": "Emis",
+    "AO": "AO", "Ambient_Occlusion": "AO", "Mixed_AO": "AO",
+    "Height": "Disp", "Displacement": "Disp",
+    "Opacity": "Opac", "Alpha": "Opac",
+    "Specular": "Spec", "SpecularColor": "Spec",
+    "Glossiness": "Gloss", "Gloss": "Gloss",
+    "Subsurface": "SSS", "SSS": "SSS", "SubsurfaceColor": "SSS",
+    "Transmission": "Trans",
+    "Coat": "Coat", "CoatRoughness": "CoatR",
+    "Sheen": "Sheen",
+}
+
 
 class ModelTreeWidget(QtWidgets.QWidget):
     """スキャン結果をチェックボックスツリーで表示するウィジェット"""
@@ -846,7 +1037,7 @@ class ModelTreeWidget(QtWidgets.QWidget):
         self.tree.setColumnWidth(0, 260)
         self.tree.setColumnWidth(1, 55)
         self.tree.setColumnWidth(2, 90)
-        self.tree.setColumnWidth(3, 90)
+        self.tree.setColumnWidth(3, 220)  # Fix(v5): チャンネル要約を表示するため拡張
         self.tree.setAlternatingRowColors(True)
         self.tree.setStyleSheet(
             "QTreeWidget { background: #1c1c1c; color: #d0d0d0; "
@@ -880,7 +1071,17 @@ class ModelTreeWidget(QtWidgets.QWidget):
             model_item.setText(0, base_name)
             model_item.setText(1, str(data["tile_count"]))
             model_item.setText(2, tile_range)
-            model_item.setText(3, f"{len(data['channels'])} ch")
+
+            # Fix(v5 / フェーズ2 ①): AISSの「[4] Base, Rough, Metal, Nrm」に
+            # 相当する一行要約。展開しなくても検出内容がひと目で分かるように。
+            short_names = [
+                _CH_SHORT_LABEL.get(ch_key, ch_key)
+                for ch_key in sorted(data["channels"].keys())
+            ]
+            summary = ", ".join(short_names)
+            model_item.setText(3, f"{len(data['channels'])}ch: {summary}")
+            model_item.setToolTip(3, summary)  # 列幅で省略された場合のフォールバック
+
             model_item.setCheckState(0, Qt.Checked)
             model_item.setFlags(
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
@@ -1232,7 +1433,7 @@ class MeshAssignDialog(QtWidgets.QDialog):
 class UDIMSetupDialog(QtWidgets.QDialog):
     """UDIM テクスチャ自動セットアップ メインダイアログ"""
 
-    TITLE = "UDIM Auto Setup  v1.0  ―  SP → Maya Arnold"
+    TITLE = "UDIM Auto Setup  v5  ―  SP → Maya Arnold"
 
     def __init__(self, parent=None):
         if wrapInstance and parent is None:
@@ -1252,7 +1453,7 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         root.setContentsMargins(12, 12, 12, 12)
 
         # タイトル
-        title = QtWidgets.QLabel("UDIM Texture Auto Setup  <small>v1.0</small>")
+        title = QtWidgets.QLabel("UDIM Texture Auto Setup  <small>v5</small>")
         title.setStyleSheet("font-size: 14px; font-weight: bold; color: #e0e0e0;")
         title.setTextFormat(Qt.RichText)
         root.addWidget(title)
@@ -1267,6 +1468,12 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         dir_lay = QtWidgets.QHBoxLayout(dir_grp)
         self._dir_edit = QtWidgets.QLineEdit()
         self._dir_edit.setPlaceholderText("テクスチャフォルダを選択してください...")
+        # Fix(v5 / フェーズ3): SP側の live_sync_config.json から現在アクティブな
+        # Final フォルダの実パスを検出できれば、初期値として自動入力する。
+        # 検出できない場合(設定ファイルなし・フォルダ不在等)は従来通り空欄。
+        detected_final_dir = _detect_sp_final_dir()
+        if detected_final_dir:
+            self._dir_edit.setText(detected_final_dir)
         dir_lay.addWidget(self._dir_edit)
         browse_btn = QtWidgets.QPushButton("参照...")
         browse_btn.setFixedWidth(72)
@@ -1275,27 +1482,54 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         root.addWidget(dir_grp)
 
         # ─ オプション ──────────────────────────────────────────────────
+        # Fix(v5 / フェーズ2 ③): AISS(チェックボックス2個のみ)の
+        # シンプルさに寄せるため、よく使う2項目だけを常時表示にし、
+        # 残りは「詳細設定」に折りたたむ。
         opt_grp = QtWidgets.QGroupBox("オプション")
-        opt_lay = QtWidgets.QFormLayout(opt_grp)
+        opt_lay = QtWidgets.QVBoxLayout(opt_grp)
 
-        self._prefix_edit = QtWidgets.QLineEdit("M_")
-        self._prefix_edit.setFixedWidth(120)
-        opt_lay.addRow("マテリアル名プレフィックス:", self._prefix_edit)
-
-        self._tx_chk        = QtWidgets.QCheckBox(".tx 変換も実行する (maketx が必要)")
         self._recursive_chk = QtWidgets.QCheckBox("サブフォルダも再帰的に検索する")
-        self._relpath_chk   = QtWidgets.QCheckBox("Maya プロジェクト相対パスを使用する")
-        self._layout_chk    = QtWidgets.QCheckBox("Hypershade を自動レイアウトする")
-        opt_lay.addRow("TX 変換:", self._tx_chk)
-        opt_lay.addRow("再帰検索:", self._recursive_chk)
-        opt_lay.addRow("パス形式:", self._relpath_chk)
-        opt_lay.addRow("レイアウト:", self._layout_chk)
+        self._tx_chk        = QtWidgets.QCheckBox(".tx 変換も実行する (maketx が必要)")
+        opt_lay.addWidget(self._recursive_chk)
+        opt_lay.addWidget(self._tx_chk)
+
+        self._advanced_toggle = QtWidgets.QPushButton("▸ 詳細設定")
+        self._advanced_toggle.setFlat(True)
+        self._advanced_toggle.setCursor(Qt.PointingHandCursor)
+        self._advanced_toggle.setStyleSheet(
+            "QPushButton { text-align:left; color:#999; padding:2px; border:none; }"
+            "QPushButton:hover { color:#ccc; }"
+        )
+        self._advanced_toggle.clicked.connect(self._toggle_advanced)
+        opt_lay.addWidget(self._advanced_toggle)
+
+        self._advanced_panel = QtWidgets.QWidget()
+        adv_lay = QtWidgets.QFormLayout(self._advanced_panel)
+        adv_lay.setContentsMargins(16, 4, 0, 0)
+
+        self._prefix_edit = QtWidgets.QLineEdit("")  # Fix(v5): 既定を空文字に変更(AISSと同一挙動)
+        self._prefix_edit.setFixedWidth(120)
+        self._prefix_edit.setPlaceholderText("空欄=ファイル名そのまま(AISS互換)")
+        adv_lay.addRow("マテリアル名プレフィックス:", self._prefix_edit)
+
+        self._relpath_chk = QtWidgets.QCheckBox("Maya プロジェクト相対パスを使用する")
+        adv_lay.addRow("パス形式:", self._relpath_chk)
+
+        self._layout_chk = QtWidgets.QCheckBox("Hypershade を自動レイアウトする")
+        adv_lay.addRow("レイアウト:", self._layout_chk)
+
+        self._advanced_panel.setVisible(False)  # 既定は折りたたみ
+        opt_lay.addWidget(self._advanced_panel)
+
         root.addWidget(opt_grp)
 
         # ─ スキャンボタン ──────────────────────────────────────────────
+        # Fix(v5 / フェーズ2 配色統一): AISSの Scan ボタン(青系)に合わせる
         scan_row = QtWidgets.QHBoxLayout()
         scan_btn = QtWidgets.QPushButton(" スキャン実行")
-        scan_btn.setStyleSheet("padding: 5px; font-weight: bold;")
+        scan_btn.setStyleSheet(
+            "background:#4073a6; color:white; font-weight:bold; padding:6px;"
+        )
         scan_btn.clicked.connect(self._scan)
         scan_row.addWidget(scan_btn)
         scan_row.addStretch()
@@ -1306,8 +1540,18 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         root.addWidget(self._model_tree)
 
         # ─ ログ ────────────────────────────────────────────────────────
-        log_grp = QtWidgets.QGroupBox("ログ")
-        log_lay = QtWidgets.QVBoxLayout(log_grp)
+        # Fix(v5 / フェーズ2 ④): AISS同様、既定では折りたたんでおき、
+        # [WARN]/[NG] を含む出力があった場合のみ自動的に開く。
+        self._log_toggle = QtWidgets.QPushButton("▸ ログを表示")
+        self._log_toggle.setFlat(True)
+        self._log_toggle.setCursor(Qt.PointingHandCursor)
+        self._log_toggle.setStyleSheet(
+            "QPushButton { text-align:left; color:#999; padding:2px; border:none; }"
+            "QPushButton:hover { color:#ccc; }"
+        )
+        self._log_toggle.clicked.connect(self._toggle_log)
+        root.addWidget(self._log_toggle)
+
         self._log = QtWidgets.QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumHeight(130)
@@ -1315,30 +1559,57 @@ class UDIMSetupDialog(QtWidgets.QDialog):
             "background:#1a1a1a; color:#b8b8b8; "
             "font-family:Consolas,monospace; font-size:11px;"
         )
-        log_lay.addWidget(self._log)
-        root.addWidget(log_grp)
+        self._log.setVisible(False)
+        root.addWidget(self._log)
 
         # ─ 実行ボタン ──────────────────────────────────────────────────
+        # Fix(v5 / フェーズ2 ②): 主要操作(セットアップ実行)だけを大きく
+        # 目立たせ、それ以外(.tx変換のみ／メッシュ割り当て／ログクリア)は
+        # 小さく・控えめなスタイルに格下げする。
+        _SECONDARY_BTN_STYLE = (
+            "QPushButton { padding: 3px 10px; color: #aaa; background: #2a2a2a;"
+            " border: 1px solid #3a3a3a; font-size: 10px; }"
+            "QPushButton:hover { color: #fff; background: #3a3a3a; }"
+        )
+
         btn_row = QtWidgets.QHBoxLayout()
         run_btn = QtWidgets.QPushButton("▶  選択モデルをセットアップ")
         run_btn.setStyleSheet(
-            "background:#1a5276; color:white; font-weight:bold; padding:6px;"
+            "background:#339959; color:white; font-weight:bold; padding:8px;"
+            " font-size:12px;"
         )
         run_btn.clicked.connect(self._run)
+
         tx_btn = QtWidgets.QPushButton(".tx のみ変換")
+        tx_btn.setStyleSheet(_SECONDARY_BTN_STYLE)
         tx_btn.clicked.connect(self._tx_only)
+
         mesh_btn = QtWidgets.QPushButton("メッシュ割り当て...")
-        mesh_btn.setStyleSheet("padding: 5px;")
+        mesh_btn.setStyleSheet(_SECONDARY_BTN_STYLE)
         mesh_btn.setToolTip("別ウィンドウでシーン内メッシュへの自動割り当てを実行")
         mesh_btn.clicked.connect(self._open_mesh_assign)
+
         clr_btn = QtWidgets.QPushButton("ログをクリア")
+        clr_btn.setStyleSheet(_SECONDARY_BTN_STYLE)
         clr_btn.clicked.connect(self._log.clear)
-        btn_row.addWidget(run_btn)
+
+        btn_row.addWidget(run_btn, stretch=1)
         btn_row.addWidget(tx_btn)
         btn_row.addWidget(mesh_btn)
-        btn_row.addStretch()
         btn_row.addWidget(clr_btn)
         root.addLayout(btn_row)
+
+    def _toggle_advanced(self):
+        """③ 詳細設定パネルの表示/非表示を切り替える"""
+        visible = not self._advanced_panel.isVisible()
+        self._advanced_panel.setVisible(visible)
+        self._advanced_toggle.setText("▾ 詳細設定" if visible else "▸ 詳細設定")
+
+    def _toggle_log(self, force_visible: bool = None):
+        """④ ログパネルの表示/非表示を切り替える。force_visible指定時はその状態に強制する"""
+        visible = force_visible if force_visible is not None else not self._log.isVisible()
+        self._log.setVisible(visible)
+        self._log_toggle.setText("▾ ログを表示" if visible else "▸ ログを表示")
 
     # ── スロット ─────────────────────────────────────────────────────────
     def _browse(self):
@@ -1353,11 +1624,22 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         d = self._dir_edit.text().strip()
         if not d:
             QtWidgets.QMessageBox.warning(self, "入力エラー", "テクスチャフォルダを指定してください。")
+            return ""
+        # Fix(v5): フォルダの存在確認を追加。存在しないパスのままスキャンすると
+        # 生の例外メッセージがログに出てしまうため、先に分かりやすく警告する。
+        if not os.path.isdir(d):
+            QtWidgets.QMessageBox.warning(
+                self, "入力エラー", f"指定されたフォルダが存在しません:\n{d}"
+            )
+            return ""
         return d
 
     def _print(self, msg: str):
         self._log.appendPlainText(msg)
         QtWidgets.QApplication.processEvents()
+        # Fix(v5 / フェーズ2 ④): 警告・エラーが出た場合は自動でログを開く
+        if not self._log.isVisible() and ("[NG]" in msg or "[WARN]" in msg):
+            self._toggle_log(force_visible=True)
 
     def _redirect_and_call(self, fn):
         """print() を GUI ログにリダイレクトして fn を実行する"""
@@ -1423,8 +1705,8 @@ class UDIMSetupDialog(QtWidgets.QDialog):
             selected_models=selected,
             material_prefix=self._prefix_edit.text(),
             create_tx=self._tx_chk.isChecked(),
-            use_relative_path=self._relpath_chk.isChecked(),   # 
-            layout_hypershade=self._layout_chk.isChecked(),    # 
+            use_relative_path=self._relpath_chk.isChecked(),   #
+            layout_hypershade=self._layout_chk.isChecked(),    #
         ))
 
     def _open_mesh_assign(self):
