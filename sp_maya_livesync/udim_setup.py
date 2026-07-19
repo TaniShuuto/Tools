@@ -77,6 +77,18 @@ except ImportError:
     except ImportError:
         wrapInstance = None
 
+# 2026.07.20: バージョン表記をセマンティックバージョニング(MAJOR.MINOR.PATCH)
+# へ移行。これまで __version__ 変数を持たず、ファイル冒頭docstringと
+# TITLE文字列に "v5" とハードコードしていたが、ツール群として初めて
+# 正式にバージョン番号を割り当てる区切りとして 1.0.0 からスタートする
+# (旧 "v5" 表記との対応はREADME.mdの「バージョン履歴」節を参照)。
+# 以降は maya_live_sync.py / sp_live_sync_plugin.py と同じ SemVer の
+# ルールに従う:
+#   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
+#   MINOR: 後方互換のある機能追加
+#   PATCH: 後方互換のあるバグ修正
+__version__ = "1.0.0"
+
 # ===========================================================================
 # チャンネルマップ
 # attr       : aiStandardSurface の接続先アトリビュート (None = 手動接続)
@@ -1016,7 +1028,7 @@ class ModelTreeWidget(QtWidgets.QWidget):
         # ─ ヘッダー行 ──────────────────────────────────────────────
         hdr = QtWidgets.QHBoxLayout()
         lbl = QtWidgets.QLabel("検知されたモデル")
-        lbl.setStyleSheet("font-weight: bold; color: #c0c0c0;")
+        lbl.setStyleSheet("font-weight: bold;")
         hdr.addWidget(lbl)
         hdr.addStretch()
 
@@ -1040,10 +1052,7 @@ class ModelTreeWidget(QtWidgets.QWidget):
         self.tree.setColumnWidth(3, 220)  # Fix(v5): チャンネル要約を表示するため拡張
         self.tree.setAlternatingRowColors(True)
         self.tree.setStyleSheet(
-            "QTreeWidget { background: #1c1c1c; color: #d0d0d0; "
-            "               font-family: Consolas, monospace; font-size: 11px; }"
-            "QTreeWidget::item:selected { background: #2a6496; }"
-            "QTreeWidget::item:alternate { background: #222222; }"
+            "QTreeWidget { font-family: Consolas, monospace; font-size: 11px; }"
         )
         self.tree.setMinimumHeight(200)
         lay.addWidget(self.tree)
@@ -1055,7 +1064,7 @@ class ModelTreeWidget(QtWidgets.QWidget):
             "<span style='color:#c83c3c;'>[NG] 未対応（手動接続）</span>"
         )
         legend.setTextFormat(Qt.RichText)
-        legend.setStyleSheet("font-size: 10px; color: #888;")
+        legend.setStyleSheet("font-size: 10px;")
         lay.addWidget(legend)
 
     def populate(self, scan_results: dict):
@@ -1150,7 +1159,11 @@ class MeshAssignDialog(QtWidgets.QDialog):
     チェックボックスで選択したメッシュにマテリアルを割り当てる。
     """
 
-    TITLE = "メッシュ自動割り当て  v1.0"
+    # 2026.07.20: 独自の "v1.0" 表記を撤去し、udim_setup.py 全体の
+    # __version__ を参照する形に統一する。このダイアログは udim_setup.py
+    # に付随するサブ機能であり、独立したツールとして別系統のバージョンを
+    # 持つ必要はない。
+    TITLE = "メッシュ自動割り当て  v{0}".format(__version__)
 
     def __init__(self, scan_results: dict = None, parent=None):
         if wrapInstance and parent is None:
@@ -1174,12 +1187,11 @@ class MeshAssignDialog(QtWidgets.QDialog):
         root.setContentsMargins(12, 12, 12, 12)
 
         title = QtWidgets.QLabel("メッシュ自動割り当て")
-        title.setStyleSheet("font-size: 13px; font-weight: bold; color: #e0e0e0;")
+        title.setStyleSheet("font-size: 13px; font-weight: bold;")
         root.addWidget(title)
 
         sep = QtWidgets.QFrame()
         sep.setFrameShape(QtWidgets.QFrame.HLine)
-        sep.setStyleSheet("color: #444;")
         root.addWidget(sep)
 
         # ─ マテリアル選択 ─────────────────────────────────────────────
@@ -1264,10 +1276,7 @@ class MeshAssignDialog(QtWidgets.QDialog):
         self._mesh_tree.setAlternatingRowColors(True)
         self._mesh_tree.setMinimumHeight(200)
         self._mesh_tree.setStyleSheet(
-            "QTreeWidget { background: #1c1c1c; color: #d0d0d0;"
-            "  font-family: Consolas, monospace; font-size: 11px; }"
-            "QTreeWidget::item:selected { background: #2a6496; }"
-            "QTreeWidget::item:alternate { background: #222222; }"
+            "QTreeWidget { font-family: Consolas, monospace; font-size: 11px; }"
         )
         list_lay.addWidget(self._mesh_tree)
 
@@ -1288,7 +1297,6 @@ class MeshAssignDialog(QtWidgets.QDialog):
         self._log.setReadOnly(True)
         self._log.setMaximumHeight(72)
         self._log.setStyleSheet(
-            "background:#1a1a1a; color:#b8b8b8;"
             "font-family:Consolas,monospace; font-size:11px;"
         )
         root.addWidget(self._log)
@@ -1296,8 +1304,9 @@ class MeshAssignDialog(QtWidgets.QDialog):
         # ─ 割り当てボタン ────────────────────────────────────────────
         assign_btn = QtWidgets.QPushButton("▶  チェックしたメッシュに割り当て")
         assign_btn.setStyleSheet(
-            "background:#1a5276; color:white; font-weight:bold; padding:6px;"
+            "QPushButton { font-weight: bold; padding: 6px; }"
         )
+        assign_btn.setMinimumHeight(32)
         assign_btn.clicked.connect(self._assign)
         root.addWidget(assign_btn)
 
@@ -1433,7 +1442,9 @@ class MeshAssignDialog(QtWidgets.QDialog):
 class UDIMSetupDialog(QtWidgets.QDialog):
     """UDIM テクスチャ自動セットアップ メインダイアログ"""
 
-    TITLE = "UDIM Auto Setup  v5  ―  SP → Maya Arnold"
+    # 2026.07.20: 独自の "v5" 表記を撤去し、モジュール共通の __version__
+    # を参照する形に統一(SemVer移行、旧v5表記との対応はREADME参照)。
+    TITLE = "UDIM Auto Setup  v{0}  ―  SP → Maya Arnold".format(__version__)
 
     def __init__(self, parent=None):
         if wrapInstance and parent is None:
@@ -1453,14 +1464,15 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         root.setContentsMargins(12, 12, 12, 12)
 
         # タイトル
-        title = QtWidgets.QLabel("UDIM Texture Auto Setup  <small>v5</small>")
-        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #e0e0e0;")
+        title = QtWidgets.QLabel(
+            "UDIM Texture Auto Setup  <small>v{0}</small>".format(__version__)
+        )
+        title.setStyleSheet("font-size: 14px; font-weight: bold;")
         title.setTextFormat(Qt.RichText)
         root.addWidget(title)
 
         sep = QtWidgets.QFrame()
         sep.setFrameShape(QtWidgets.QFrame.HLine)
-        sep.setStyleSheet("color: #444;")
         root.addWidget(sep)
 
         # ─ フォルダ ────────────────────────────────────────────────────
@@ -1497,8 +1509,7 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         self._advanced_toggle.setFlat(True)
         self._advanced_toggle.setCursor(Qt.PointingHandCursor)
         self._advanced_toggle.setStyleSheet(
-            "QPushButton { text-align:left; color:#999; padding:2px; border:none; }"
-            "QPushButton:hover { color:#ccc; }"
+            "QPushButton { text-align:left; padding:2px; border:none; }"
         )
         self._advanced_toggle.clicked.connect(self._toggle_advanced)
         opt_lay.addWidget(self._advanced_toggle)
@@ -1524,12 +1535,16 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         root.addWidget(opt_grp)
 
         # ─ スキャンボタン ──────────────────────────────────────────────
-        # Fix(v5 / フェーズ2 配色統一): AISSの Scan ボタン(青系)に合わせる
+        # UI導線改善(フェーズ1再実施): 背景色のハードコード塗りはMayaの
+        # テーマ設定によって視認性が崩れるリスクがあるため撤去し、
+        # 太字・padding・最小高さといった「サイズによる強調」のみで
+        # 層1(最頻操作)を表現する。色は付けずMayaの標準ボタン配色に委ねる。
         scan_row = QtWidgets.QHBoxLayout()
         scan_btn = QtWidgets.QPushButton(" スキャン実行")
         scan_btn.setStyleSheet(
-            "background:#4073a6; color:white; font-weight:bold; padding:6px;"
+            "QPushButton { font-weight: bold; padding: 6px; }"
         )
+        scan_btn.setMinimumHeight(30)
         scan_btn.clicked.connect(self._scan)
         scan_row.addWidget(scan_btn)
         scan_row.addStretch()
@@ -1542,54 +1557,59 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         # ─ ログ ────────────────────────────────────────────────────────
         # Fix(v5 / フェーズ2 ④): AISS同様、既定では折りたたんでおき、
         # [WARN]/[NG] を含む出力があった場合のみ自動的に開く。
+        # UI導線改善(フェーズ1再実施・バグ修正): クリックは
+        # _on_log_toggle_clicked (引数なし) 経由にし、_toggle_log への
+        # bool引数混入を防ぐ。
         self._log_toggle = QtWidgets.QPushButton("▸ ログを表示")
         self._log_toggle.setFlat(True)
         self._log_toggle.setCursor(Qt.PointingHandCursor)
         self._log_toggle.setStyleSheet(
-            "QPushButton { text-align:left; color:#999; padding:2px; border:none; }"
-            "QPushButton:hover { color:#ccc; }"
+            "QPushButton { text-align:left; padding:2px; border:none; }"
         )
-        self._log_toggle.clicked.connect(self._toggle_log)
+        self._log_toggle.clicked.connect(self._on_log_toggle_clicked)
         root.addWidget(self._log_toggle)
 
         self._log = QtWidgets.QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumHeight(130)
         self._log.setStyleSheet(
-            "background:#1a1a1a; color:#b8b8b8; "
             "font-family:Consolas,monospace; font-size:11px;"
         )
         self._log.setVisible(False)
         root.addWidget(self._log)
 
         # ─ 実行ボタン ──────────────────────────────────────────────────
-        # Fix(v5 / フェーズ2 ②): 主要操作(セットアップ実行)だけを大きく
+        # UI導線改善(フェーズ1再実施): 主要操作(セットアップ実行)を大きく
         # 目立たせ、それ以外(.tx変換のみ／メッシュ割り当て／ログクリア)は
-        # 小さく・控えめなスタイルに格下げする。
+        # 小さく・控えめなスタイルに格下げする方針は維持しつつ、
+        # 背景色のハードコードは撤去してMayaの標準配色を尊重する。
+        # 層1(run_btn)はサイズ・太字・padding、層3(tx/mesh/clr)は
+        # flatスタイル・小フォントのみで頻度差を表現する。
         _SECONDARY_BTN_STYLE = (
-            "QPushButton { padding: 3px 10px; color: #aaa; background: #2a2a2a;"
-            " border: 1px solid #3a3a3a; font-size: 10px; }"
-            "QPushButton:hover { color: #fff; background: #3a3a3a; }"
+            "QPushButton { padding: 3px 10px; font-size: 10px; }"
         )
 
         btn_row = QtWidgets.QHBoxLayout()
         run_btn = QtWidgets.QPushButton("▶  選択モデルをセットアップ")
         run_btn.setStyleSheet(
-            "background:#339959; color:white; font-weight:bold; padding:8px;"
-            " font-size:12px;"
+            "QPushButton { font-weight: bold; padding: 8px; font-size: 12px; }"
         )
+        run_btn.setMinimumHeight(36)
         run_btn.clicked.connect(self._run)
 
         tx_btn = QtWidgets.QPushButton(".tx のみ変換")
+        tx_btn.setFlat(True)
         tx_btn.setStyleSheet(_SECONDARY_BTN_STYLE)
         tx_btn.clicked.connect(self._tx_only)
 
         mesh_btn = QtWidgets.QPushButton("メッシュ割り当て...")
+        mesh_btn.setFlat(True)
         mesh_btn.setStyleSheet(_SECONDARY_BTN_STYLE)
         mesh_btn.setToolTip("別ウィンドウでシーン内メッシュへの自動割り当てを実行")
         mesh_btn.clicked.connect(self._open_mesh_assign)
 
         clr_btn = QtWidgets.QPushButton("ログをクリア")
+        clr_btn.setFlat(True)
         clr_btn.setStyleSheet(_SECONDARY_BTN_STYLE)
         clr_btn.clicked.connect(self._log.clear)
 
@@ -1605,11 +1625,22 @@ class UDIMSetupDialog(QtWidgets.QDialog):
         self._advanced_panel.setVisible(visible)
         self._advanced_toggle.setText("▾ 詳細設定" if visible else "▸ 詳細設定")
 
-    def _toggle_log(self, force_visible: bool = None):
+    def _toggle_log(self, force_visible=None):
         """④ ログパネルの表示/非表示を切り替える。force_visible指定時はその状態に強制する"""
         visible = force_visible if force_visible is not None else not self._log.isVisible()
         self._log.setVisible(visible)
         self._log_toggle.setText("▾ ログを表示" if visible else "▸ ログを表示")
+
+    def _on_log_toggle_clicked(self):
+        # UI導線改善(フェーズ1再実施・バグ修正): QPushButton.clicked は
+        # bool を渡すため、これを直接 _toggle_log(force_visible=...) に
+        # 接続すると、手動クリックのたびに False が force_visible へ
+        # 混入し「常に閉じる方向にしか動かない」不具合が起きていた。
+        # クリック専用のこのハンドラを間に挟み、force_visible には
+        # 常にNoneのみを渡す(=現在の表示状態を見て自前で反転させる)
+        # ことで、_print() 側からの明示的な force_visible=True 呼び出しと
+        # 手動クリックの経路を安全に分離する。
+        self._toggle_log()
 
     # ── スロット ─────────────────────────────────────────────────────────
     def _browse(self):

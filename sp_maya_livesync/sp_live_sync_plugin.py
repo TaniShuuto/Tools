@@ -275,7 +275,15 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 #     いずれも値が変化した場合のみ実行されるよう既にガードされており、
 #     追加の変更は不要と判断した。詳細は本ファイル冒頭のdocstring
 #     「2026.07.19-04」の項を参照。
-__version__ = "2026.07.19-04"
+# 2026.07.20: バージョン表記をセマンティックバージョニング(MAJOR.MINOR.PATCH)
+# へ移行。ツール群として初めて正式にバージョン番号を割り当てる区切りとして
+# 1.0.0 からスタートする(このコミット以前は日付ベースの独自表記
+# "2026.07.19-04" だった。旧番号との対応はREADME.mdの「バージョン履歴」
+# 節を参照)。以降は SemVer のルールに従う(maya_live_sync.py側と同じ基準):
+#   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
+#   MINOR: 後方互換のある機能追加
+#   PATCH: 後方互換のあるバグ修正
+__version__ = "1.0.0"
 
 import os
 import re
@@ -1658,7 +1666,18 @@ class LiveSyncPanel(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
 
+        # --- 層1: 最頻操作 -----------------------------------------------
+        # UI導線改善(フェーズ1): 「1セッション中に何度も触るか」を基準に
+        # 層1(最頻・大きく最上段固定)/層2(時々・常時表示だが控えめ)/
+        # 層3(稀・折りたたみやメニューの奥)の3段階に分ける。
+        # maya_live_sync.py の LiveSyncWindow と同じ考え方で揃えることで、
+        # SP側・Maya側の操作感覚を統一する。色による区別は環境依存の
+        # 配色崩れを避けるため使わず、サイズと配置順序のみで表現する。
         self.enable_checkbox = QtWidgets.QCheckBox("Live Sync を有効にする")
+        enable_font = self.enable_checkbox.font()
+        enable_font.setBold(True)
+        enable_font.setPointSize(enable_font.pointSize() + 1)
+        self.enable_checkbox.setFont(enable_font)
         self.enable_checkbox.toggled.connect(self.engine.set_enabled)
         layout.addWidget(self.enable_checkbox)
 
@@ -1690,6 +1709,17 @@ class LiveSyncPanel(QtWidgets.QWidget):
         )
         self.final_pending_label.setVisible(False)
         layout.addWidget(self.final_pending_label)
+
+        # UI導線改善(フェーズ1): 「今すぐ同期」は保存を待たずに手元の
+        # 変更をすぐ反映したい時に押す操作で、層1の有効化チェックボックスに
+        # 次いで頻度が高い。他のボタン群より一段階目立つ高さにして
+        # 単独行に配置する。engine.force_sync_now は引数を取らないメソッド
+        # のため、Qtのclicked(bool)シグナルの引数はそのまま無視される
+        # (force_sync_now側でboolを受け取る仮引数を持たないため安全)。
+        self.sync_now_btn = QtWidgets.QPushButton("今すぐ同期")
+        self.sync_now_btn.setMinimumHeight(32)
+        self.sync_now_btn.clicked.connect(self.engine.force_sync_now)
+        layout.addWidget(self.sync_now_btn)
 
         # フォルダパス・解像度・デバウンス間隔は基本的に初回セットアップ時に
         # 一度決めれば済む項目のため、折りたたみ可能なグループにまとめて
@@ -1737,11 +1767,18 @@ class LiveSyncPanel(QtWidgets.QWidget):
 
         layout.addWidget(self.settings_group)
 
+        # --- 層2: 時々使う操作 / 層3: 稀な操作 ----------------------------
+        # UI導線改善(フェーズ1): 保存・履歴・全量同期は「たまに触る」層2、
+        # ウィザードは「初回セットアップ時に一度触ればよい」層3として、
+        # maya_live_sync.py の more_btn と同じ「その他の設定」メニュー方式に
+        # まとめる。今すぐ同期(層1)を主要ボタン列から独立させたことで、
+        # このボタン列は全て層2以下の操作のみになる。
         btn_row = QtWidgets.QHBoxLayout()
         self.save_btn = QtWidgets.QPushButton("設定を保存")
         self.save_btn.clicked.connect(self._on_save_clicked)
-        self.sync_now_btn = QtWidgets.QPushButton("今すぐ同期")
-        self.sync_now_btn.clicked.connect(self.engine.force_sync_now)
+        self.history_btn = QtWidgets.QPushButton("同期履歴を開く")
+        self.history_btn.setToolTip("SP側/Maya側共通の同期履歴ログ(テキストファイル)を開きます。")
+        self.history_btn.clicked.connect(self._open_history_log)
         # 2026.07.19-03(フェーズ2): Final書き出しを差分化したことに伴う
         # 手動の逃げ道。差分状態がMaya側の実ファイルとズレたと感じた場合、
         # このボタンでクールダウンを無視した即時の全量Final書き出しができる。
@@ -1752,17 +1789,23 @@ class LiveSyncPanel(QtWidgets.QWidget):
             "Maya側とズレていると感じた場合の手動リセット用です。"
         )
         self.force_full_btn.clicked.connect(self.engine.force_full_final_sync)
-        self.wizard_btn = QtWidgets.QPushButton("セットアップウィザートを開く")
-        self.wizard_btn.setToolTip("フォルダ設定・解像度などを対話形式で見直せます。")
-        self.wizard_btn.clicked.connect(self.open_setup_wizard)
-        self.history_btn = QtWidgets.QPushButton("同期履歴を開く")
-        self.history_btn.setToolTip("SP側/Maya側共通の同期履歴ログ(テキストファイル)を開きます。")
-        self.history_btn.clicked.connect(self._open_history_log)
+
+        self.more_btn = QtWidgets.QToolButton()
+        self.more_btn.setText("その他の設定")
+        self.more_btn.setToolTip("セットアップウィザートなど、初回導入時に主に使う操作です。")
+        self.more_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.more_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        more_menu = QtWidgets.QMenu(self.more_btn)
+        wizard_action = more_menu.addAction("セットアップウィザートを開く")
+        wizard_action.setToolTip("フォルダ設定・解像度などを対話形式で見直せます。")
+        wizard_action.triggered.connect(self.open_setup_wizard)
+        self.more_btn.setMenu(more_menu)
+
         btn_row.addWidget(self.save_btn)
-        btn_row.addWidget(self.sync_now_btn)
-        btn_row.addWidget(self.force_full_btn)
-        btn_row.addWidget(self.wizard_btn)
         btn_row.addWidget(self.history_btn)
+        btn_row.addWidget(self.force_full_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.more_btn)
         layout.addLayout(btn_row)
 
         stats_group = QtWidgets.QGroupBox("同期状況")
@@ -1779,26 +1822,48 @@ class LiveSyncPanel(QtWidgets.QWidget):
         stats_layout.addRow("直近の処理時間", self.duration_label)
         layout.addWidget(stats_group)
 
-        structure_group = QtWidgets.QGroupBox("テクスチャセット構成(Maya側の対応確認用)")
-        structure_layout = QtWidgets.QVBoxLayout(structure_group)
+        # UI導線改善(フェーズ1再実施): 「テクスチャセット構成」は
+        # Maya側との対応関係に疑問を感じた時に確認する層2寄りの情報で、
+        # 常時展開しておく必要性は同期状況ほど高くない。
+        # maya_live_sync.py 側の material_tab に既に常設のテーブルが
+        # あるため、SP側はあくまで補助確認用として折りたたみにする。
+        self.structure_toggle_btn = QtWidgets.QPushButton("▸ テクスチャセット構成を確認（Maya側の対応確認用）")
+        self.structure_toggle_btn.setFlat(True)
+        self.structure_toggle_btn.clicked.connect(self._on_structure_toggle_clicked)
+        layout.addWidget(self.structure_toggle_btn)
+
+        self.structure_section = QtWidgets.QWidget()
+        structure_section_layout = QtWidgets.QVBoxLayout(self.structure_section)
+        structure_section_layout.setContentsMargins(0, 0, 0, 0)
         self.structure_list = QtWidgets.QListWidget()
         self.structure_list.setMaximumHeight(120)
-        structure_layout.addWidget(self.structure_list)
+        structure_section_layout.addWidget(self.structure_list)
         recheck_btn = QtWidgets.QPushButton("構成を今すぐチェック")
         recheck_btn.clicked.connect(self.engine.check_texture_set_structure)
-        structure_layout.addWidget(recheck_btn)
-        layout.addWidget(structure_group)
+        structure_section_layout.addWidget(recheck_btn)
+        self.structure_section.setVisible(False)
+        layout.addWidget(self.structure_section)
 
-        layout.addWidget(QtWidgets.QLabel("ログ"))
+        # UI導線改善(フェーズ1再実施): ログは常時大きく表示する必要は
+        # なく、udim_setup.py の折りたたみログと同じ考え方で既定は
+        # 閉じておく。ただしエラー発生時に見落とすと困るため、
+        # status_changed で受け取ったメッセージにエラーを示す文言が
+        # 含まれる場合は自動的に開く(_on_log_message側で判定)。
+        self.log_toggle_btn = QtWidgets.QPushButton("▸ ログを表示")
+        self.log_toggle_btn.setFlat(True)
+        self.log_toggle_btn.clicked.connect(self._on_log_toggle_clicked)
+        layout.addWidget(self.log_toggle_btn)
+
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
+        self.log_view.setVisible(False)
         layout.addWidget(self.log_view, stretch=1)
 
         self._load_values_from_config()
         self._refresh_structure_list([], [], [])
 
-        self.engine.status_changed.connect(self.log_view.appendPlainText)
+        self.engine.status_changed.connect(self._on_log_message)
         self.engine.stats_changed.connect(self._on_stats_changed)
         self.engine.structure_changed.connect(self._refresh_structure_list)
         self.engine.exporting_changed.connect(self.exporting_warning_label.setVisible)
@@ -1826,6 +1891,38 @@ class LiveSyncPanel(QtWidgets.QWidget):
                 item = form.itemAt(row, role)
                 if item is not None and item.widget() is not None:
                     item.widget().setVisible(checked)
+
+    def _on_structure_toggle_clicked(self):
+        # UI導線改善(フェーズ1再実施): QPushButton.clicked は bool を
+        # 渡すが、ここでは受け取らずに現在の表示状態を見て自前で反転する。
+        # maya_live_sync.py の _on_orphan_toggle_clicked と同じ設計。
+        self._set_structure_section_visible(not self.structure_section.isVisible())
+
+    def _set_structure_section_visible(self, visible):
+        self.structure_section.setVisible(visible)
+        self.structure_toggle_btn.setText(
+            "▾ テクスチャセット構成を確認（Maya側の対応確認用）" if visible
+            else "▸ テクスチャセット構成を確認（Maya側の対応確認用）"
+        )
+
+    def _on_log_toggle_clicked(self):
+        self._set_log_visible(not self.log_view.isVisible())
+
+    def _set_log_visible(self, visible):
+        self.log_view.setVisible(visible)
+        self.log_toggle_btn.setText("▾ ログを表示" if visible else "▸ ログを表示")
+
+    def _on_log_message(self, message):
+        # UI導線改善(フェーズ1再実施): ログは既定で折りたたんでいるが、
+        # エラーや警告を見落とすとトラブル対応が遅れるため、該当する
+        # 文言を含むメッセージを受け取った場合は自動的に開く。
+        # udim_setup.py の _print() が [WARN]/[NG] で自動展開する
+        # パターンと同じ考え方。
+        self.log_view.appendPlainText(message)
+        if not self.log_view.isVisible():
+            lowered = message.lower()
+            if "エラー" in message or "失敗" in message or "warning" in lowered or "error" in lowered:
+                self._set_log_visible(True)
 
     def _browse_folder(self, line_edit):
         current = line_edit.text() or "C:/"

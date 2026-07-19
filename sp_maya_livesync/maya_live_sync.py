@@ -422,7 +422,15 @@ def diag_c1_check_qobject_validity(window):
 #    (シグナル発火による再入は軽量なフラグで防止)。
 #    同じ理由で _refresh_material_table() (マテリアル構造タブ)にも
 #    同様の明示的読み直しを追加した。
-__version__ = "2026.07.17-02"
+# 2026.07.20: バージョン表記をセマンティックバージョニング(MAJOR.MINOR.PATCH)
+# へ移行。ツール群として初めて正式にバージョン番号を割り当てる区切りとして
+# 1.0.0 からスタートする(このコミット以前は日付ベースの独自表記
+# "2026.07.17-02" だった。旧番号との対応はREADME.mdの「バージョン履歴」
+# 節を参照)。以降は SemVer のルールに従う:
+#   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
+#   MINOR: 後方互換のある機能追加
+#   PATCH: 後方互換のあるバグ修正
+__version__ = "1.0.0"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -3091,10 +3099,69 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         status_bar_layout = QtWidgets.QVBoxLayout(status_bar_group)
         status_bar_layout.setSpacing(4)
 
-        # 行1: シーン ⇔ SPプロジェクトの対応表示 + 設定ボタン
-        scene_link_row = QtWidgets.QHBoxLayout()
+        # UI導線改善(フェーズ1再々実施・ご相談対応): 「プロジェクト連携」は
+        # 複数SPプロジェクト対応後、可変長の状態文(不一致時は特に長くなる)
+        # とボタン列が1つの枠に詰め込まれ、狭いウィンドウ幅では右側の
+        # ボタンが見切れる問題があった。
+        #
+        # 対応方針(ご相談の結果): 折りたたみ化する。ただし「今どの
+        # プロジェクトと繋がっているか」は常時ひと目で分かる必要がある
+        # ため、完全に隠すのではなく「要約1行を常時表示 + 詳細操作は
+        # 展開時のみ」という構成にする。
+        #   - 要約行: 色付きドット(一致=緑/不一致=赤/未設定=黄)+
+        #     プロジェクト名(+件数)。クリックで開閉。
+        #   - 詳細セクション: 従来通りの状態文・設定ボタン・作業対象
+        #     切り替えドロップダウンを縦積みで配置(横並びをやめたため
+        #     見切れが起きない)。
+        #   - 不一致検知時は自動的に展開する(orphan_section/log_view等の
+        #     「エラー検知で自動的に開く」パターンを踏襲)。
+        #
+        # 既存のウィジェット参照名(self.scene_link_label 等)・シグナル
+        # 接続は一切変更していないため、_refresh_scene_link_label() の
+        # 判定ロジック自体は変更不要。末尾で要約表示の更新のみ追加する。
+        #
+        # 実装注意: status_bar_group(「状態」というタイトル付きの外枠)の
+        # 内側に入れ子になるため、QGroupBoxではなくQWidgetを使う
+        # (二重の枠線を避けるため)。折りたたみの区切りは要約行の
+        # クリック可能な見た目自体で表現する。
+        link_group = QtWidgets.QWidget()
+        link_group_layout = QtWidgets.QVBoxLayout(link_group)
+        link_group_layout.setContentsMargins(0, 0, 0, 0)
+        link_group_layout.setSpacing(4)
+
+        # 要約行(常時表示・クリックで開閉)。
+        # 実装注意: QPushButtonはリッチテキスト(HTMLの<span>等)を
+        # サポートしないため、色付きドットは別途QLabelに分離する
+        # (QLabelはsetTextFormat(Qt.RichText)で正式にHTML表示できる)。
+        summary_row = QtWidgets.QHBoxLayout()
+        summary_row.setSpacing(6)
+        self.link_summary_dot = QtWidgets.QLabel("●")
+        self.link_summary_dot.setTextFormat(QtCore.Qt.RichText)
+        self.link_summary_dot.setStyleSheet("color: #888888;")
+        self.link_summary_btn = QtWidgets.QPushButton("▸ プロジェクト連携")
+        self.link_summary_btn.setFlat(True)
+        self.link_summary_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 2px; border: none; }"
+        )
+        self.link_summary_btn.setToolTip("クリックで詳細を開閉します。")
+        self.link_summary_btn.clicked.connect(self._on_link_summary_clicked)
+        summary_row.addWidget(self.link_summary_dot)
+        summary_row.addWidget(self.link_summary_btn, stretch=1)
+        link_group_layout.addLayout(summary_row)
+
+        # 詳細セクション(既定は折りたたみ)。
+        self.link_detail_section = QtWidgets.QWidget()
+        link_detail_layout = QtWidgets.QVBoxLayout(self.link_detail_section)
+        link_detail_layout.setContentsMargins(4, 4, 0, 0)
+        link_detail_layout.setSpacing(6)
+
+        # 行1: シーン ⇔ SPプロジェクトの対応表示(単独行。幅いっぱいで
+        # 折り返せるため、不一致時の長文でも横方向の見切れが起きない)。
         self.scene_link_label = QtWidgets.QLabel("(確認中...)")
         self.scene_link_label.setWordWrap(True)
+        link_detail_layout.addWidget(self.scene_link_label)
+
+        # 行2: 設定ボタン(横並び対象を無くし単独行に)。
         self.scene_link_btn = QtWidgets.QPushButton("SPプロジェクトを設定")
         self.scene_link_btn.setToolTip(
             "今SPで開いているプロジェクトを、このMayaシーンの対応先として"
@@ -3102,11 +3169,9 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             "自動的に同じSPプロジェクトを追跡できます。"
         )
         self.scene_link_btn.clicked.connect(self._on_link_scene_to_sp_project)
-        scene_link_row.addWidget(self.scene_link_label, stretch=1)
-        scene_link_row.addWidget(self.scene_link_btn)
-        status_bar_layout.addLayout(scene_link_row)
+        link_detail_layout.addWidget(self.scene_link_btn)
 
-        # 2026.07.19-03(複数SPプロジェクト対応、フェーズ1): 行1.5:
+        # 2026.07.19-03(複数SPプロジェクト対応、フェーズ1): 行3:
         # このシーンに登録済みのSPプロジェクト一覧から、今作業している
         # 対象(天板/脚など)を選ぶドロップダウン。天板→脚のように頻繁に
         # 切り替える運用では、都度「設定し直す」で上書きしていた従来の
@@ -3114,12 +3179,47 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # 保持したまま選択だけを切り替えられるようにする。
         scene_link_switch_row = QtWidgets.QHBoxLayout()
         switch_label = QtWidgets.QLabel("作業対象:")
+        # UI導線改善(ご相談対応): 「作業対象:」ラベルを太字にして、
+        # 直後のコンボボックスと視覚的に結びつける。
+        switch_label_font = switch_label.font()
+        switch_label_font.setBold(True)
+        switch_label.setFont(switch_label_font)
+
+        # UI導線改善(ご相談対応・案B): 「クリックして出てくることが
+        # 分かりにくい」との相談を受け、コンボボックス自体ではなく
+        # 外側のQFrameに枠線を付けて「操作エリア全体」を視覚的に
+        # ひとかたまりのクリック可能領域として見せる。
+        #
+        # QComboBox自体にはスタイルシートを一切適用しない。QComboBoxの
+        # ような複合ウィジェットは、一部プロパティにでもスタイルシートを
+        # 当てると他のサブコントロール(ドロップダウン矢印の描画等)の
+        # デフォルト表示まで巻き添えで崩れることがQtの既知の注意点として
+        # あり(Mayaのバージョンや PySide2/6 の違いで挙動差が出やすい)、
+        # 一度検討した「▾ボタンを隣に追加する案」も標準の矢印と重複して
+        # 分かりにくくなる懸念があったため見送った経緯がある。
+        # QFrameという別ウィジェットを外側に足すだけなら、
+        # QComboBox自体の描画には一切干渉しない。
+        combo_frame = QtWidgets.QFrame()
+        # UI導線改善(ご相談対応・案B、安全性優先の再修正): スタイルシート
+        # のborder指定(palette()構文含む)は実機での見え方を確実に検証
+        # できないため、Qt標準のフレーム描画APIに完全に委ねる。
+        # StyledPanel + Sunken の組み合わせは、Mayaのテーマに関わらず
+        # 「くぼんだ枠」として描画され、ボタンなど他の凹んだ操作領域と
+        # 見た目の一貫性が保てる(スタイルシート不使用のため、
+        # QComboBox側の描画に影響する余地も一切ない)。
+        combo_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        combo_frame.setFrameShadow(QtWidgets.QFrame.Sunken)
+        combo_frame_layout = QtWidgets.QHBoxLayout(combo_frame)
+        combo_frame_layout.setContentsMargins(2, 2, 2, 2)
+
         self.scene_link_combo = QtWidgets.QComboBox()
         self.scene_link_combo.setToolTip(
             "このシーンに登録済みのSPプロジェクトから、今作業している"
             "対象を選びます。\n選択はシーンに保存され、次回このシーンを"
             "開いた時も復元されます。"
         )
+        combo_frame_layout.addWidget(self.scene_link_combo)
+
         # 2026.07.19-03: プログラムからのsetCurrentIndex()呼び出し
         # (_refresh_scene_link_label内での一覧再構築時)で意図せず
         # currentIndexChangedが発火し、再帰的にactive_link_idの書き込みと
@@ -3128,6 +3228,15 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # フラグで一時的に無効化する(_refresh_scene_link_labelを参照)。
         self._updating_scene_link_combo = False
         self.scene_link_combo.currentIndexChanged.connect(self._on_scene_link_combo_changed)
+        scene_link_switch_row.addWidget(switch_label)
+        scene_link_switch_row.addWidget(combo_frame, stretch=1)
+        link_detail_layout.addLayout(scene_link_switch_row)
+
+        # UI導線改善: 「追加」「削除」を独立した行にすることで、
+        # コンボボックス行の幅を圧迫しないようにする(以前はこの2ボタンが
+        # コンボボックスと同じ行にあり、狭い幅では見切れの原因になって
+        # いた)。
+        scene_link_manage_row = QtWidgets.QHBoxLayout()
         self.scene_link_add_btn = QtWidgets.QPushButton("＋現在のSPプロジェクトを追加")
         self.scene_link_add_btn.setToolTip(
             "今SPで開いているプロジェクトを、このシーンの新しい作業対象"
@@ -3140,11 +3249,23 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             "削除します。"
         )
         self.scene_link_remove_btn.clicked.connect(self._on_remove_scene_project_link)
-        scene_link_switch_row.addWidget(switch_label)
-        scene_link_switch_row.addWidget(self.scene_link_combo, stretch=1)
-        scene_link_switch_row.addWidget(self.scene_link_add_btn)
-        scene_link_switch_row.addWidget(self.scene_link_remove_btn)
-        status_bar_layout.addLayout(scene_link_switch_row)
+        scene_link_manage_row.addWidget(self.scene_link_add_btn, stretch=1)
+        scene_link_manage_row.addWidget(self.scene_link_remove_btn)
+        link_detail_layout.addLayout(scene_link_manage_row)
+
+        # 2026.07.20(ご要望対応): 「前のバージョンで最初からプロジェクト
+        # 連携設定系が見えるようにしてほしい」という要望を受け、詳細
+        # セクションの初期表示状態を開いた状態に変更する。折りたたみ
+        # 機能自体(クリックで開閉、不一致検知時の自動展開)はそのまま
+        # 維持し、初期値のみ変更する。
+        # 対応するchevron記号(summary_row側の▸/▾)は、この直後に必ず
+        # 呼ばれる _refresh_scene_link_label() -> _update_link_summary()
+        # 内で、現在のisVisible()を見て正しく揃えられるため、ここで
+        # 個別に書き換える必要はない。
+        self.link_detail_section.setVisible(True)
+        link_group_layout.addWidget(self.link_detail_section)
+
+        status_bar_layout.addWidget(link_group)
 
         # 行2: 他セッション警告(通常は非表示、検出時のみ出す)
         other_session_row = QtWidgets.QHBoxLayout()
@@ -3170,8 +3291,20 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         layout.addWidget(status_bar_group)
 
+        # --- 層1: 最頻操作 ---------------------------------------------
+        # UI導線改善(フェーズ1): このウィンドウを開いて最初に目に入り、
+        # かつ作業中いちばん多く触る操作を「層1」として最上段に固定し、
+        # 他の操作より一回り大きく・高さのあるボタンにする。判断基準は
+        # 「1セッション中に何度も押すか(層1)」「初回設定時など、たまに
+        # 触る程度か(層2)」「導入時に一度触ればよいか(層3)」の3段階。
+        # 色による区別はMayaの配色設定によって破綻しやすいため使わず、
+        # サイズと配置順序だけで頻度差を表現する。
         self.enable_btn = QtWidgets.QPushButton("監視（自動反映）: OFF")
         self.enable_btn.setCheckable(True)
+        self.enable_btn.setMinimumHeight(36)
+        enable_font = self.enable_btn.font()
+        enable_font.setBold(True)
+        self.enable_btn.setFont(enable_font)
         self.enable_btn.setToolTip(
             "ONにすると、SP側で塗った内容がMayaへ自動で反映されるようになります。\n"
             "(SPの書き出しフォルダを見張り、更新があるとテクスチャを読み込み直します)"
@@ -3192,7 +3325,19 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.quality_btn.toggled.connect(self._on_quality_toggled)
         layout.addWidget(self.quality_btn)
 
-        form = QtWidgets.QFormLayout()
+        # --- 層2: 初回セットアップ時に主に触る設定 -----------------------
+        # UI導線改善(フェーズ1): 監視フォルダ・レンダラーは通常、初回の
+        # セットアップウィザード実行時に決めればそれ以降ほとんど変更しない
+        # 項目のため、折りたたみ可能なグループ(QGroupBox, checkable)に
+        # まとめる。setChecked(True)はQGroupBoxの初期値(未指定時は
+        # チェック済み)と同じ値のため、ここではtoggledシグナルは発火
+        # しない。sp_live_sync_plugin.py の settings_group と同じ
+        # 折りたたみ方式に揃え、SP側・Maya側で操作感覚を統一する。
+        self.folder_group = QtWidgets.QGroupBox("同期フォルダ・レンダラー設定（通常は初回のみ）")
+        self.folder_group.setCheckable(True)
+        self.folder_group.setChecked(True)
+        self.folder_group.toggled.connect(self._on_folder_group_toggled)
+        form = QtWidgets.QFormLayout(self.folder_group)
         row = QtWidgets.QHBoxLayout()
         self.watch_edit = QtWidgets.QLineEdit()
         self.watch_edit.setToolTip(
@@ -3212,8 +3357,9 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.renderer_combo.addItems(RENDERER_CHOICES)
         self.renderer_combo.setToolTip("マテリアルを作るときに使うレンダラーです（通常はArnold）。")
         form.addRow("レンダラー", self.renderer_combo)
-        layout.addLayout(form)
+        layout.addWidget(self.folder_group)
 
+        # --- 層2: 日常的に使う操作 / 層3: 導入時に一度だけの操作 ----------
         # 日常的に使う操作(設定保存・履歴確認)と、初回導入時に一度だけ
         # 行えばよい操作(shelf設置・ウィザート・userSetup.py登録)を
         # 視覚的に分離する。後者は使用頻度が低いため「その他の設定」に
@@ -3332,19 +3478,37 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         mat_btn_row.addWidget(self.create_shader_btn)
         mat_layout.addLayout(mat_btn_row)
 
-        orphan_label = QtWidgets.QLabel("使われていないファイルノード")
-        orphan_label.setToolTip(
+        # UI導線改善(フェーズ1): 「未使用ファイルノード」の確認は、
+        # モデル名変更やクリーンアップ作業時にだけ必要になる層3寄りの
+        # 操作。通常のマテリアル作成フローでは触らないため、既定では
+        # 折りたたんでおき、必要な時だけボタンで開けるようにする。
+        self.orphan_toggle_btn = QtWidgets.QPushButton("▸ 使われていないファイルノードを確認")
+        self.orphan_toggle_btn.setFlat(True)
+        self.orphan_toggle_btn.setToolTip(
             "モデル名やマテリアル名の変更・削除によって、どのマテリアルにも\n"
-            "つながらなくなって取り残された file ノードの一覧です。\n"
+            "つながらなくなって取り残された file ノードを確認できます。\n"
             "誤削除を防ぐため、このツールが自動で消すことはありません。"
         )
-        mat_layout.addWidget(orphan_label)
+        # Qtのclickedシグナルはbool(チェック状態相当)を引数として渡すため、
+        # 引数なしの_on_orphan_toggle_clickedを間に挟み、トグル本体の
+        # _set_orphan_section_visible(bool)へは明示的な値のみを渡す。
+        # こうすることでクリックのたびに意図しないbool値が force_visible
+        # 相当の引数へ流れ込む(常に閉じる方向にしか動かなくなる)事故を
+        # 構造的に防ぐ。
+        self.orphan_toggle_btn.clicked.connect(self._on_orphan_toggle_clicked)
+        mat_layout.addWidget(self.orphan_toggle_btn)
+
+        self.orphan_section = QtWidgets.QWidget()
+        orphan_section_layout = QtWidgets.QVBoxLayout(self.orphan_section)
+        orphan_section_layout.setContentsMargins(0, 0, 0, 0)
         self.orphan_list = QtWidgets.QListWidget()
         self.orphan_list.setMaximumHeight(100)
-        mat_layout.addWidget(self.orphan_list)
+        orphan_section_layout.addWidget(self.orphan_list)
         self.refresh_orphan_btn = QtWidgets.QPushButton("使われていないノードを探す")
         self.refresh_orphan_btn.clicked.connect(self._refresh_orphan_list)
-        mat_layout.addWidget(self.refresh_orphan_btn)
+        orphan_section_layout.addWidget(self.refresh_orphan_btn)
+        self.orphan_section.setVisible(False)
+        mat_layout.addWidget(self.orphan_section)
 
         self._load_values_from_config()
 
@@ -3398,6 +3562,20 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         if renderer in RENDERER_CHOICES:
             self.renderer_combo.setCurrentIndex(RENDERER_CHOICES.index(renderer))
 
+    def _on_folder_group_toggled(self, checked):
+        # UI導線改善(フェーズ1): チェックを外すと中身を折りたたんで
+        # (非表示にして)場所を取らないようにする。QGroupBoxの標準動作
+        # (チェック解除時に子をdisableするだけ)とは別に、行そのものを
+        # 隠すことで見た目もすっきりさせる。
+        # sp_live_sync_plugin.py の LiveSyncPanel._on_settings_group_toggled
+        # と同じ方式に揃え、SP側・Maya側で操作感覚を統一している。
+        form = self.folder_group.layout()
+        for row in range(form.rowCount()):
+            for role in (QtWidgets.QFormLayout.LabelRole, QtWidgets.QFormLayout.FieldRole):
+                item = form.itemAt(row, role)
+                if item is not None and item.widget() is not None:
+                    item.widget().setVisible(checked)
+
     def _browse_watch_dir(self):
         current = self.watch_edit.text() or "C:/"
         selected = QtWidgets.QFileDialog.getExistingDirectory(self, "監視フォルダを選択", current)
@@ -3412,6 +3590,58 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.watcher.stop(reason="manual")
 
     # -- 2026.07.15-01: 状態バー関連 -------------------------------------
+
+    def _on_link_summary_clicked(self):
+        # UI導線改善(ご相談対応): QPushButton.clicked は bool を渡すが、
+        # ここでは受け取らずに現在の表示状態を見て自前で反転する。
+        # maya_live_sync.py の _on_orphan_toggle_clicked、
+        # sp_live_sync_plugin.py の _on_structure_toggle_clicked と
+        # 同じ設計(引数なしのクリック専用ハンドラ + 明示的なbool値のみを
+        # 受け取る実処理、という分離により、clickedのbool引数が意図せず
+        # 表示状態の決定に混入する事故を構造的に防ぐ)。
+        self._set_link_detail_visible(not self.link_detail_section.isVisible())
+
+    def _set_link_detail_visible(self, visible):
+        self.link_detail_section.setVisible(visible)
+        chevron = "▾" if visible else "▸"
+        # 現在の要約テキストはボタンのプロパティに保持しておき、
+        # 開閉時は先頭のchevron記号だけを付け替える(本文は
+        # _refresh_scene_link_label 側で更新される)。
+        current_summary = self.link_summary_btn.property("_summary_text") or "プロジェクト連携"
+        self.link_summary_btn.setText("{0} {1}".format(chevron, current_summary))
+
+    def _update_link_summary(self, kind, text, auto_expand=False):
+        """要約行(常時表示)のドット色と文言を更新する。
+
+        kind: "ok"(一致・緑) / "warn"(不一致・赤) / "neutral"(未設定/
+              SP未起動など・黄〜グレー) のいずれか。ドットの色でのみ
+              状態を示し、詳細な文言は展開時にしか見せない(要約行を
+              長文化させないため、text はここで十分に短く要約した
+              ものを渡すこと)。
+        auto_expand: True の場合、詳細セクションが閉じていれば自動的に
+              開く(不一致など、見落とすと困る状態の時に使う)。
+              udim_setup.py の _print() が [WARN]/[NG] 検知時に
+              自動でログを展開するのと同じ考え方。
+
+        実装注意: QPushButton(link_summary_btn)はリッチテキストを
+        サポートしないため、色は隣接する QLabel(link_summary_dot、
+        setTextFormat(Qt.RichText)対応)側のスタイルシートでのみ
+        表現する。ボタン側にはHTMLタグを含まないプレーンテキストのみ
+        渡す。
+        """
+        dot_color = {"ok": "#2a9c4a", "warn": "#c94a2a", "neutral": "#c9822a"}.get(kind, "#888888")
+        self.link_summary_dot.setStyleSheet("color: {0};".format(dot_color))
+
+        summary_text = "プロジェクト連携  {0}".format(text)
+        self.link_summary_btn.setProperty("_summary_text", summary_text)
+
+        if auto_expand and not self.link_detail_section.isVisible():
+            self._set_link_detail_visible(True)
+        else:
+            # 開閉状態はそのまま維持し、chevron記号+要約文言だけ更新する。
+            visible = self.link_detail_section.isVisible()
+            chevron = "▾" if visible else "▸"
+            self.link_summary_btn.setText("{0} {1}".format(chevron, summary_text))
 
     def _refresh_scene_link_label(self):
         """状態バー上部の「シーン ⇔ SPプロジェクト」表示と、複数SP
@@ -3493,6 +3723,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.scene_link_btn.setText("SPプロジェクトを設定")
             self.scene_link_btn.setEnabled(True)
             self.scene_link_remove_btn.setEnabled(False)
+            self._update_link_summary("neutral", "未設定")
             return
 
         self.scene_link_remove_btn.setEnabled(True)
@@ -3513,6 +3744,8 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.scene_link_label.setStyleSheet("color: #c9822a;")
             self.scene_link_btn.setText("SPプロジェクトを設定し直す")
             self.scene_link_btn.setEnabled(True)
+            # 再設定が必要な状態のため、見落とし防止のため自動展開する。
+            self._update_link_summary("neutral", "要再設定(未保存だったプロジェクト)", auto_expand=True)
             return
 
         linked_name = _link_display_name(selected_link)
@@ -3528,6 +3761,8 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.scene_link_label.setStyleSheet("color: #888888;")
             self.scene_link_btn.setText("SPプロジェクトを設定し直す")
             self.scene_link_btn.setEnabled(True)
+            # SP未起動は異常ではなくよくある状態のため、自動展開はしない。
+            self._update_link_summary("neutral", "{0} (SP未起動)".format(linked_name))
             return
 
         if active_key != linked_key:
@@ -3544,11 +3779,23 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 )
             )
             self.scene_link_label.setStyleSheet("color: #c94a2a; font-weight: bold;")
+            # 不一致は見落とすとテクスチャがズレたまま作業を続けることに
+            # なりかねないため、詳細セクションが閉じていれば自動的に開く
+            # (ご相談対応: udim_setup.py の警告時自動展開と同じ考え方)。
+            self._update_link_summary(
+                "warn", "{0} ⇔ SP側は{1}".format(linked_name, active_name), auto_expand=True
+            )
         else:
             self.scene_link_label.setText(
                 "このシーン「{0}」 ⇔ SPプロジェクト「{1}」".format(scene_name, linked_name)
             )
             self.scene_link_label.setStyleSheet("color: #2a9c4a;")
+            # UI導線改善(ご相談対応): 2件以上登録されている場合のみ件数を
+            # 添える(1件の時にまで「(1件登録)」と出すと冗長なため)。
+            summary_text = linked_name
+            if len(links) >= 2:
+                summary_text = "{0} ({1}件登録)".format(linked_name, len(links))
+            self._update_link_summary("ok", summary_text)
         self.scene_link_btn.setText("SPプロジェクトを設定し直す")
         self.scene_link_btn.setEnabled(True)
 
@@ -3862,6 +4109,23 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.watcher._emit_status("シェーダーを生成しました: {0}".format(", ".join(created)))
         if failed:
             QtWidgets.QMessageBox.warning(self, "Live Sync", "生成に失敗しました:\n" + "\n".join(failed))
+
+    def _on_orphan_toggle_clicked(self):
+        # UI導線改善(フェーズ1): QPushButton.clicked は bool(checked相当)を
+        # 渡してくるが、ここでは引数を一切受け取らないことで、その値が
+        # 意図せず表示状態の決定に混入することを構造的に防ぐ。実際の
+        # 表示/非表示の決定は現在の状態を見て自前で反転させる。
+        self._set_orphan_section_visible(not self.orphan_section.isVisible())
+
+    def _set_orphan_section_visible(self, visible):
+        # udim_setup.py の詳細設定/ログの折りたたみパターンと同じ
+        # 「▸/▾ + テキスト書き換え」方式に揃える。visible は必ず明示的な
+        # bool値のみを受け取り、シグナルの生の引数を直接渡さない。
+        self.orphan_section.setVisible(visible)
+        self.orphan_toggle_btn.setText(
+            "▾ 使われていないファイルノードを確認" if visible
+            else "▸ 使われていないファイルノードを確認"
+        )
 
     def _refresh_orphan_list(self):
         self.orphan_list.clear()

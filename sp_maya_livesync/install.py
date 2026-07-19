@@ -225,6 +225,35 @@ def _reload_if_cached(module_name):
             pass  # モジュール側で読み込み時エラーがあっても、後続の登録処理には委ねる
 
 
+def _collect_installed_versions():
+    """
+    2026.07.20(フェーズ2・バージョン整合性): TOOL_FILES に含まれる
+    各モジュールの __version__ を一覧取得する。
+
+    このMayaセッションで既に _reload_if_cached() 等を通じて
+    sys.modules にロード済みのものだけを対象とする、読み取り専用の
+    処理。新規に import や importlib.reload() を行うことはない
+    (それらは _run() 側で既に呼び出し順序も含めて慎重に扱われている
+    処理であり、ここで重複して呼ぶと不要な副作用のリスクが増えるため
+    意図的に避けている)。
+
+    戻り値: [(表示名, バージョン文字列 or None, 取得できたか), ...]
+    取得できなかった場合(未import・属性なし等)は None と False を返す。
+    """
+    results = []
+    for entry in TOOL_FILES:
+        fname = entry["name"]
+        module_name = os.path.splitext(fname)[0]
+        version = None
+        ok = False
+        module = sys.modules.get(module_name)
+        if module is not None:
+            version = getattr(module, "__version__", None)
+            ok = version is not None
+        results.append((fname, version, ok))
+    return results
+
+
 def _release_session_lock_directly():
     """
     2026.07.16(見落とし修正): _destroy_stale_livesync_window() 内の
@@ -554,6 +583,12 @@ def _run():
     except Exception:
         pass
 
+    # 2026.07.20(フェーズ2・バージョン整合性): 上記は maya_live_sync.py
+    # 単体の新旧差分表示だが、実際にコピーされる全ツールファイルの
+    # バージョンが今どうなっているかを一目で確認できるよう、一覧も
+    # 別途取得しておく(表示は完了メッセージの後半に追加する)。
+    installed_versions = _collect_installed_versions()
+
     has_aiss = "sp_to_aiStandardSurface.py" in copied
     has_udim = "udim_setup.py" in copied
 
@@ -580,6 +615,20 @@ def _run():
         else:
             lines.append("[バージョン] {0}（新規インストール）".format(new_version))
         lines.append("")
+
+    # 2026.07.20(フェーズ2・バージョン整合性): インストールされた
+    # 全ツールファイルのバージョンを一覧表示する。上記の[バージョン]は
+    # maya_live_sync.py単体の新旧差分だが、こちらは「今このセッションで
+    # 動いている全ファイルの組み合わせ」を一目で確認できるようにする
+    # ためのもの。取得できなかったファイル(未import・__version__属性
+    # なし等)は「-」と表示し、原因の切り分けがしやすいようにする。
+    lines.append("[バージョン一覧]")
+    for fname, version, ok in installed_versions:
+        if ok:
+            lines.append("  - {0}: v{1}".format(fname, version))
+        else:
+            lines.append("  - {0}: - (未読込のため確認できません。ウィンドウを一度開くと確認できます)".format(fname))
+    lines.append("")
 
     lines.append("[コピーしたツール]")
     for name in copied:
