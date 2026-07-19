@@ -1,48 +1,62 @@
 # ============================================================
 #  sp_to_aiStandardSurface.py
-#  Substance Painter textures -> aiStandardSurface auto assign
-#  v2.1  Prefix auto-detection + checklist UI
-#        + Displacement re-centering (remapValue) fix
+#  Substance Painterのテクスチャ -> aiStandardSurfaceへの自動接続
+#  (旧表記 v2.1相当。2026.07.20にSemVerへ移行、現在のバージョンは
+#   ファイル内の __version__ を参照。詳細はREADME.mdの
+#   「バージョン履歴」節を参照)
+#  プレフィックス自動検出 + チェックリストUI
+#  + Displacement再センタリング(remapValue)修正
 #
-#  Requirements : Maya 2022+ / Arnold 7+
-#  Usage        : Paste into Maya's Script Editor (Python tab) and run,
-#                 or save to ~/Documents/maya/scripts/ and call from a shelf
+#  必要環境 : Maya 2022+ / Arnold 7+
+#  使い方   : Mayaのスクリプトエディタ(Pythonタブ)に貼り付けて実行するか、
+#             ~/Documents/maya/scripts/ に保存してシェルフから呼び出す
 #
-#  Note: All cmds-facing strings (UI labels, dialogs, print logs) are kept
-#  in plain ASCII English on purpose. On some Windows + Japanese-locale
-#  Maya setups, non-ASCII strings passed through cmds/MEL get mangled into
-#  "?" characters. Keeping these strings ASCII-only avoids that entirely.
-#  Comments (this text) are not affected since Python parses the source
-#  file as UTF-8 regardless of OS locale.
+#  注記: 以前はシェルフボタンにこのファイルの中身を丸ごと貼り付けて
+#  MEL/cmds経由で実行していたため、日本語などの非ASCII文字列が
+#  「?」に化ける不具合があった。現在は本ファイルを単体のPythonスクリプト
+#  としてimport/exec経由で呼び出す運用に切り替えたため、その制約は
+#  解消されている(このコメント含めPythonソース自体はUTF-8として
+#  正しく読み込まれる)。UIラベル・ダイアログ・ログは日本語で統一する。
 #
 #  ------------------------------------------------------------
-#  v2.1 change log (displacement fix):
-#    - Previously the height/displacement file node's outColorR was wired
-#      directly into displacementShader.displacement. A standard 0-1
-#      grayscale height map uses 0.5 as the "no displacement" mid value,
-#      so feeding the raw value shifts the whole surface outward by roughly
-#      (mean brightness * scale), which showed up as the object looking
-#      uniformly "puffed up".
-#    - Now a remapValue node re-maps 0-1 into -0.5..0.5 before the
-#      displacementShader, so 0.5 becomes the zero-displacement baseline.
-#      This matches the approach already used in maya_live_sync.py's
-#      create_shader_network(), keeping both tools consistent.
-#    - displacementShader.scale is set to a conservative starting value
-#      (0.1) when the attribute exists, instead of leaving Maya's default
-#      of 1.0 (which is usually far too strong for test geometry). Tune it
-#      in the render view afterwards.
-#    - A short reminder is printed: Arnold displacement also needs the mesh
-#      shape's Subdivision (aiSubdivType = catclark/linear, iterations) and
-#      Bounds Padding (aiDispPadding) to be set. This script intentionally
-#      does not touch the mesh shape, so that step stays manual.
+#  旧v2.1 変更履歴 (displacement修正):
+#    - 以前はheight/displacement用のfileノードのoutColorRを
+#      displacementShader.displacementへ直接接続していた。標準的な
+#      0-1のグレースケールハイトマップは0.5が「変位なし」の中間値と
+#      なるため、生の値をそのまま渡すと (平均輝度 * scale) 分だけ
+#      サーフェス全体が外側へ膨張して見える不具合があった。
+#    - remapValueノードで0-1を-0.5..0.5へ再マップしてから
+#      displacementShaderへ渡すことで、0.5が変位ゼロの基準値になる。
+#      これはmaya_live_sync.pyのcreate_shader_network()で既に
+#      採用している方式と同じで、両ツール間の一貫性を保っている。
+#    - displacementShader.scaleは、属性が存在する場合はMayaの既定値
+#      1.0(テスト用ジオメトリには強すぎることが多い)のままにせず、
+#      控えめな初期値(0.1)に設定する。レンダービューで確認しながら
+#      後から調整すること。
+#    - 短いリマインダーを表示する: Arnoldのdisplacementは、メッシュ
+#      シェイプ側のSubdivision(aiSubdivType = catclark/linear,
+#      iterations)とBounds Padding(aiDispPadding)の設定も必要。
+#      本スクリプトは意図的にメッシュシェイプには触れないため、
+#      その設定は手動で行うこと。
 # ============================================================
 
 import os
 import re
 import maya.cmds as cmds
 
+# 2026.07.20: バージョン表記をセマンティックバージョニング
+# (MAJOR.MINOR.PATCH)へ移行。ツール群として初めて正式にバージョン番号を
+# 割り当てる区切りとして 1.0.0 からスタートする(このコミット以前は
+# コメント内ハードコードの独自表記 "v2.1" だった。旧番号との対応は
+# README.mdの「バージョン履歴」節を参照)。以降は他3ファイルと同じ
+# SemVer のルールに従う:
+#   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
+#   MINOR: 後方互換のある機能追加
+#   PATCH: 後方互換のあるバグ修正
+__version__ = "1.0.0"
+
 # -------------------------------------------------------
-#  Displacement tuning defaults (v2.1)
+#  Displacement tuning defaults (旧v2.1)
 # -------------------------------------------------------
 #  Starting scale for the displacementShader. 1.0 (Maya default) is almost
 #  always too strong for small test meshes; start low and raise in the
@@ -254,19 +268,19 @@ def _create_file_node(tex_path, space_key, place_node):
 
 def _connect_displacement(mat, fn):
     """
-    v2.1: Wire a height/displacement file node into the material's shading
-    group THROUGH a remapValue node that re-centers the 0-1 grayscale range
-    to -0.5..0.5. This makes 0.5 (mid gray) the zero-displacement baseline,
-    which removes the uniform "puffed up" offset that a direct connection
-    produces.
+    v2.1: height/displacement用のfileノードを、0-1のグレースケール
+    レンジを-0.5..0.5へ再センタリングするremapValueノードを経由して
+    マテリアルのシェーディンググループへ接続する。これにより0.5
+    (中間グレー)が変位ゼロの基準値になり、直接接続した場合に生じる
+    一様な「膨張」オフセットが解消される。
 
-    A conservative scale is set on the displacementShader as a starting
-    point. The mesh-side Subdivision / Bounds Padding still has to be set
-    manually (this function does not touch the mesh shape on purpose).
+    displacementShaderには控えめな初期scaleを設定する。メッシュ側の
+    Subdivision / Bounds Paddingは引き続き手動設定が必要
+    (本関数は意図的にメッシュシェイプには触れない)。
 
-    Returns the created displacementShader node.
+    生成したdisplacementShaderノードを返す。
     """
-    # 0-1 -> -0.5..0.5 re-centering.
+    # 0-1 -> -0.5..0.5 への再センタリング。
     remap = cmds.shadingNode("remapValue", asUtility=True)
     cmds.setAttr(f"{remap}.inputMin", 0.0)
     cmds.setAttr(f"{remap}.inputMax", 1.0)
@@ -277,7 +291,7 @@ def _connect_displacement(mat, fn):
     disp = cmds.shadingNode("displacementShader", asShader=True)
     cmds.connectAttr(f"{remap}.outValue", f"{disp}.displacement", force=True)
 
-    # Conservative starting scale (Maya default 1.0 is usually too strong).
+    # 控えめな初期scale(Mayaの既定値1.0は強すぎることが多い)。
     if (DISPLACEMENT_SCALE_DEFAULT is not None
             and cmds.attributeQuery("scale", node=disp, exists=True)):
         try:
@@ -290,11 +304,11 @@ def _connect_displacement(mat, fn):
         cmds.connectAttr(f"{disp}.displacement",
                           f"{sg[0]}.displacementShader", force=True)
 
-    print("[SP-to-aiSS] Displacement connected via remapValue "
-          "(0-1 -> -0.5..0.5), scale="
-          f"{DISPLACEMENT_SCALE_DEFAULT}. "
-          "Remember to set the mesh Subdivision (aiSubdivType) and "
-          "Bounds Padding (aiDispPadding) on the shape node.")
+    print("[SP-to-aiSS] displacementをremapValue経由で接続しました "
+          "(0-1 -> -0.5..0.5)、scale="
+          f"{DISPLACEMENT_SCALE_DEFAULT}。"
+          "メッシュシェイプ側のSubdivision(aiSubdivType)と"
+          "Bounds Padding(aiDispPadding)も忘れずに設定してください。")
     return disp
 
 
@@ -348,8 +362,8 @@ def _verify_and_fix_colorspaces(file_nodes):
 def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
                                 ao_multiply=True, assign_to_selected=False):
     """
-    Create (or reuse) one aiStandardSurface for the given prefix and
-    connect all matching textures to it.
+    指定プレフィックスに対応するaiStandardSurfaceを作成(または既存を再利用)し、
+    一致する全テクスチャを接続する。
     """
     mat_name = mat_name_override if mat_name_override else prefix
     mat   = _get_or_create_material(mat_name)
@@ -383,7 +397,7 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
             assigned[tex_type] = nm
 
         # --- Displacement ---
-        # v2.1: re-centering + conservative scale moved into a helper.
+        # v2.1: 再センタリング + 控えめなscaleはヘルパー関数に移設済み。
         elif info["attr"] == "__displacement__":
             fn   = _create_file_node(fpath, "Raw", place)
             created_file_nodes.append(fn)
@@ -396,7 +410,7 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
             created_file_nodes.append(ao_node)
             assigned[tex_type] = ao_node
 
-        # --- Standard ---
+        # --- 標準チャンネル ---
         else:
             fn = _create_file_node(fpath, info["colorSpace"], place)
             created_file_nodes.append(fn)
@@ -414,7 +428,7 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
                     try:
                         cmds.connectAttr(f"{fn}.outColorR", f"{mat}.{info['attr']}", force=True)
                     except Exception as e:
-                        cmds.warning(f"[SP-to-aiSS] Failed to connect {info['attr']}: {e}")
+                        cmds.warning(f"[SP-to-aiSS] {info['attr']} の接続に失敗しました: {e}")
 
             for extra_attr, val in info.get("also_set", {}).items():
                 try:
@@ -424,7 +438,7 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
 
             assigned[tex_type] = fn
 
-    # --- AO multiply ---
+    # --- AO乗算 ---
     if ao_multiply and ao_node and "baseColor" in assigned:
         mult = cmds.shadingNode("aiMultiply", asUtility=True)
         existing = cmds.listConnections(f"{mat}.baseColor", plugs=True, source=True)
@@ -432,9 +446,9 @@ def assign_textures_for_prefix(tex_dir, prefix, files, mat_name_override=None,
         cmds.connectAttr(src,                   f"{mult}.input1",    force=True)
         cmds.connectAttr(f"{ao_node}.outColor", f"{mult}.input2",    force=True)
         cmds.connectAttr(f"{mult}.outColor",    f"{mat}.baseColor",  force=True)
-        print(f"[SP-to-aiSS] [{prefix}] AO multiplied into baseColor.")
+        print(f"[SP-to-aiSS] [{prefix}] AOをbaseColorに乗算しました。")
 
-    # --- Assign to selected meshes ---
+    # --- 選択中メッシュへの割り当て ---
     if assign_to_selected:
         sel = cmds.ls(selection=True, dag=True, shapes=True, type="mesh")
         if sel:
@@ -471,36 +485,36 @@ def show_ui():
     if cmds.window(WIN_MAIN, exists=True):
         cmds.deleteUI(WIN_MAIN)
 
-    cmds.window(WIN_MAIN, title="SP -> aiStandardSurface  v2.1",
+    cmds.window(WIN_MAIN, title="SP -> aiStandardSurface  v{0}".format(__version__),
                 widthHeight=(500, 420), sizeable=True)
     cmds.columnLayout("mainCol", adjustableColumn=True,
                       rowSpacing=6, columnOffset=["both", 10])
     cmds.separator(h=8, style="none")
 
-    # ---- Texture folder ----
-    cmds.text(label="Texture folder", align="left", font="boldLabelFont")
+    # ---- テクスチャフォルダ ----
+    cmds.text(label="テクスチャフォルダ", align="left", font="boldLabelFont")
     cmds.rowLayout(numberOfColumns=2, columnWidth2=(370, 100),
                    adjustableColumn=1,
                    columnAttach=[(1,"both",0),(2,"both",4)])
-    dir_field = cmds.textField(placeholderText="Type a path or click Browse...")
-    cmds.button(label="Browse...", command=lambda _: _browse_dir(dir_field))
+    dir_field = cmds.textField(placeholderText="パスを入力するか「参照...」をクリック")
+    cmds.button(label="参照...", command=lambda _: _browse_dir(dir_field))
     cmds.setParent("..")
 
-    cmds.button(label="Scan folder for texture sets",
-                height=32, backgroundColor=(0.25, 0.45, 0.65),
+    cmds.button(label="フォルダをスキャンしてテクスチャセットを検出",
+                height=32,
                 command=lambda _: _scan_and_build_checklist(dir_field))
 
     _gui_state["dir_field"] = dir_field
 
     cmds.separator(h=4, style="in")
 
-    # ---- Prefix list (scroll) ----
-    cmds.text(label="Detected texture sets (check the ones to create)",
+    # ---- プレフィックス一覧(スクロール) ----
+    cmds.text(label="検出されたテクスチャセット（作成するものにチェック）",
               align="left", font="boldLabelFont")
 
     cmds.scrollLayout(height=140, childResizable=True)
     col = cmds.columnLayout(adjustableColumn=True, rowSpacing=2)
-    cmds.text(label="-- Scan a folder first --", align="left",
+    cmds.text(label="-- まずフォルダをスキャンしてください --", align="left",
               font="smallObliqueLabelFont")
     cmds.setParent("..")          # col
     cmds.setParent("..")          # scroll
@@ -509,23 +523,22 @@ def show_ui():
 
     cmds.separator(h=4, style="in")
 
-    # ---- Options ----
-    cmds.text(label="Options", align="left", font="boldLabelFont")
-    ao_cb  = cmds.checkBox(label="Multiply AO into BaseColor",   value=True)
-    sel_cb = cmds.checkBox(label="Assign to selected meshes", value=False)
+    # ---- オプション ----
+    cmds.text(label="オプション", align="left", font="boldLabelFont")
+    ao_cb  = cmds.checkBox(label="AOをBaseColorに乗算する",   value=True)
+    sel_cb = cmds.checkBox(label="選択中のメッシュに割り当てる", value=False)
 
     _gui_state["ao_cb"]  = ao_cb
     _gui_state["sel_cb"] = sel_cb
 
     cmds.separator(h=8, style="in")
 
-    # ---- Run button ----
-    cmds.button(label="Create checked materials", height=40,
-                backgroundColor=(0.2, 0.6, 0.35),
+    # ---- 実行ボタン ----
+    cmds.button(label="チェックしたセットのマテリアルを作成", height=40,
                 command=lambda _: _run_all())
 
     cmds.separator(h=4, style="none")
-    cmds.text(label="* See Script Editor for the log output", align="left",
+    cmds.text(label="※ ログの詳細はScript Editorを確認してください", align="left",
               font="smallObliqueLabelFont")
     cmds.separator(h=8, style="none")
 
@@ -533,17 +546,17 @@ def show_ui():
 
 
 def _browse_dir(field):
-    result = cmds.fileDialog2(fileMode=3, caption="Select texture folder")
+    result = cmds.fileDialog2(fileMode=3, caption="テクスチャフォルダを選択")
     if result:
         cmds.textField(field, edit=True, text=result[0])
 
 
 def _scan_and_build_checklist(dir_field):
-    """Scan the folder and rebuild the checklist of detected prefixes."""
+    """フォルダをスキャンし、検出したプレフィックスのチェックリストを再構築する。"""
     tex_dir = cmds.textField(dir_field, query=True, text=True).strip()
     if not tex_dir or not os.path.isdir(tex_dir):
-        cmds.confirmDialog(title="Error",
-                           message="Please specify a valid texture folder.",
+        cmds.confirmDialog(title="エラー",
+                           message="有効なテクスチャフォルダを指定してください。",
                            button=["OK"])
         return
 
@@ -564,22 +577,22 @@ def _scan_and_build_checklist(dir_field):
     cmds.setParent(col)
 
     if not groups:
-        cmds.text(label="No texture files found.",
+        cmds.text(label="テクスチャファイルが見つかりませんでした。",
                   align="left", font="smallObliqueLabelFont")
         return
 
-    # Select all / Deselect all row
+    # 全選択 / 全解除 の行
     cmds.rowLayout(numberOfColumns=2, columnWidth2=[110, 110],
                    columnAttach=[(1,"both",2),(2,"both",2)])
-    cmds.button(label="Select all",
+    cmds.button(label="全選択",
                 command=lambda _: _set_all_checks(True))
-    cmds.button(label="Deselect all",
+    cmds.button(label="全解除",
                 command=lambda _: _set_all_checks(False))
     cmds.setParent("..")
 
     cmds.separator(h=4, style="none")
 
-    # one checkbox per prefix + texture-count label
+    # プレフィックスごとにチェックボックス + テクスチャ枚数ラベルを表示
     for prefix, files in sorted(groups.items()):
         cmds.rowLayout(numberOfColumns=2,
                        columnWidth2=[280, 200],
@@ -595,11 +608,11 @@ def _scan_and_build_checklist(dir_field):
         cmds.setParent("..")
         _gui_state["prefix_cbs"][prefix] = cb
 
-    print(f"[SP-to-aiSS] Scan complete: {len(groups)} set(s) found")
+    print(f"[SP-to-aiSS] スキャン完了: {len(groups)} 件のセットを検出しました")
 
 
 def _tex_type_label(fpath):
-    """Return a short label for the texture type of a file."""
+    """ファイルのテクスチャ種別を表す短いラベルを返す。"""
     base = os.path.splitext(os.path.basename(fpath))[0].lower()
     tex_type, _, _pattern = _detect_texture_type(base)
     short = {
@@ -630,8 +643,8 @@ def _run_all():
     ]
 
     if not targets:
-        cmds.confirmDialog(title="Notice",
-                           message="No texture sets are checked.",
+        cmds.confirmDialog(title="お知らせ",
+                           message="チェックされているテクスチャセットがありません。",
                            button=["OK"])
         return
 
@@ -645,12 +658,29 @@ def _run_all():
         )
         created.append(mat)
 
-    msg = f"Created {len(created)} material(s):\n" + "\n".join(created)
-    cmds.confirmDialog(title="Done", message=msg, button=["OK"])
-    print(f"\n[SP-to-aiSS] Done: {created}")
+    msg = f"{len(created)} 件のマテリアルを作成しました:\n" + "\n".join(created)
+    cmds.confirmDialog(title="完了", message=msg, button=["OK"])
+    print(f"\n[SP-to-aiSS] 完了: {created}")
 
 
 # ============================================================
-#  Entry point
+#  エントリーポイント
 # ============================================================
-show_ui()
+# 2026.07.20(不具合修正): これまでモジュールレベルで show_ui() を
+# 直接呼んでいたため、install.py が内部的に(バージョン確認や
+# sys.modules への登録のために) import sp_to_aiStandardSurface を
+# 行っただけで、ユーザーが意図しないタイミングでウィンドウが勝手に
+# 開いてしまう不具合があった(maya_live_sync.py・udim_setup.py は
+# import だけでは何も表示されない設計のため、aiSS だけが目立って
+# 前面に出てしまい、install.py 実行直後に LiveSync ウィンドウが
+# 表示され続けてほしいという要望とも相性が悪かった)。
+#
+# udim_setup.py の if __name__ == "__main__": launch_gui() と同じ
+# 考え方に揃え、「単体のPythonスクリプトとして直接実行された場合のみ
+# 自動でUIを開く」設計に変更する。シェルフボタン側(install.py の
+# AISS_COMMAND)は元々 `import sp_to_aiStandardSurface as _sp` の後に
+# 明示的に `_sp.show_ui()` を呼んでおり、この変更後もシェルフボタンの
+# 動作は変わらない(むしろ、従来はimport時の自動呼び出しとこの明示
+# 呼び出しが二重に実行されていたため、この修正でその重複も解消される)。
+if __name__ == "__main__":
+    show_ui()
