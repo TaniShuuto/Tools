@@ -11,13 +11,19 @@ uninstall.py  -  SP -> Maya Live Sync : Maya drag-and-drop uninstaller
     2. アクティブシェルフ + 全シェルフタブから起動ボタンを削除
          - [LiveSync]
          - [aiSS]
+         - [UDIM]
     3. userSetup.py に登録された自動起動ブロックを削除
          (SP_LIVE_SYNC_AUTO_REGISTER マーカーで囲まれた範囲のみ。
           ユーザーが書いた他の内容には触れない)
-    4. Maya の scripts フォルダから下記2ファイルを削除
+    4. Maya の scripts フォルダから下記3ファイルを削除
          - maya_live_sync.py
          - sp_to_aiStandardSurface.py
-    5. 完了メッセージを表示
+         - udim_setup.py
+    5. Maya の icons フォルダから UDIM 用のシェルフアイコン
+       (udim_setup_icon.png)を削除
+         (install.py がコピーした場合のみ存在する任意ファイルのため、
+          見つからなくてもエラーにはしない)
+    6. 完了メッセージを表示
 
 **削除しないもの(意図的):**
     C:/SPMayaLiveSync 配下の設定ファイル・live/final フォルダ内の
@@ -37,6 +43,13 @@ uninstall.py  -  SP -> Maya Live Sync : Maya drag-and-drop uninstaller
 NOTE:
     UI文字列は、Windows + 日本語ロケール環境での文字化けを避けるため
     ASCII(英語)に統一しています(コメントは UTF-8 のまま影響ありません)。
+
+2026.07.20(見落とし修正): これまで udim_setup.py 導入前に作られたまま
+更新されておらず、TOOL_FILE_NAMES / シェルフボタン削除の対象に
+udim_setup.py・UDIMシェルフボタン・アイコン画像が一切含まれていなかった。
+install.py 側で udim_setup.py を導入した環境でアンインストールを実行しても、
+UDIM関連だけが残り続ける不具合があったため、install.py 側の定義
+(UDIM_LABEL 等)と対になるよう追加した。
 """
 
 import os
@@ -63,9 +76,13 @@ def onMayaDroppedPythonFile(*args, **kwargs):
 # install.py の TOOL_FILES / シェルフラベルと同じ定義を、依存を減らす
 # ため独立して持つ(install.py が既に削除された後でもこのファイル単体で
 # 動作できるようにするため)。
-TOOL_FILE_NAMES = ["maya_live_sync.py", "sp_to_aiStandardSurface.py"]
+# 2026.07.20(見落とし修正): udim_setup.py を追加。install.py の
+# TOOL_FILES と UDIM_LABEL / UDIM_ICON_NAME に対応。
+TOOL_FILE_NAMES = ["maya_live_sync.py", "sp_to_aiStandardSurface.py", "udim_setup.py"]
 LIVESYNC_LABEL = "LiveSync"
 AISS_LABEL = "aiSS"
+UDIM_LABEL = "UDIM"
+UDIM_ICON_NAME = "udim_setup_icon.png"
 REGISTER_MARKER = "# === SP_LIVE_SYNC_AUTO_REGISTER ==="
 
 # maya_live_sync.py 側の定義と一致させる必要がある定数。ここでも
@@ -79,6 +96,39 @@ _FALLBACK_WORKSPACE_CONTROL_NAME = _FALLBACK_WINDOW_OBJECT_NAME + "WorkspaceCont
 def _scripts_dir():
     """Maya のユーザ scripts フォルダ(全バージョン共通)のパスを返す。"""
     return cmds.internalVar(userScriptDir=True)
+
+
+def _icons_dir():
+    """
+    Maya のユーザ prefs 配下の icons フォルダのパスを返す。
+    install.py の _icons_dir() と同じ場所(コピー先)を指す必要があるため、
+    同じロジックを独立して持つ。
+    """
+    return os.path.join(cmds.internalVar(userPrefDir=True), "icons")
+
+
+def _remove_icon_files():
+    """
+    install.py が任意でコピーしたシェルフアイコン画像を icons フォルダから
+    削除する。install.py 自体がコピーを試みて失敗している場合(画像が
+    同梱されていなかった等)は、そもそもファイルが存在しないため、
+    見つからなくてもエラーとせず静かにスキップする。
+    削除できたファイル名の一覧を返す。
+    """
+    dst_dir = _icons_dir()
+    removed = []
+    for name in [UDIM_ICON_NAME]:
+        path = os.path.join(dst_dir, name)
+        if not os.path.isfile(path):
+            print("[Live Sync Uninstaller] Icon not found (already removed or never installed?): {0}".format(path))
+            continue
+        try:
+            os.remove(path)
+            removed.append(name)
+            print("[Live Sync Uninstaller] Removed icon: {0}".format(path))
+        except Exception as e:
+            print("[Live Sync Uninstaller] Could not remove icon '{0}': {1}".format(path, e))
+    return removed
 
 
 def _release_session_lock_directly():
@@ -302,14 +352,21 @@ def _run():
     _destroy_livesync_window()
 
     # 2. シェルフボタンの削除。
+    # 2026.07.20(見落とし修正): UDIMシェルフボタンの削除が漏れていたため追加。
     livesync_removed = _remove_shelf_buttons(LIVESYNC_LABEL)
     aiss_removed = _remove_shelf_buttons(AISS_LABEL)
+    udim_removed = _remove_shelf_buttons(UDIM_LABEL)
 
     # 3. userSetup.py の自動起動登録を削除。
     autostart_ok, autostart_msg = _remove_autostart_block()
 
-    # 4. ツール本体ファイルの削除。
+    # 4. ツール本体ファイルの削除(TOOL_FILE_NAMESにudim_setup.pyを追加済み)。
     removed_files = _remove_tool_files()
+
+    # 5. UDIM用シェルフアイコン画像の削除。
+    # 2026.07.20(見落とし修正): install.pyがコピーしたudim_setup_icon.png
+    # がicons フォルダに残り続けていたため追加。
+    removed_icons = _remove_icon_files()
 
     # sys.modules に残っているキャッシュも掃除しておく(ファイルは
     # 消えても、既にimport済みのモジュールオブジェクトはメモリ上に
@@ -333,6 +390,13 @@ def _run():
     lines.append("[シェルフボタン]")
     lines.append("  - '{0}' : {1} 個削除".format(LIVESYNC_LABEL, livesync_removed))
     lines.append("  - '{0}' : {1} 個削除".format(AISS_LABEL, aiss_removed))
+    lines.append("  - '{0}' : {1} 個削除".format(UDIM_LABEL, udim_removed))
+
+    if removed_icons:
+        lines.append("")
+        lines.append("[シェルフアイコン]")
+        for name in removed_icons:
+            lines.append("  - {0} を削除".format(name))
 
     lines.append("")
     lines.append("[自動起動の登録]")
