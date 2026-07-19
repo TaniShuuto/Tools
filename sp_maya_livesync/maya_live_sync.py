@@ -123,6 +123,8 @@ import re
 import json
 import time
 import glob
+import uuid
+import base64
 import datetime
 import subprocess
 
@@ -985,6 +987,31 @@ def _active_texture_sets(cfg):
 
 _SCENE_LINK_FILEINFO_KEY = "sp_live_sync_project_key"
 
+# 2026.07.19-03(複数SPプロジェクト対応、フェーズ1): 1シーンにつき
+# SPプロジェクトを1つしか紐付けられなかった従来の制限を撤廃するための
+# 新キー。天板/脚のようにオブジェクトごとにSPプロジェクトを分けている
+# 作例では、作業対象を切り替えるたびに旧キー(_SCENE_LINK_FILEINFO_KEY)を
+# 上書きする必要があり、直前の紐付けが失われてしまっていた。
+#
+# 新形式は「複数のlinkのリスト + 現在アクティブなlinkのid」を持つ:
+#   {
+#     "links": [
+#       {"id": "link_xxxxxx", "sp_project_key": "...", "label": "天板",
+#        "bound_nodes": []},
+#       ...
+#     ],
+#     "active_link_id": "link_xxxxxx"
+#   }
+#
+# "bound_nodes" は現時点では常に空配列(未使用)。将来「Maya側で選択した
+# オブジェクトから対応するSPPを自動判定する」拡張を行う際に、この
+# データ構造自体を作り直さずに済むよう、フィールドだけ先に確保している。
+#
+# 新旧キーは別名のため共存可能。旧キーのみが存在する古いシーンを開いた
+# 場合は _migrate_legacy_scene_link() が読み取り時に非破壊で新形式へ
+# 変換する(実際にシーンへ書き戻すのは次回保存時)。
+_SCENE_LINKS_FILEINFO_KEY = "sp_live_sync_project_links"
+
 
 def _normalize_project_key_for_compare(key):
     """
@@ -1012,10 +1039,74 @@ def _normalize_project_key_for_compare(key):
     return key.replace("\\", "/")
 
 
-def _get_current_scene_project_link():
-    """現在Mayaで開いているシーンに紐付けられたSPプロジェクトキーを
-    返す。紐付けが無ければNone。戻り値は常にスラッシュ区切りに
-    正規化済み(_normalize_project_key_for_compare参照)。
+def _generate_link_id():
+    """新規linkのための短いID("link_xxxxxx")を発行する。
+
+    衝突確認は行わない: 1シーンに同時に持つlink数はごく少数
+    (作例のオブジェクト分割数程度)であり、6桁の16進数(約1677万通り)で
+    実運用上の衝突確率は無視できる。万一衝突しても、次にlinkを追加する
+    タイミングで別のIDが振られるだけで実害は無い。
+    """
+    return "link_{0}".format(uuid.uuid4().hex[:6])
+
+
+def _empty_scene_links_payload():
+    """linkが1件も無い状態のペイロードを返す(新規シーン等)。"""
+    return {"links": [], "active_link_id": None}
+
+
+def _migrate_legacy_scene_link(legacy_key):
+    """2026.07.19-03より前の単一キー形式(_SCENE_LINK_FILEINFO_KEY /
+    last_scene_project_links の文字列値)を、新links形式へ変換する。
+
+    非破壊: 呼び出し元が新形式を明示的に保存しない限り、旧キー自体は
+    そのまま残る(ロールバック時の保険、および万一の旧バージョン混在
+    時の最低限の動作を維持するため)。
+
+    legacy_key が空/Noneの場合は空のペイロードを返す。
+    """
+    normalized = _normalize_project_key_for_compare(legacy_key)
+    if not normalized:
+        return _empty_scene_links_payload()
+
+    link = {
+        "id": _generate_link_id(),
+        "sp_project_key": normalized,
+        "label": "(移行済み) {0}".format(_project_display_name(normalized) or normalized),
+        "bound_nodes": [],
+    }
+    return {"links": [link], "active_link_id": link["id"]}
+
+
+def _get_scene_project_links(_diag=None):
+    """現在Mayaで開いているシーンに紐付けられた、複数SPプロジェクトの
+    link一覧とアクティブlinkのidを返す。
+
+    戻り値: {"links": [...], "active_link_id": "..." or None}
+    新形式のfileInfo/共有設定に情報が無い場合は、旧形式(単一キー)から
+    自動的に移行して返す(シーンへの書き戻しはここでは行わない。
+    呼び出し元が明示的に _set_scene_project_links() を呼ぶまでは
+    ディスク上は旧形式のままで良い)。
+
+    2026.07.19-04(緊急修正): 当初はJSON文字列をそのまま
+    cmds.fileInfo() の値として渡していたが、fileInfoはMEL文字列として
+    保存する際に独自のエスケープ処理を行うため、ダブルクォートを
+    大量に含むJSON文字列(1リンクあたり4組、複数リンクでは10組以上)を
+    往復させると値が破損し、書き込み直後のクエリでも
+    json.loads() が失敗する不具合があった(2026.07.16の
+    _normalize_project_key_for_compare と同種、バックスラッシュではなく
+    ダブルクォートで再発したケース)。
+    _set_scene_project_links() 側でBase64エンコードしてから
+    fileInfoへ渡すようにしたため、ここではデコードしてから
+    json.loads() する。ASCII文字のみのBase64文字列はfileInfoの
+    エスケープと衝突しないため、往復での破損が起きない。
+
+    _diag: 呼び出し元がUI状態ログに「壊れた値からのフォールバックが
+    発生したかどうか」を表示できるようにするための、書き込み可能な
+    dict(任意)。渡された場合、フォールバックが発生すると
+    _diag["fallback"] = True をセットする。モジュールレベル関数から
+    は self._emit_status() を直接呼べない(LiveSyncWatcherインスタンス
+    に紐付いていないため)ため、この形で呼び出し元に伝播する。
     """
     try:
         scene_path = cmds.file(query=True, sceneName=True)
@@ -1024,39 +1115,151 @@ def _get_current_scene_project_link():
 
     if scene_path:
         try:
-            info = cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, query=True)
+            info = cmds.fileInfo(_SCENE_LINKS_FILEINFO_KEY, query=True)
         except Exception:
             info = None
-        if info:
-            # 2026.07.16: 以前ここで行っていた
-            # value.encode("utf-8").decode("unicode_escape") は、
-            # Windowsパスのバックスラッシュ区切りを破壊する不具合の
-            # 原因だったため撤去した。保存側(_set_current_scene_
-            # project_link)が既にスラッシュ区切りで保存するため、
-            # 読み取り側で特別なデコードは不要。
-            value = info[0]
-            return _normalize_project_key_for_compare(value) or None
+        if info and info[0]:
+            payload = _decode_scene_links_fileinfo_value(info[0])
+            if payload is not None:
+                return payload
+            # デコード/パース失敗時。サイレントに旧形式へフォールバック
+            # すると、既にlinksを追加したはずなのに毎回「見つからない」
+            # ことになり、原因不明のまま同じ不具合を再発させてしまう。
+            # Mayaコンソールへの警告に加え、_diagで呼び出し元(UI)にも
+            # 伝える。
+            try:
+                om.MGlobal.displayWarning(
+                    "SP Live Sync: シーンの複数SPプロジェクト情報の読み取りに"
+                    "失敗しました(壊れた値の可能性)。旧形式からの復元を試みます。"
+                )
+            except Exception:
+                pass
+            if isinstance(_diag, dict):
+                _diag["fallback"] = True
+
+        # 新形式が無い/壊れている場合は旧形式から移行する。
+        try:
+            legacy_info = cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, query=True)
+        except Exception:
+            legacy_info = None
+        legacy_value = legacy_info[0] if legacy_info else None
+        return _migrate_legacy_scene_link(legacy_value)
+
+    # 未保存シーン: 共有設定ファイル側のセッション内フォールバックを見る。
+    cfg = load_config()
+    all_links = cfg.get("last_scene_project_links", {})
+    entry = all_links.get("__unsaved__")
+    if isinstance(entry, dict) and "links" in entry:
+        validated = _validate_scene_links_payload(entry)
+        if validated is not None:
+            return validated
+        if isinstance(_diag, dict):
+            _diag["fallback"] = True
+    # 旧形式(文字列)からの移行、またはエントリ自体が無い/壊れている場合。
+    return _migrate_legacy_scene_link(entry if isinstance(entry, str) else None)
+
+
+def _encode_scene_links_fileinfo_value(payload):
+    """payload(dict)をJSON化した上でBase64(ASCII)エンコードして返す。
+
+    fileInfoの値をダブルクォート/日本語混じりのJSON文字列そのままに
+    しないための変換。base64.b64encodeの出力は英数字+"+/="のみで、
+    fileInfoのエスケープと衝突する文字を一切含まない。
+    """
+    raw = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _validate_scene_links_payload(payload):
+    """{"links": [...], "active_link_id": ...} 形式のpayloadを検証し、
+    壊れた要素を取り除いた安全な形で返す。
+
+    トップレベルの形だけでなく、links配列の各要素が辞書で
+    id/sp_project_keyを持つかも検証する。手動でのシーン/設定ファイル
+    編集や、将来のバージョン間の非互換なデータが紛れ込んだ場合、
+    _find_link()等が link.get(...) を呼んだ時点でAttributeErrorを
+    起こし、状態バーの描画自体が止まってしまう(例外がUIスレッドに
+    伝播するとウィンドウ操作不能になりうる)ため、ここで壊れた要素
+    だけを除外し、機能全体を止めないようにする。
+
+    トップレベルの形自体が不正(dictでない、"links"が無い等)な場合は
+    Noneを返す。
+    """
+    if not isinstance(payload, dict) or "links" not in payload:
         return None
 
-    # 未保存シーン: セッション内フォールバックを見る。シーンを一意に
-    # 識別できないため、"__unsaved__" 固定のキーで代用する(SP側の
-    # _current_project_key() が未保存プロジェクトを区別できないのと
-    # 同じ既知の制限)。
-    cfg = load_config()
-    links = cfg.get("last_scene_project_links", {})
-    return _normalize_project_key_for_compare(links.get("__unsaved__"))
+    raw_links = payload.get("links")
+    if not isinstance(raw_links, list):
+        return None
+
+    valid_links = []
+    for link in raw_links:
+        if not isinstance(link, dict):
+            continue
+        if not link.get("id") or not link.get("sp_project_key"):
+            continue
+        valid_links.append({
+            "id": link.get("id"),
+            "sp_project_key": link.get("sp_project_key"),
+            "label": link.get("label") or "",
+            "bound_nodes": link.get("bound_nodes") if isinstance(link.get("bound_nodes"), list) else [],
+        })
+
+    active_link_id = payload.get("active_link_id")
+    if active_link_id is not None and not any(l["id"] == active_link_id for l in valid_links):
+        # アクティブとして記録されていたIDが有効なlink群に無い場合
+        # (上の検証で除外された、または元データが壊れていた場合)、
+        # 残ったlinkの先頭にフォールバックする。
+        active_link_id = valid_links[0]["id"] if valid_links else None
+
+    return {"links": valid_links, "active_link_id": active_link_id}
 
 
-def _set_current_scene_project_link(sp_project_key):
-    """現在Mayaで開いているシーンに、対応するSPプロジェクトキーを
-    紐付けて保存する。保存済みシーンならfileInfo(次回保存時に
-    シーンファイルへ永続化される)、未保存シーンなら共有設定ファイルの
-    last_scene_project_links に一時的に記録する。
+def _decode_scene_links_fileinfo_value(encoded_value):
+    """_encode_scene_links_fileinfo_value() の逆変換。
 
-    2026.07.16: 保存前にスラッシュ区切りへ正規化してから書き込む
-    (詳細は _normalize_project_key_for_compare のコメント参照)。
+    デコードまたはJSONパースに失敗した場合はNoneを返す(例外を外に
+    漏らさない。呼び出し元が旧形式へのフォールバックを判断できる
+    ようにするため)。構造検証は _validate_scene_links_payload() に
+    委譲する。
     """
-    normalized_key = _normalize_project_key_for_compare(sp_project_key)
+    if not encoded_value:
+        return None
+    try:
+        raw = base64.b64decode(encoded_value.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return _validate_scene_links_payload(payload)
+
+
+def _set_scene_project_links(payload):
+    """_get_scene_project_links() と対になる書き込み関数。
+
+    payload は {"links": [...], "active_link_id": "..." or None} 形式。
+    保存済みシーンなら新形式のfileInfoキーへ(次回シーン保存時に
+    ファイルへ永続化される)、未保存シーンなら共有設定ファイルの
+    last_scene_project_links["__unsaved__"] へ書き込む。
+
+    2026.07.16の教訓(_normalize_project_key_for_compare 参照)を踏まえ、
+    各link内のsp_project_keyは保存前に必ず正規化する。
+
+    2026.07.19-04(緊急修正): fileInfoへの書き込みはJSON文字列を直接
+    渡さず、Base64エンコードしたASCII文字列を渡す
+    (_get_scene_project_links の同日コメント参照)。
+    """
+    normalized_links = []
+    for link in payload.get("links", []):
+        normalized_links.append({
+            "id": link.get("id") or _generate_link_id(),
+            "sp_project_key": _normalize_project_key_for_compare(link.get("sp_project_key")),
+            "label": link.get("label") or "",
+            "bound_nodes": list(link.get("bound_nodes", [])),
+        })
+    normalized_payload = {
+        "links": normalized_links,
+        "active_link_id": payload.get("active_link_id"),
+    }
 
     try:
         scene_path = cmds.file(query=True, sceneName=True)
@@ -1065,16 +1268,141 @@ def _set_current_scene_project_link(sp_project_key):
 
     if scene_path:
         try:
-            cmds.fileInfo(_SCENE_LINK_FILEINFO_KEY, normalized_key or "")
+            cmds.fileInfo(_SCENE_LINKS_FILEINFO_KEY, _encode_scene_links_fileinfo_value(normalized_payload))
             return True
         except Exception:
             return False
 
     cfg = load_config()
-    links = dict(cfg.get("last_scene_project_links", {}))
-    links["__unsaved__"] = normalized_key
-    save_config({"last_scene_project_links": links})
+    all_links = dict(cfg.get("last_scene_project_links", {}))
+    all_links["__unsaved__"] = normalized_payload
+    save_config({"last_scene_project_links": all_links})
     return True
+
+
+def _find_link(payload, link_id):
+    """payload["links"]の中からidが一致するlinkを返す(無ければNone)。"""
+    for link in payload.get("links", []):
+        if link.get("id") == link_id:
+            return link
+    return None
+
+
+# 2026.07.19-05: 1シーンに保持できるlink数の上限。fileInfoの値自体に
+# 明文化された長さ制限は無いが、Maya ASCII保存時に巨大な文字列属性が
+# クラッシュを誘発する既知の問題が報告されており、念のため現実的な
+# 運用(作例のオブジェクト分割数はせいぜい数個〜10個程度)を大きく
+# 超える異常な蓄積を防ぐガードを設ける。上限に達した場合は追加を
+# 拒否し、不要なlinkを削除するよう促す。
+_MAX_SCENE_PROJECT_LINKS = 30
+
+
+def _add_scene_project_link(sp_project_key, label=None):
+    """現在のシーンに新しいlinkを追加し、追加したlinkをアクティブにする。
+
+    既に同じsp_project_key(正規化後)のlinkが存在する場合は、重複追加
+    せずにそのlinkをアクティブにするだけに留める(「＋追加」ボタンを
+    連打しても増殖しないようにするため)。
+
+    戻り値: 追加(または既存採用)されたlinkのdict。上限超過で追加でき
+    なかった場合は None。
+    """
+    normalized_key = _normalize_project_key_for_compare(sp_project_key)
+    payload = _get_scene_project_links()
+
+    existing = None
+    for link in payload.get("links", []):
+        if link.get("sp_project_key") == normalized_key:
+            existing = link
+            break
+
+    if existing is not None:
+        payload = dict(payload)
+        payload["active_link_id"] = existing["id"]
+        _set_scene_project_links(payload)
+        return existing
+
+    if len(payload.get("links", [])) >= _MAX_SCENE_PROJECT_LINKS:
+        return None
+
+    new_link = {
+        "id": _generate_link_id(),
+        "sp_project_key": normalized_key,
+        "label": label or _project_display_name(normalized_key) or "",
+        "bound_nodes": [],
+    }
+    payload = dict(payload)
+    payload["links"] = list(payload.get("links", [])) + [new_link]
+    payload["active_link_id"] = new_link["id"]
+    _set_scene_project_links(payload)
+    return new_link
+
+
+def _remove_scene_project_link(link_id):
+    """指定したlinkをシーンの紐付けから削除する。
+
+    削除対象がアクティブlinkだった場合、残ったlinkの先頭を新たに
+    アクティブにする(残りが無ければ active_link_id は None になる)。
+    """
+    payload = _get_scene_project_links()
+    remaining = [link for link in payload.get("links", []) if link.get("id") != link_id]
+
+    new_active = payload.get("active_link_id")
+    if new_active == link_id:
+        new_active = remaining[0]["id"] if remaining else None
+
+    _set_scene_project_links({"links": remaining, "active_link_id": new_active})
+
+
+def _set_active_link(link_id):
+    """状態バーのドロップダウン選択などから呼ばれる、アクティブlinkの
+    切り替え。link_id が既存linksに存在しない場合は何もしない
+    (存在しないidを誤って選択状態にしてしまう事故を防ぐため)。
+    """
+    payload = _get_scene_project_links()
+    if link_id is not None and _find_link(payload, link_id) is None:
+        return False
+    payload = dict(payload)
+    payload["active_link_id"] = link_id
+    _set_scene_project_links(payload)
+    return True
+
+
+def _get_current_scene_project_link():
+    """[互換ラッパー] 現在アクティブなlinkのsp_project_keyだけを返す。
+
+    2026.07.19-03より前は「シーンにつき1つの紐付け」という設計だった
+    ため、多数の呼び出し元がこの関数の戻り値(文字列またはNone)を
+    直接前提にしている。複数link対応後もそれらの呼び出し元を一度に
+    全置換すると変更範囲が広がり過ぎるため、当面は「現在アクティブな
+    linkのキーを返す」薄いラッパーとして残す。新規コードは
+    _get_scene_project_links() を直接使うこと。
+    """
+    payload = _get_scene_project_links()
+    active_link = _find_link(payload, payload.get("active_link_id"))
+    if active_link is None:
+        return None
+    return active_link.get("sp_project_key") or None
+
+
+def _set_current_scene_project_link(sp_project_key):
+    """[互換ラッパー] _add_scene_project_link() を呼び、渡された
+    sp_project_key をアクティブなlinkとして紐付ける。
+
+    既存呼び出し元(「SPプロジェクトを設定」ボタン等)は「1つを
+    上書きする」つもりで呼んでいるが、新形式では「無ければ追加、
+    既にあれば選択」という挙動になる。天板→脚のように複数プロジェクトを
+    行き来する運用では、この変更によって直前の紐付けが消えなくなる
+    (これが今回の複数プロジェクト対応の主眼)。
+
+    2026.07.19-05(不具合修正): 以前は _add_scene_project_link() の
+    戻り値を見ずに常に True を返していたため、上限(_MAX_SCENE_PROJECT_
+    LINKS)到達で追加に失敗した場合でも呼び出し元に「成功した」と
+    伝わってしまい、実際には紐付いていないのに「紐付けました」という
+    誤った成功ログが表示される不具合があった。戻り値をそのまま
+    真偽値として伝播させる。
+    """
+    return _add_scene_project_link(sp_project_key) is not None
 
 
 def _scene_display_name():
@@ -1095,6 +1423,33 @@ def _project_display_name(project_key):
     if project_key == "__unsaved__":
         return "(未保存のSPプロジェクト)"
     return os.path.basename(project_key)
+
+
+def _link_display_name(link):
+    """状態バー・ドロップダウン表示用の、link1件分の短い名前を返す。
+
+    label が設定されていれば "label（basename）" 形式、無ければ
+    従来通り basename のみを返す(_project_display_name と同じ体裁)。
+
+    2026.07.19-05: ユーザーが「＋現在のSPプロジェクトを追加」の名前
+    入力ダイアログで、意図せずファイル名をそのまま(拡張子込みで)
+    入力した場合、"Poker_Table_Stand.spp（Poker_Table_Stand.spp）"の
+    ように同じ名前が二重表示される不具合があった(実機ログで確認)。
+    label と basename が実質同一(拡張子の有無だけの違いを含む)の
+    場合は、basename側のみを表示する。
+    """
+    if not link:
+        return None
+    project_key = link.get("sp_project_key")
+    basename = _project_display_name(project_key)
+    label = (link.get("label") or "").strip()
+    if label and basename:
+        label_stem, _ = os.path.splitext(label)
+        basename_stem, _ = os.path.splitext(basename)
+        if label == basename or label_stem == basename_stem:
+            return basename
+        return "{0}（{1}）".format(label, basename)
+    return label or basename
 
 
 def _export_prefix(cfg, texture_set_name, project_key=None):
@@ -2751,6 +3106,46 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         scene_link_row.addWidget(self.scene_link_btn)
         status_bar_layout.addLayout(scene_link_row)
 
+        # 2026.07.19-03(複数SPプロジェクト対応、フェーズ1): 行1.5:
+        # このシーンに登録済みのSPプロジェクト一覧から、今作業している
+        # 対象(天板/脚など)を選ぶドロップダウン。天板→脚のように頻繁に
+        # 切り替える運用では、都度「設定し直す」で上書きしていた従来の
+        # 挙動だと直前の紐付けが消えてしまっていたため、複数件を
+        # 保持したまま選択だけを切り替えられるようにする。
+        scene_link_switch_row = QtWidgets.QHBoxLayout()
+        switch_label = QtWidgets.QLabel("作業対象:")
+        self.scene_link_combo = QtWidgets.QComboBox()
+        self.scene_link_combo.setToolTip(
+            "このシーンに登録済みのSPプロジェクトから、今作業している"
+            "対象を選びます。\n選択はシーンに保存され、次回このシーンを"
+            "開いた時も復元されます。"
+        )
+        # 2026.07.19-03: プログラムからのsetCurrentIndex()呼び出し
+        # (_refresh_scene_link_label内での一覧再構築時)で意図せず
+        # currentIndexChangedが発火し、再帰的にactive_link_idの書き込みと
+        # 再描画が連鎖するのを避けるため、シグナル接続はコンボボックス
+        # 構築後にまとめて行い、更新中は _updating_scene_link_combo
+        # フラグで一時的に無効化する(_refresh_scene_link_labelを参照)。
+        self._updating_scene_link_combo = False
+        self.scene_link_combo.currentIndexChanged.connect(self._on_scene_link_combo_changed)
+        self.scene_link_add_btn = QtWidgets.QPushButton("＋現在のSPプロジェクトを追加")
+        self.scene_link_add_btn.setToolTip(
+            "今SPで開いているプロジェクトを、このシーンの新しい作業対象"
+            "として追加します。\n既存の紐付けは上書きされません。"
+        )
+        self.scene_link_add_btn.clicked.connect(self._on_add_scene_project_link)
+        self.scene_link_remove_btn = QtWidgets.QPushButton("削除")
+        self.scene_link_remove_btn.setToolTip(
+            "ドロップダウンで選択中の作業対象を、このシーンの紐付けから"
+            "削除します。"
+        )
+        self.scene_link_remove_btn.clicked.connect(self._on_remove_scene_project_link)
+        scene_link_switch_row.addWidget(switch_label)
+        scene_link_switch_row.addWidget(self.scene_link_combo, stretch=1)
+        scene_link_switch_row.addWidget(self.scene_link_add_btn)
+        scene_link_switch_row.addWidget(self.scene_link_remove_btn)
+        status_bar_layout.addLayout(scene_link_switch_row)
+
         # 行2: 他セッション警告(通常は非表示、検出時のみ出す)
         other_session_row = QtWidgets.QHBoxLayout()
         self.other_session_label = QtWidgets.QLabel("")
@@ -3019,7 +3414,8 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
     # -- 2026.07.15-01: 状態バー関連 -------------------------------------
 
     def _refresh_scene_link_label(self):
-        """状態バー上部の「シーン ⇔ SPプロジェクト」表示を更新する。
+        """状態バー上部の「シーン ⇔ SPプロジェクト」表示と、複数SP
+        プロジェクト切り替え用ドロップダウンを更新する。
 
         2026.07.15-05(緊急修正): active_key(SP側が今開いているプロジェクト)
         が None の場合(SPが未起動、またはプロジェクトを何も開いていない)
@@ -3055,6 +3451,15 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         このメソッド自身に接続されているため、そのまま呼ぶと1回の
         更新で2回連続実行されてしまう(実害はないが無駄なため、
         フラグで防ぐ)。
+
+        2026.07.19-03(複数SPプロジェクト対応、フェーズ1): 従来は
+        「シーンにつき1つの紐付け」しか無かったため、ここでの比較は
+        linked_key(唯一の紐付け先)とactive_key(SP側の現在値)を単純に
+        比べるだけで済んでいた。複数link対応後は「現在ドロップダウンで
+        選択されているlink」に対してのみ同じ比較を行う。一致判定の
+        意味自体は変わらない(比較対象が「唯一の紐付け」から「選択中の
+        紐付け」に変わっただけ)ため、過去の緊急修正(上記)で得られた
+        正規化・タイミングの教訓はそのまま活きる。
         """
         if getattr(self, "_refreshing_scene_link_label", False):
             return
@@ -3063,18 +3468,36 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.watcher._refresh_dynamic_config()
         finally:
             self._refreshing_scene_link_label = False
+
         scene_name = _scene_display_name()
-        linked_key = _get_current_scene_project_link()
+        diag = {}
+        payload = _get_scene_project_links(_diag=diag)
+        if diag.get("fallback"):
+            self.watcher._emit_status(
+                "警告: 保存済みの複数SPプロジェクト情報を正しく読み取れず、"
+                "以前の紐付けから復元しました。追加した作業対象がドロップ"
+                "ダウンに反映されない場合は、お手数ですが再度「＋現在の"
+                "SPプロジェクトを追加」からやり直してください。"
+            )
+        links = payload.get("links", [])
+        active_link_id = payload.get("active_link_id")
         active_key = _normalize_project_key_for_compare(self.watcher.config.get("active_project_key"))
 
-        if linked_key is None:
+        self._rebuild_scene_link_combo(links, active_link_id)
+
+        if not links:
             self.scene_link_label.setText(
                 "このシーン「{0}」のSPプロジェクトは未設定です。".format(scene_name)
             )
             self.scene_link_label.setStyleSheet("color: #c9822a;")
             self.scene_link_btn.setText("SPプロジェクトを設定")
             self.scene_link_btn.setEnabled(True)
+            self.scene_link_remove_btn.setEnabled(False)
             return
+
+        self.scene_link_remove_btn.setEnabled(True)
+        selected_link = _find_link(payload, active_link_id) or links[0]
+        linked_key = selected_link.get("sp_project_key")
 
         if linked_key == "__unsaved__":
             # 2026.07.16(緊急修正): SP側が未保存の段階で紐付けボタンを
@@ -3083,23 +3506,24 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             # での新規紐付けをブロックするが、既に焼き付いてしまった
             # 過去の紐付けは自動修復できないため、再設定を明示的に促す。
             self.scene_link_label.setText(
-                "このシーン「{0}」は未保存だったSPプロジェクトに紐付けられています。"
-                "SP側で保存後、もう一度「SPプロジェクトを設定」を押してください。".format(scene_name)
+                "このシーン「{0}」の選択中の作業対象は未保存だったSPプロジェクトに"
+                "紐付けられています。SP側で保存後、もう一度"
+                "「SPプロジェクトを設定」を押してください。".format(scene_name)
             )
             self.scene_link_label.setStyleSheet("color: #c9822a;")
             self.scene_link_btn.setText("SPプロジェクトを設定し直す")
             self.scene_link_btn.setEnabled(True)
             return
 
-        linked_name = _project_display_name(linked_key)
+        linked_name = _link_display_name(selected_link)
 
         if not active_key:
             # SP側が起動していない、またはプロジェクトを何も開いていない。
             # 紐付け自体は設定済みなので、それを踏まえた文言にする
             # (緑=正常でも赤=不一致でもない、独立した状態)。
             self.scene_link_label.setText(
-                "このシーン「{0}」の対応先は {1} です(SP側は現在未起動/"
-                "未検出のため一致確認はできません)。".format(scene_name, linked_name)
+                "このシーン「{0}」の選択中の作業対象は {1} です(SP側は現在"
+                "未起動/未検出のため一致確認はできません)。".format(scene_name, linked_name)
             )
             self.scene_link_label.setStyleSheet("color: #888888;")
             self.scene_link_btn.setText("SPプロジェクトを設定し直す")
@@ -3107,10 +3531,15 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             return
 
         if active_key != linked_key:
-            # SP側は今、紐付け先とは別のプロジェクトを開いている。
+            # SP側は今、選択中の作業対象とは別のプロジェクトを開いている。
+            # 2026.07.19-03: 複数link対応後は、これは必ずしも「上書き
+            # 忘れ」ではなく「単にドロップダウンの選択がSP側と違う」
+            # だけの場合もある(天板を選んだままSP側で脚を開いた等)。
+            # そのため文言も「選択し直す」ニュアンスに寄せる。
             active_name = _project_display_name(active_key)
             self.scene_link_label.setText(
-                "「{0}」の対応先は {1} ですが、SP側は今 {2} を開いています。".format(
+                "選択中の作業対象「{0}」の対応先は {1} ですが、SP側は今 {2} を"
+                "開いています。ドロップダウンの選択もご確認ください。".format(
                     scene_name, linked_name, active_name
                 )
             )
@@ -3123,9 +3552,115 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.scene_link_btn.setText("SPプロジェクトを設定し直す")
         self.scene_link_btn.setEnabled(True)
 
+    def _rebuild_scene_link_combo(self, links, active_link_id):
+        """複数SPプロジェクト切り替え用ドロップダウンの選択肢を、現在の
+        links配列で作り直す。
+
+        setCurrentIndex() 等による選択肢の再構築中に
+        currentIndexChanged が発火して _on_scene_link_combo_changed が
+        呼ばれると、再帰的にactive_link_idの書き込み→再描画が連鎖して
+        しまうため、_updating_scene_link_combo フラグで一時的に
+        シグナルハンドラを無効化する。
+        """
+        self._updating_scene_link_combo = True
+        try:
+            self.scene_link_combo.clear()
+            if not links:
+                self.scene_link_combo.setEnabled(False)
+                return
+            self.scene_link_combo.setEnabled(True)
+            selected_index = 0
+            for i, link in enumerate(links):
+                self.scene_link_combo.addItem(_link_display_name(link) or "(名称未設定)", link.get("id"))
+                if link.get("id") == active_link_id:
+                    selected_index = i
+            self.scene_link_combo.setCurrentIndex(selected_index)
+        finally:
+            self._updating_scene_link_combo = False
+
+    def _on_scene_link_combo_changed(self, index):
+        """ドロップダウンでの作業対象切り替え。_rebuild_scene_link_combo
+        によるプログラム的な再構築中は無視する(再入防止)。
+        """
+        if getattr(self, "_updating_scene_link_combo", False):
+            return
+        if index < 0:
+            return
+        link_id = self.scene_link_combo.itemData(index)
+        _set_active_link(link_id)
+        self._refresh_scene_link_label()
+
+    def _on_add_scene_project_link(self):
+        """「＋現在のSPプロジェクトを追加」ボタン: SP側が今開いている
+        プロジェクトを、このシーンの新しい作業対象として追加する
+        (既存の紐付けは上書きしない)。
+        """
+        active_key = self.watcher.config.get("active_project_key")
+        if not active_key:
+            QtWidgets.QMessageBox.information(
+                self, "Live Sync",
+                "SP側で今開いているプロジェクトが確認できません。\n"
+                "Substance Painterでプロジェクトを開いてから、もう一度お試しください。"
+            )
+            return
+        if active_key == "__unsaved__":
+            QtWidgets.QMessageBox.information(
+                self, "Live Sync",
+                "SP側のプロジェクトがまだ保存されていません。\n"
+                "この状態で追加すると「未保存」のままシーンに固定されてしまい、"
+                "後で保存しても自動更新されません。\n"
+                "SP側で一度「名前を付けて保存」してから、もう一度お試しください。"
+            )
+            return
+
+        active_name = _project_display_name(active_key)
+        label, ok = QtWidgets.QInputDialog.getText(
+            self, "Live Sync",
+            "この作業対象の名前を入力してください(例: 天板、脚)。\n"
+            "空欄のままでもプロジェクト名で登録できます。"
+        )
+        if not ok:
+            return
+
+        new_link = _add_scene_project_link(active_key, label=label.strip() if label else None)
+        if new_link is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Live Sync",
+                "このシーンに登録できる作業対象の上限({0}件)に達しています。\n"
+                "使わなくなった作業対象をドロップダウンから選択し、"
+                "「削除」で整理してからお試しください。".format(_MAX_SCENE_PROJECT_LINKS)
+            )
+            return
+        self.watcher._emit_status(
+            "シーン「{0}」にSPプロジェクト「{1}」を追加しました。".format(
+                _scene_display_name(), _link_display_name(new_link)
+            )
+        )
+        self._refresh_scene_link_label()
+
+    def _on_remove_scene_project_link(self):
+        """「削除」ボタン: ドロップダウンで選択中の作業対象を、このシーン
+        の紐付けから削除する。
+        """
+        index = self.scene_link_combo.currentIndex()
+        if index < 0:
+            return
+        link_id = self.scene_link_combo.itemData(index)
+        link_name = self.scene_link_combo.currentText()
+        reply = QtWidgets.QMessageBox.question(
+            self, "Live Sync",
+            "作業対象「{0}」をこのシーンの紐付けから削除します。"
+            "よろしいですか？".format(link_name),
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        _remove_scene_project_link(link_id)
+        self.watcher._emit_status("作業対象「{0}」を削除しました。".format(link_name))
+        self._refresh_scene_link_label()
+
     def _on_link_scene_to_sp_project(self):
         """「SPプロジェクトを設定」ボタン: SP側が今開いているプロジェクトを
-        ワンクリックで現在のMayaシーンに紐付ける。
+        ワンクリックで現在のMayaシーンの選択中作業対象に紐付ける。
 
         2026.07.16(緊急修正): このボタンが保存する紐付け情報は、
         押した瞬間の active_project_key を一度きり書き込むだけで、
@@ -3140,6 +3675,16 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         __unsaved__のままという矛盾として実機で確認された)。
         対策として、active_project_keyが "__unsaved__" の間はこの
         ボタンでの紐付けをブロックし、先にSP側で保存するよう案内する。
+
+        2026.07.19-03(複数SPプロジェクト対応、フェーズ1): 従来は
+        「シーンの紐付けを1件だけ上書きする」ボタンだったが、
+        _set_current_scene_project_link() が内部的に
+        _add_scene_project_link() を呼ぶようになったため、既存の
+        紐付けが1件も無ければ新規追加、既に同じSPプロジェクトの
+        紐付けがあればそれをアクティブにするだけに変わった
+        (複数プロジェクトが並存している状態で誤って他の紐付けを
+        消してしまわないようにするため)。複数の作業対象を「追加」
+        したい場合は「＋現在のSPプロジェクトを追加」ボタンを使う。
         """
         active_key = self.watcher.config.get("active_project_key")
         if not active_key:
@@ -3173,7 +3718,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 "シーン「{0}」をSPプロジェクト「{1}」に紐付けました。".format(scene_name, active_name)
             )
         else:
-            self.watcher._emit_status("紐付けの保存に失敗しました。")
+            self.watcher._emit_status(
+                "紐付けの保存に失敗しました(このシーンに登録できる作業対象の"
+                "上限({0}件)に達している可能性があります。使わなくなった"
+                "作業対象を「削除」で整理してください)。".format(_MAX_SCENE_PROJECT_LINKS)
+            )
         self._refresh_scene_link_label()
 
     def _on_other_session_changed(self, other):
