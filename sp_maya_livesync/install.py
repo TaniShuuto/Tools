@@ -13,10 +13,12 @@ install.py  -  SP -> Maya Live Sync : Maya drag-and-drop installer
          - udim_setup.py                (UDIMテクスチャ自動セットアップ・任意)
        いずれも「同じフォルダに無ければスキップ」なので、必要なツールだけを
        このファイルと同じフォルダに置いた状態でドラッグ&ドロップすればよい。
-    2. udim_setup_icon.png が同じフォルダにあれば、Maya の per-user
-       icons フォルダへコピーし、UDIMボタンの見た目に使う(無ければ
-       Maya標準のPythonアイコンにフォールバックするので、無くても
-       インストール自体は問題なく完了する)。
+    2. maya_live_sync_icon.png / sp_to_aiStandardSurface_icon.png /
+       udim_setup_icon.png が同じフォルダにあれば、Maya の per-user
+       icons フォルダへコピーし、それぞれ対応するシェルフボタン
+       (LiveSync / aiSS / UDIM)の見た目に使う(無ければ Maya標準の
+       Pythonアイコンにフォールバックするので、無くてもインストール
+       自体は問題なく完了する)。
     3. アクティブなシェルフに起動ボタンを追加(コピーできたツールの分だけ)
          - [LiveSync] ... ライブ同期ウィンドウを開く
          - [aiSS]     ... マテリアル生成ツールを開き、Final書き出しフォルダを
@@ -37,7 +39,31 @@ install.py  -  SP -> Maya Live Sync : Maya drag-and-drop installer
 NOTE:
     UI文字列は、Windows + 日本語ロケール環境での文字化けを避けるため
     ASCII(英語)に統一しています(コメントは UTF-8 のまま影響ありません)。
+
+変更履歴:
+    1.0.2 (2026.07.20):
+        - シェルフボタンのツールヒント(annotation)を、ホバーしただけで
+          機能が伝わるよう全ボタンで文言を統一・具体化。
+          「ツール名: 何をするか」の2段構成に揃えた。
+            - LiveSync: "SP -> Maya Live Sync : open the live sync
+              window" (何が起きるか不明瞭) ->
+              "Live Sync: auto-reload SP textures in Maya as you
+              paint (open the monitor window)" (SPで塗った内容が
+              Mayaへ自動反映される、という挙動を明記)
+            - aiSS  : 語順を他ボタンと揃え、"aiSS:" 接頭辞を追加
+            - UDIM  : 同上。UDIMタイル単位で処理される点を明記
+    1.0.1 (2026.07.20):
+        - LiveSync / aiSS シェルフボタン専用のアイコン画像
+          (maya_live_sync_icon.png / sp_to_aiStandardSurface_icon.png)
+          に対応。従来はこの2つのボタンだけ Maya 標準アイコンのままで
+          あった(UDIMボタンのみ専用アイコン対応済みだった)ため統一した。
+          専用アイコンが同じフォルダに無い場合は、これまで通り標準の
+          pythonFamily.png にフォールバックする。
+    1.0.0:
+        - 初版(SemVer導入)。
 """
+
+__version__ = "1.0.2"
 
 import os
 import sys
@@ -79,13 +105,16 @@ TOOL_FILES = [
 #  pythonFamily.png にフォールバックするため、アイコンが無くても
 #  インストール自体は問題なく完走する。
 ICON_FILES = [
+    {"name": "maya_live_sync_icon.png", "required": False},
+    {"name": "sp_to_aiStandardSurface_icon.png", "required": False},
     {"name": "udim_setup_icon.png", "required": False},
 ]
 
 # --- シェルフボタン: LiveSync ---------------------------------------------
 LIVESYNC_LABEL = "LiveSync"
-LIVESYNC_ANNOTATION = "SP -> Maya Live Sync : open the live sync window"
+LIVESYNC_ANNOTATION = "Live Sync: auto-reload SP textures in Maya as you paint (open the monitor window)"
 LIVESYNC_COMMAND = "import maya_live_sync\nmaya_live_sync.show_ui()"
+LIVESYNC_ICON_NAME = "maya_live_sync_icon.png"
 
 # --- シェルフボタン: aiSS (Final取り込みへ誘導) ---------------------------
 #  ツールを開いた直後に、共有設定の final_export_dir をフォルダ入力欄へ
@@ -93,7 +122,7 @@ LIVESYNC_COMMAND = "import maya_live_sync\nmaya_live_sync.show_ui()"
 #  取り込みへ自然に誘導できる。sp_to_aiStandardSurface.py には手を加えず、
 #  公開されている _gui_state["dir_field"] を使って外側から設定している。
 AISS_LABEL = "aiSS"
-AISS_ANNOTATION = "Build aiStandardSurface from the SP *Final* export (folder auto-filled)"
+AISS_ANNOTATION = "aiSS: build aiStandardSurface materials from the SP Final export (folder auto-filled)"
 AISS_COMMAND = (
     "import os\n"
     "import maya.cmds as cmds\n"
@@ -120,10 +149,11 @@ AISS_COMMAND = (
     "except Exception as _e:\n"
     "    print('[aiSS] Could not pre-fill Final folder: ' + str(_e))\n"
 )
+AISS_ICON_NAME = "sp_to_aiStandardSurface_icon.png"
 
 # --- シェルフボタン: UDIM (UDIMテクスチャ自動セットアップ) -----------------
 UDIM_LABEL = "UDIM"
-UDIM_ANNOTATION = "UDIM Texture Auto Setup : scan a folder and build aiStandardSurface materials"
+UDIM_ANNOTATION = "UDIM: scan a texture folder and auto-build aiStandardSurface materials per UDIM tile"
 UDIM_COMMAND = "import udim_setup\nudim_setup.launch_gui()"
 UDIM_ICON_NAME = "udim_setup_icon.png"
 
@@ -507,7 +537,7 @@ def _remove_existing_shelf_buttons(label):
                     print("[Live Sync Installer] Could not remove existing shelf button '{0}': {1}".format(label, e))
 
 
-def _add_shelf_button(label, annotation, command, image="pythonFamily.png"):
+def _add_shelf_button(label, annotation, command, image="pythonFamily.png", overlay_label=None):
     """アクティブなシェルフにボタンを1つ追加する。成否を返す。
     2026.07.16: 追加の前に、全シェルフタブを横断して同じラベルの
     既存ボタンがあれば削除する(再インストールのたびにボタンが
@@ -517,6 +547,14 @@ def _add_shelf_button(label, annotation, command, image="pythonFamily.png"):
     image: アイコンのファイル名(フルパス不要)。Maya の icons 検索パス
     (_icons_dir() でコピーした先を含む)から解決される。専用アイコンが
     見つからなかった場合は呼び出し側で標準の pythonFamily.png を渡すこと。
+
+    2026.07.20: label はシェルフボタンの内部識別名 + ツールヒント
+    (マウスホバー時に annotation と併せて表示される文字列)としては
+    機能するが、アイコン画像の上に文字を重ねて表示するには Maya では
+    別途 imageOverlayLabel フラグの指定が必要(label だけではアイコン
+    上の表示は空欄のままになる)。overlay_label が未指定の場合は
+    label をそのまま使う。長すぎるとアイコン上で読みにくくなるため、
+    短い略称(例: "LS", "aiSS", "UDIM")を渡すことを推奨する。
     """
     try:
         current_shelf = mel.eval("tabLayout -q -selectTab $gShelfTopLevel")
@@ -526,6 +564,7 @@ def _add_shelf_button(label, annotation, command, image="pythonFamily.png"):
             label=label,
             annotation=annotation,
             image=image,
+            imageOverlayLabel=overlay_label if overlay_label else label,
             command=command,
             sourceType="python",
         )
@@ -593,10 +632,12 @@ def _run():
     has_udim = "udim_setup.py" in copied
 
     copied_icons = _copy_icons(source_dir)
+    livesync_icon = LIVESYNC_ICON_NAME if LIVESYNC_ICON_NAME in copied_icons else "pythonFamily.png"
+    aiss_icon = AISS_ICON_NAME if AISS_ICON_NAME in copied_icons else "pythonFamily.png"
     udim_icon = UDIM_ICON_NAME if UDIM_ICON_NAME in copied_icons else "pythonFamily.png"
 
-    livesync_shelf = _add_shelf_button(LIVESYNC_LABEL, LIVESYNC_ANNOTATION, LIVESYNC_COMMAND)
-    aiss_shelf = _add_shelf_button(AISS_LABEL, AISS_ANNOTATION, AISS_COMMAND) if has_aiss else False
+    livesync_shelf = _add_shelf_button(LIVESYNC_LABEL, LIVESYNC_ANNOTATION, LIVESYNC_COMMAND, image=livesync_icon)
+    aiss_shelf = _add_shelf_button(AISS_LABEL, AISS_ANNOTATION, AISS_COMMAND, image=aiss_icon) if has_aiss else False
     udim_shelf = _add_shelf_button(UDIM_LABEL, UDIM_ANNOTATION, UDIM_COMMAND, image=udim_icon) if has_udim else False
 
     auto_ok = _register_autostart()
@@ -640,14 +681,16 @@ def _run():
 
     lines.append("")
     lines.append("[シェルフボタン]")
+    livesync_icon_note = "専用アイコン" if livesync_icon == LIVESYNC_ICON_NAME else "標準アイコン(専用アイコン画像が見つからなかったため)"
     lines.append(
-        "  - '{0}' : ライブ同期ウィンドウ".format(LIVESYNC_LABEL)
+        "  - '{0}' : ライブ同期ウィンドウ ({1})".format(LIVESYNC_LABEL, livesync_icon_note)
         if livesync_shelf else
         "  - LiveSync ボタンの追加はスキップされました(手動で作成できます)。"
     )
     if has_aiss:
+        aiss_icon_note = "専用アイコン" if aiss_icon == AISS_ICON_NAME else "標準アイコン(専用アイコン画像が見つからなかったため)"
         lines.append(
-            "  - '{0}' : Final取り込み(押すとFinalフォルダを自動入力)".format(AISS_LABEL)
+            "  - '{0}' : Final取り込み(押すとFinalフォルダを自動入力) ({1})".format(AISS_LABEL, aiss_icon_note)
             if aiss_shelf else
             "  - aiSS ボタンの追加はスキップされました(手動で作成できます)。"
         )
