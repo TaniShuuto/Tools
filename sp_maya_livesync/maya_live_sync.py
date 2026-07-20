@@ -430,7 +430,23 @@ def diag_c1_check_qobject_validity(window):
 #   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
 #   MINOR: 後方互換のある機能追加
 #   PATCH: 後方互換のあるバグ修正
-__version__ = "1.0.0"
+# 2026.07.20-02(SPプロジェクト自動追従): SP側で開いているプロジェクトが
+#     切り替わった際、現在のシーンに登録済みのlinkの中に一致するものが
+#     あれば、ドロップダウンの手動選択を待たずに active_link_id を自動的に
+#     切り替えるようにした(_try_auto_switch_active_link())。
+#     - 検知自体は既存の _refresh_dynamic_config()(project_poll_timer
+#       経由、監視ON/OFFに関わらずウィンドウを開いていれば3秒間隔で常時
+#       実行)にそのまま乗せており、新たなポーリングは追加していない。
+#     - 未登録のSPプロジェクトを開いた場合は自動追加せず、従来通り
+#       _refresh_scene_link_label() の不一致警告に委ねる(相談の結果、
+#       この挙動を明示的に選択)。
+#     - _set_active_link() は呼ぶたびに無条件で書き込みを行う(保存済み
+#       シーンなら cmds.fileInfo() 経由でシーンを「変更あり」にマークする)
+#       ため、切り替え先が現在のactive_link_idと同じ場合は呼ばないよう
+#       ガードしている(3秒ごとに無駄な書き込みでシーンが常時未保存扱いに
+#       なることを防ぐ)。
+#     後方互換のある機能追加のため、SemVerのルールに従いMINORを上げる。
+__version__ = "1.1.0"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -1657,6 +1673,15 @@ class LiveSyncWatcher(QtCore.QObject):
                 self.config[key] = latest[key]
 
         if self.config.get("active_project_key") != prev_active_project_key:
+            # 2026.07.20(SPプロジェクト自動追従): SP側で開いているプロジェクトが
+            # 切り替わり、かつそれが現在のシーンに既にlink登録済みの
+            # プロジェクトである場合、ユーザーがドロップダウンを手動操作
+            # しなくても active_link_id を自動的に追従させる。
+            # 「以前ベースは作ってある」との確認の通り、active_project_key の
+            # 変化検知自体(このブロック)は既存の仕組みであり、今回追加したのは
+            # 一致するlinkを探して自動切替する _try_auto_switch_active_link()
+            # の呼び出しのみ。
+            self._try_auto_switch_active_link()
             self.scene_link_changed.emit()
 
         if self.config.get("known_texture_sets_by_project") != prev_texture_sets:
@@ -1670,6 +1695,63 @@ class LiveSyncWatcher(QtCore.QObject):
         if current_other_pid != prev_other_pid:
             self.other_session_info = current_other
             self.other_session_changed.emit(current_other)
+
+    def _try_auto_switch_active_link(self):
+        """2026.07.20(SPプロジェクト自動追従): SP側の active_project_key が
+        変化した際に呼ばれる。現在のシーンに登録済みのlinkの中に、SP側が
+        今開いているプロジェクトと一致するものがあれば、ユーザーの手動
+        操作(ドロップダウン選択)を待たずに active_link_id を自動的に
+        切り替える。
+
+        設計方針(相談の結果、以下に確定):
+        - 有効範囲: 監視(自動反映)ON/OFFに関わらず、ウィンドウを開いていれば
+          常時追従する。_refresh_dynamic_config() 自体が project_poll_timer
+          (監視状態に関わらず常時起動)から呼ばれる既存の仕組みに乗るため、
+          このメソッド固有の追加条件分岐は不要。
+        - 未登録のSPプロジェクトを開いた場合: 自動でlinkを新規追加すること
+          はしない。従来通り _refresh_scene_link_label() 側の不一致警告
+          (赤字表示)に委ねる。ユーザーが必要と判断した場合のみ、既存の
+          「＋現在のSPプロジェクトを追加」ボタンで明示的に追加する。
+
+        実装上の注意: _set_active_link() は呼ぶたびに無条件で
+        _set_scene_project_links() を実行し、保存済みシーンの場合は
+        cmds.fileInfo() への書き込みを伴う(=シーンが「変更あり」状態に
+        マークされる)。3秒間隔のポーリングのたびに、既に一致している
+        linkへ向けて無駄な書き込みを繰り返すと、実質何も変わっていない
+        のにシーンが常に未保存扱いになり続けてしまう。そのため、
+        「切り替え先が現在のactive_link_idと異なる場合のみ」呼び出す
+        ガードを設けている。
+        """
+        active_key = _normalize_project_key_for_compare(self.config.get("active_project_key"))
+        if not active_key or active_key == "__unsaved__":
+            # SP未起動/未検出、または未保存プロジェクトは自動切替の対象外
+            # (未保存プロジェクトは複数を区別できないという既知の制限が
+            # あり、誤ったlinkへ切り替えてしまう恐れがあるため)。
+            return
+
+        payload = _get_scene_project_links()
+        links = payload.get("links", [])
+        if not links:
+            return
+
+        matched = None
+        for link in links:
+            if link.get("sp_project_key") == active_key:
+                matched = link
+                break
+        if matched is None:
+            # 未登録のプロジェクト。自動追加はせず、状態バーの不一致警告に委ねる。
+            return
+
+        if payload.get("active_link_id") == matched.get("id"):
+            # 既に一致している(無駄な書き込みを避ける)。
+            return
+
+        if _set_active_link(matched.get("id")):
+            self._emit_status(
+                "[連携] SP側のプロジェクト切り替えを検知し、作業対象を「{0}」へ自動的に切り替えました。".format(
+                    _link_display_name(matched))
+            )
 
     def apply_and_save_config(self, new_values):
         """ユーザー操作(監視フォルダ変更等)による保存。監視の再起動を伴う。"""
@@ -1742,7 +1824,13 @@ class LiveSyncWatcher(QtCore.QObject):
             os.makedirs(active_watch_dir, exist_ok=True)
             ok = self.fs_watcher.addPath(active_watch_dir)
             if ok:
-                self._emit_status("プロジェクトの切り替えを検知し、監視フォルダを更新しました: {0}".format(active_watch_dir))
+                # UI導線改善(ご相談対応): 前回追加した「作業対象の自動切替」
+                # ログ([連携]プレフィックス)と、こちらのフォルダ監視追従
+                # ログが、どちらも「プロジェクトの切り替えを検知し」で
+                # 始まるため、ログを流し読みした際に別々の仕組みだと
+                # 気づきにくかった。[追従]プレフィックスを付け、区別できる
+                # ようにする(挙動自体は変更していない)。
+                self._emit_status("[追従] プロジェクトの切り替えを検知し、監視フォルダを更新しました: {0}".format(active_watch_dir))
         except Exception as e:
             self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
 
@@ -1771,7 +1859,7 @@ class LiveSyncWatcher(QtCore.QObject):
             os.makedirs(active_final_dir, exist_ok=True)
             ok = self.fs_watcher.addPath(active_final_dir)
             if ok:
-                self._emit_status("プロジェクトの切り替えを検知し、Finalフォルダの監視先を更新しました: {0}".format(active_final_dir))
+                self._emit_status("[追従] プロジェクトの切り替えを検知し、Finalフォルダの監視先を更新しました: {0}".format(active_final_dir))
         except Exception as e:
             self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
 
@@ -3162,11 +3250,24 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         link_detail_layout.addWidget(self.scene_link_label)
 
         # 行2: 設定ボタン(横並び対象を無くし単独行に)。
+        #
+        # UI導線改善(ご相談対応): 自動追従機能(_try_auto_switch_active_link,
+        # v1.1.0)の実装により、SP側のプロジェクト切り替えは通常このボタンを
+        # 押さなくても作業対象ドロップダウンへ自動的に反映されるように
+        # なった。このボタンが必要なのは「まだ一度もこのシーンに登録して
+        # いないSPプロジェクトを初めて紐付ける」場合と「__unsaved__の
+        # ままシーンに焼き付いてしまった紐付けをやり直す」場合に限られる。
+        # 出番が減った操作のため、他の主要ボタン(enable_btn等)と同じ
+        # 見た目のまま最上位の視覚的重みを持ち続けるのは導線として不整合
+        # だった。色による区別は既存方針により避け、高さを抑えることで
+        # 「常用の操作ではない」ことを表現する。
         self.scene_link_btn = QtWidgets.QPushButton("SPプロジェクトを設定")
+        self.scene_link_btn.setMaximumHeight(24)
         self.scene_link_btn.setToolTip(
             "今SPで開いているプロジェクトを、このMayaシーンの対応先として"
-            "登録します。\n登録しておくと、次回このシーンを開いた時に"
-            "自動的に同じSPプロジェクトを追跡できます。"
+            "登録します。\n通常はSP側のプロジェクト切り替えを検知して自動的に"
+            "作業対象が切り替わるため、このボタンは主に「まだ登録していない"
+            "新しいSPプロジェクトを初めて追加する」場合に使います。"
         )
         self.scene_link_btn.clicked.connect(self._on_link_scene_to_sp_project)
         link_detail_layout.addWidget(self.scene_link_btn)
@@ -3316,8 +3417,16 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # 自動切り替えは行わない(どちらを表示中か分かりにくくなる
         # ことを避けるため)。切り替え後は、明示的にこのボタンを
         # もう一度押すまでリアルタイム更新の対象から外れる。
+        #
+        # UI導線改善(ご相談対応): enable_btn(層1・監視ON/OFF)と隣接して
+        # 並ぶため、同じ高さ・同じ太さのボタンだと「対になるトグル」に
+        # 見えてしまうが、両者は無関係な軸(監視するか/どちらの品質を
+        # 見るか)である。色による区別は既存方針(3378行目付近のコメント
+        # 参照)により避け、代わりに高さを明示的に enable_btn より
+        # 低く抑えることで、層1/層2のサイズ差を意図通り広げる。
         self.quality_btn = QtWidgets.QPushButton("表示品質: プレビュー(リアルタイム)")
         self.quality_btn.setCheckable(True)
+        self.quality_btn.setMaximumHeight(24)
         self.quality_btn.setToolTip(
             "ONにすると、SP側で保存時に書き出された高画質版(Finalフォルダ)に"
             "file ノードを切り替えます。OFFに戻すとリアルタイムプレビューに戻ります。"
