@@ -446,7 +446,134 @@ def diag_c1_check_qobject_validity(window):
 #       ガードしている(3秒ごとに無駄な書き込みでシーンが常時未保存扱いに
 #       なることを防ぐ)。
 #     後方互換のある機能追加のため、SemVerのルールに従いMINORを上げる。
-__version__ = "1.1.0"
+# 2026.07.21-01(Phase 1, 緊急修正: 複数SPプロジェクト並行対応の根治):
+#     以下の症状が実機で報告され、原因調査の結果いずれも
+#     「active_watch_subfolder/active_final_subfolder(SP側が今開いている
+#     1プロジェクトのみを表すスカラー値)を追跡の起点にしている」という
+#     共通の設計限界に起因すると判明した:
+#       (1) 複数SPプロジェクトを動的に追跡できず、最初に設定したSP
+#           プロジェクトのみを追跡している
+#       (2) リアルタイム追従ができなくなっている(Finalのみ追従できる)
+#       (3) Fileノードが存在するのに、一度Maya再起動しないとマテリアルを
+#           認識しない
+#     対策として、既存の texture_set_export_prefix_by_project 等と同じ
+#     「project_key -> 値」のネスト辞書パターンを踏襲した新設定キー
+#     watch_subfolder_by_project / final_subfolder_by_project を導入し、
+#     監視・reload・マテリアル一覧・マッピング判定のすべてを「シーンに
+#     紐付けられた全プロジェクトの集合」ベースに作り替えた。主な変更点:
+#       - _active_watch_dir()/_active_final_dir()(単数形、代表1件のみ)
+#         とは別に、_active_watch_dirs()/_active_final_dirs()(複数形、
+#         全プロジェクト分の集合)を新設。監視登録・_process_pending_
+#         changes()・reload_textures()/reload_final_textures()・
+#         _managed_dirs()・detect_current_quality() はすべて複数形へ
+#         差し替えた。単数形は後方互換フォールバックとaiSSのフォルダ欄
+#         自動入力用の「代表1件」としての役割に限定した。
+#       - _process_pending_changes() の完了flag判定を、単一のmtime比較値
+#         からディレクトリ単位のmtime辞書(_flag_mtimes_watch/_final)へ
+#         変更。あるプロジェクトの新しいflagが、別プロジェクトのmtimeとの
+#         大小比較で「まだ古い」と誤判定される問題を解消した(症状(2)の
+#         直接の修正箇所)。
+#       - シーンに紐付いたSPプロジェクトとSP側の現在プロジェクトが
+#         食い違う場合の安全防御(自動停止)ロジックを、「アクティブな
+#         1linkとの比較」から「シーンに紐付いた“いずれかの”linkとの
+#         比較」に修正。旧ロジックのままだと、複数プロジェクトを並行
+#         紐付けている状態でSP側がプロジェクトを切り替えるたびに、
+#         正しく紐付いているにもかかわらず監視全体が誤って停止する
+#         欠陥があった(実装レビュー中に発見、複数プロジェクト運用の
+#         根治と直接矛盾するため必須の修正として対応)。
+#       - get_known_texture_sets()を「シーンに紐付いた全プロジェクトの
+#         テクスチャセット名の和集合」を返すよう変更(論点2案A)。
+#         同名テクスチャセットが複数プロジェクトに存在する場合の区別用に
+#         get_known_texture_sets_detailed()を新設し、マテリアル構造タブに
+#         「SPプロジェクト」列を追加した。is_texture_set_mapped()/
+#         create_shader_network() は project_key 引数を新設し、同名
+#         テクスチャセット間の取り違えを防いだ(症状(3)の修正箇所)。
+#       - reload_textures()/reload_final_textures() の「古いサブフォルダを
+#         参照したまま取り残されたノード」の補正先を、従来の「現在の1つの
+#         サブフォルダ」から「ファイル名prefixから逆引きした、該当
+#         プロジェクトのサブフォルダ」に変更(_match_known_texture_set_
+#         project()を新設)。
+#       - 設定ファイルの正規化キー空間の不一致(links側はスラッシュ統一済み、
+#         SP側書き込みは未正規化)を _export_prefix()/get_shading_engine_
+#         map()/save_shading_engine_mapping() 側で吸収するよう修正。
+#       - load_config() に、旧単一値からby_project辞書への非破壊
+#         マイグレーション(_migrate_legacy_active_subfolder())を追加。
+#     設計上の注記: switch_texture_quality()(表示品質の手動切り替え
+#     ボタン)は、シーン内の全fileノードを一括で1つの品質へ収束させる
+#     既存仕様を維持するため、意図的に単数形(代表1件)のまま据え置いた。
+#     複数プロジェクトが混在するシーンでプロジェクト単位の品質切り替えが
+#     必要になった場合は、別途の機能追加として設計を検討すること。
+#     症状(4)「Mayaのシーン切り替えでウィンドウが初期化されない」は
+#     本バージョンの対象外(Phase 2で対応予定)。
+#     設定ファイルへのキー追加のみで既存キーの意味は変えておらず、
+#     後方互換を維持しているため、SemVerのルールに従いMINORを上げる。
+# 2026.07.21-02(緊急バグ修正: シーン切替時に前の作業対象が残留する不具合):
+#     1.2.0リリース後の実機報告で、「新しいMayaシーンに切り替えても、
+#     マテリアル一覧・状態バーの作業対象表示が前のシーンのままになる」
+#     不具合が確認された。原因は get_known_texture_sets()/
+#     get_known_texture_sets_detailed()/get_active_project_label() が、
+#     「このシーンにSPプロジェクトの紐付け(link)が1件も無い」場合の
+#     後方互換フォールバックとして self.config["active_project_key"]
+#     (SP側が今開いているプロジェクトを表すだけで、Mayaのシーンを
+#     切り替えてもメモリ上に残り続ける値)を参照していたこと。
+#     「紐付け未設定」と「シーンを切り替えて紐付けの文脈が変わった」を
+#     区別できておらず、シーン切替直後は必ず一瞬 linked_keys が
+#     0件になり得るため、そのたびに前のシーンの active_project_key へ
+#     意図せず先祖返りしていた。
+#     このフォールバックを廃止し、シーンにlinkが1件も無い場合は
+#     空(一覧は空リスト、ラベルは「このシーンにはまだSPプロジェクトが
+#     紐付けられていません」)を返すよう修正した。
+#     あわせて、点検の過程で find_orphan_file_nodes() が同種の理由で
+#     _export_prefix() をproject_key省略(active_project_key基準)で
+#     呼んでおり、複数プロジェクト混在時に他プロジェクトのテクスチャ
+#     セットを誤って孤立ノード扱いする恐れがあった不具合も発見し、
+#     _match_known_texture_set_project() へ委譲する形に修正した。
+#     いずれも重大なバグ修正であり後方互換を維持しているため、
+#     SemVerのルールに従いPATCHを上げる。
+# 2026.07.21-03(未保存シーンでの作業対象引き継ぎに関する案内を追加):
+#     複数SPプロジェクトの紐付け情報は、保存済みシーンなら
+#     cmds.fileInfo()(シーンファイル自体に紐付く)へ保存されるが、
+#     未保存シーンにはファイル実体が無いため、代わりに共有設定ファイル
+#     上の固定スロット last_scene_project_links["__unsaved__"] を経由する
+#     (1.1.0から存在する設計)。この固定スロットは「今開いている未保存
+#     シーンがどれか」を区別できないため、未保存シーンAで設定した作業
+#     対象が、保存せずに別の未保存シーンBへ切り替えた際にも引き継がれて
+#     しまう。これはMayaの未保存シーンに安定した識別子が存在しないという
+#     構造的な限界であり、実装のバグではないと判断した(保存済みシーン
+#     同士の切替は1.2.1時点で正しく動作することを確認済み)。
+#     実機報告を受け、この限界そのものの解消(未保存シーンの個別識別)は
+#     見送り、代わりにユーザーへの案内を追加した: _on_scene_changed()で、
+#     切り替わった先が未保存シーンかつ、引き継がれた紐付けが実際に
+#     存在する場合、ポップアップで状況を説明し、対処法(紐付けの設定し
+#     直し、または保存によるシーンごとの区別の有効化)を案内する。
+#     シーンコールバック内で直接モーダルダイアログを出すとMaya本体の
+#     シーン読み込み処理をブロックする恐れがあるため、
+#     QTimer.singleShot(0, ...)でイベントループへ処理を戻した直後に
+#     表示するようにした。
+#     後方互換のある機能追加のため、SemVerのルールに従いMINORを上げる。
+# 2026.07.21-04(緊急バグ修正: 未保存シーン切替時のポップアップが毎回
+#     表示される):
+#     1.3.0で追加したポップアップ案内は、「未保存シーン用の共有スロット
+#     (last_scene_project_links["__unsaved__"])に前の未保存シーンの
+#     紐付けが残り続ける」という根本原因そのものには対処しておらず、
+#     案内を出すだけに留めていた。そのため、新規シーン(New Scene)を
+#     作成するたびに引き継ぎ自体は毎回発生し、ポップアップも毎回表示
+#     され続けてしまう不具合が実機で確認された。
+#     「新規シーン(New Scene)」は「白紙から始める」という明確な
+#     ユーザー意図の操作であり、前の未保存シーンの紐付けを引き継ぐ
+#     べき理由が無いため、kAfterNewを検知した際に共有スロットを
+#     _clear_unsaved_scene_link_slot() で自動的にクリアするようにした
+#     (kAfterOpen(既存ファイルを開いた)の場合も、次に未保存シーンへ
+#     移った際に古い情報を拾わないよう同様にクリアする)。
+#     これにより、新規シーンは常に「未設定」から始まるようになり、
+#     引き継ぎ自体が起きなくなるため、ポップアップも(この経路では)
+#     表示されなくなる。ポップアップ機構自体は、この自動クリアでは
+#     対処しきれない残余の経路への保険として残している。
+#     kAfterOpen/kAfterNewを区別する必要があるため、コールバック登録を
+#     ラムダ経由でis_new_sceneを明示的に渡す方式に変更した。
+#     重大なバグ修正であり後方互換を維持しているため、SemVerのルールに
+#     従いPATCHを上げる。
+__version__ = "1.3.1"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -496,6 +623,20 @@ DEFAULT_CONFIG = {
     # 反映処理はこれを読んで追従する。None のときは watch_dir 直下を
     # 使う(後方互換)。
     "active_watch_subfolder": None,
+    # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治):
+    # active_watch_subfolder / active_final_subfolder はスカラー値の
+    # ため「SP側が今開いている1プロジェクト」しか表現できず、複数の
+    # SPプロジェクトを同一シーンに紐付けて並行作業すると、後から開いた
+    # 方の値で前の方が上書きされてしまい、Mayaが同時に追跡できる
+    # プロジェクトが実質1つに限定される不具合があった(このリポジトリで
+    # 報告された緊急バグの根本原因)。texture_set_export_prefix_by_project
+    # と同じ「project_key -> サブフォルダ名」のネスト辞書をSP側が新たに
+    # 記録するようになったため、Maya側もこちらを正として複数プロジェクトを
+    # 並行追跡する。上記の active_watch_subfolder / active_final_subfolder
+    # (スカラー値)は、未対応の古いSP側との後方互換フォールバック、および
+    # aiSSのフォルダ欄自動入力用の「代表1件」の値として引き続き利用する。
+    "watch_subfolder_by_project": {},
+    "final_subfolder_by_project": {},
     # Phase 3: SP側が実際に書き出したファイル名のprefix
     # (テクスチャセット名 -> prefix文字列)。分かっていればこちらを
     # 最優先で使い、_safe_name() による予測はフォールバックとする。
@@ -917,6 +1058,61 @@ def _migrate_legacy_flat_maps(cfg):
     return cfg
 
 
+def _migrate_legacy_active_subfolder(cfg):
+    """2026.07.21(Phase 1, 複数プロジェクト並行対応の根治):
+    旧形式(active_watch_subfolder / active_final_subfolder のスカラー値)
+    しか記録されていない設定ファイルを、新形式(watch_subfolder_by_project /
+    final_subfolder_by_project のネスト辞書)へ非破壊で移行する。
+
+    _migrate_legacy_flat_maps() と同じ「読み取り時に変換 -> 呼び出し側が
+    必要なら保存で確定」パターンを踏襲する。
+
+    移行方針: 旧スカラー値は「その時点でSP側がアクティブだったプロジェクト
+    (active_project_key)のサブフォルダ」だったはずなので、by_project辞書に
+    その1エントリとして書き込む。active_project_key が無い(未対応の
+    さらに古い設定、または一度もSPと接続していない)場合は、対応付けようが
+    ないため移行せず、by_project辞書は空のまま(新しいexportが行われた
+    タイミングでSP側が正しく埋める)にフォールバックする。
+
+    既にby_project辞書に何らかの内容がある場合は、旧スカラー値による
+    上書きは行わない(新形式のほうが情報として優先されるべきであり、
+    旧スカラー値は既に古い可能性があるため)。
+
+    この関数は破壊的にcfgを書き換えず、移行後のcfgを新たに返す。
+    移行が発生した場合は cfg["_migrated_active_subfolder"] = True を立てる
+    (呼び出し側が保存要否を判断できるようにするための内部マーカー)。
+    """
+    legacy_watch = cfg.get("active_watch_subfolder")
+    legacy_final = cfg.get("active_final_subfolder")
+    if not legacy_watch and not legacy_final:
+        return cfg
+
+    active_key = cfg.get("active_project_key")
+    if not active_key:
+        # 対応付けるプロジェクトキーが分からないため、安全側に倒して
+        # 移行しない(次回SP側がexportした際に by_project 辞書へ
+        # 正しく記録されるのを待つ)。
+        return cfg
+
+    migrated = False
+
+    watch_by_project = dict(cfg.get("watch_subfolder_by_project", {}))
+    if legacy_watch and active_key not in watch_by_project:
+        watch_by_project[active_key] = legacy_watch
+        cfg["watch_subfolder_by_project"] = watch_by_project
+        migrated = True
+
+    final_by_project = dict(cfg.get("final_subfolder_by_project", {}))
+    if legacy_final and active_key not in final_by_project:
+        final_by_project[active_key] = legacy_final
+        cfg["final_subfolder_by_project"] = final_by_project
+        migrated = True
+
+    if migrated:
+        cfg["_migrated_active_subfolder"] = True
+    return cfg
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -924,17 +1120,22 @@ def load_config():
         cfg = dict(DEFAULT_CONFIG)
         cfg.update(loaded)
         cfg = _migrate_legacy_flat_maps(cfg)
+        cfg = _migrate_legacy_active_subfolder(cfg)
+        save_partial = {}
         if cfg.pop("_migrated_legacy_maps", False):
+            save_partial["texture_set_export_prefix_by_project"] = cfg["texture_set_export_prefix_by_project"]
+            save_partial["texture_set_shading_engine_map_by_project"] = cfg["texture_set_shading_engine_map_by_project"]
+            save_partial["texture_set_export_prefix"] = {}
+            save_partial["texture_set_shading_engine_map"] = {}
+        if cfg.pop("_migrated_active_subfolder", False):
+            save_partial["watch_subfolder_by_project"] = cfg["watch_subfolder_by_project"]
+            save_partial["final_subfolder_by_project"] = cfg["final_subfolder_by_project"]
+        if save_partial:
             # 移行結果をディスクへ書き戻す(次回以降は移行処理をスキップ
             # できるようにするため)。保存に失敗しても致命的ではないので
             # 例外は握りつぶす。
             try:
-                save_config({
-                    "texture_set_export_prefix_by_project": cfg["texture_set_export_prefix_by_project"],
-                    "texture_set_shading_engine_map_by_project": cfg["texture_set_shading_engine_map_by_project"],
-                    "texture_set_export_prefix": {},
-                    "texture_set_shading_engine_map": {},
-                })
+                save_config(save_partial)
             except Exception:
                 pass
         return cfg
@@ -1304,6 +1505,30 @@ def _set_scene_project_links(payload):
     return True
 
 
+def _clear_unsaved_scene_link_slot():
+    """共有設定ファイル上の last_scene_project_links["__unsaved__"]
+    (未保存シーン用の共有スロット、_get_scene_project_links()/
+    _set_scene_project_links() 参照)を空にする。
+
+    2026.07.21 追加(緊急、実機報告): このスロットは「今開いている
+    未保存シーンがどれか」を一切区別しない、Mayaプロセス全体で共有の
+    固定キーであるため、未保存シーンAで設定した紐付けが、保存せずに
+    別の未保存シーンBへ切り替えた際にもそのまま残り続けてしまう。
+    特に「新規シーン(New Scene)」は「白紙から始める」という明確な
+    ユーザー意図の操作であり、前の未保存シーンの紐付けを引き継ぐべき
+    理由が無いため、_on_scene_changed() が kAfterNew を検知した際に
+    この関数を呼び、スロットを毎回リセットする。
+    保存済みファイルを開いた場合(kAfterOpen)も、次に未保存シーンへ
+    移った際に古い情報を拾わないよう、念のため同様にクリアする。
+    """
+    cfg = load_config()
+    all_links = dict(cfg.get("last_scene_project_links", {}))
+    if "__unsaved__" not in all_links:
+        return
+    del all_links["__unsaved__"]
+    save_config({"last_scene_project_links": all_links})
+
+
 def _find_link(payload, link_id):
     """payload["links"]の中からidが一致するlinkを返す(無ければNone)。"""
     for link in payload.get("links", []):
@@ -1429,6 +1654,31 @@ def _set_current_scene_project_link(sp_project_key):
     return _add_scene_project_link(sp_project_key) is not None
 
 
+def _is_scene_unsaved():
+    """今開いているMayaシーンが未保存(一度も名前を付けて保存されて
+    いない、または新規シーンのまま)かどうかを返す。
+
+    2026.07.21 追加(緊急、実機報告): 複数SPプロジェクトの紐付け情報は
+    保存済みシーンなら cmds.fileInfo()(シーンファイル自体に紐付く、
+    シーンごとに独立)へ保存されるが、未保存シーンにはファイル実体が
+    無いため、代わりに共有設定ファイル上の固定スロット
+    last_scene_project_links["__unsaved__"] へ仮置きする設計になっている
+    (_get_scene_project_links()/_set_scene_project_links() 参照)。
+    この固定スロットは「今開いている未保存シーンがどれか」を区別
+    できないため、未保存シーンAで紐付けた作業対象が、そのシーンを
+    保存せずに別の未保存シーンBへ切り替えた際にもそのまま引き継がれて
+    しまう(Mayaの未保存シーンには安定した識別子が存在しないという
+    制約に起因する構造的な限界であり、実装のバグではない)。
+    この関数は、上記の限界をユーザーに案内するための判定に使う
+    (_on_scene_changed() 参照)。
+    """
+    try:
+        scene_path = cmds.file(query=True, sceneName=True)
+    except Exception:
+        return True
+    return not scene_path
+
+
 def _scene_display_name():
     """状態バー表示用の、今開いているシーンの短い名前を返す。"""
     try:
@@ -1488,10 +1738,23 @@ def _export_prefix(cfg, texture_set_name, project_key=None):
     project_key を省略した場合は cfg["active_project_key"] を使う。
     別プロジェクトに同名のテクスチャセットが存在しても、prefixを
     取り違えないようにするための変更。
+
+    2026.07.21(Phase 1): project_key には (a) 省略時の
+    cfg["active_project_key"](SP側由来、未正規化)と、(b) 呼び出し元が
+    links由来(_normalize_project_key_for_compare 通過後)で渡すキーの
+    2種類がありうる。texture_set_export_prefix_by_project のキー自体は
+    常に(a)と同じ未正規化空間のため、辞書側のキーを正規化してから
+    引くことで両方に対応する。
     """
     key = project_key if project_key is not None else cfg.get("active_project_key")
     by_project = cfg.get("texture_set_export_prefix_by_project", {})
-    prefix_map = by_project.get(key, {}) if key else {}
+    if key:
+        normalized_by_project = {
+            _normalize_project_key_for_compare(k): v for k, v in by_project.items()
+        }
+        prefix_map = normalized_by_project.get(_normalize_project_key_for_compare(key), {})
+    else:
+        prefix_map = {}
     return prefix_map.get(texture_set_name) or _safe_name(texture_set_name)
 
 
@@ -1524,17 +1787,23 @@ class LiveSyncWatcher(QtCore.QObject):
         # 案内を出し分けられるようにする。
         self._auto_stopped_by_scene_change = False
         self._last_known_texture_sets_snapshot = None
-        self._last_flag_mtime_watch = 0.0
-        self._last_flag_mtime_final = 0.0
-        # 2026.07.15-06: _last_flag_mtime_watch/_final は元々「どの
-        # フォルダを最後に見たか」を区別しない単一のグローバル比較値
-        # だったため、SP側のプロジェクト切り替えでフォルダ自体が変わる
-        # と、フラグの新旧判定を誤ることがあった。フォルダが変わったこと
-        # 自体を検知してmtime比較値をリセットできるよう、直近チェックした
-        # フォルダパスを記録しておく(詳細は _process_pending_changes()
-        # 参照)。
-        self._last_watch_dir_for_flag = None
-        self._last_final_dir_for_flag = None
+        # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治):
+        # _last_flag_mtime_watch/_final は元々「現在アクティブな1つの
+        # フォルダ」だけを前提にしたスカラー比較値だったため、複数の
+        # SPプロジェクトを並行して監視するようになると、あるプロジェクトの
+        # 新しいflagのmtimeが、別プロジェクトで記録済みの(たまたま数値が
+        # 大きい)mtimeより小さいというだけで「まだ古い」と誤判定され、
+        # 自動反映が一切トリガーされない不具合があった(症状:
+        # 「リアルタイム追従ができず、Finalのみ追従できる」の主要因)。
+        # ディレクトリパスをキーにしたmtime辞書に変更し、プロジェクトごと
+        # に独立して新旧を判定できるようにした。
+        # 2026.07.15-06で導入された _last_watch_dir_for_flag /
+        # _last_final_dir_for_flag(「フォルダ自体が変わったか」を検知する
+        # ための直近フォルダパス記録)は、ディレクトリ単位辞書化によって
+        # 意味を失う(辞書の各エントリが自然にフォルダ単位で独立するため)
+        # ので、この2変数とあわせて撤去した。
+        self._flag_mtimes_watch = {}
+        self._flag_mtimes_final = {}
         # 2026.07.15-04: reload_textures()/reload_final_textures() の
         # 古いサブフォルダ補正を、無関係な他プロジェクトのサブフォルダ
         # まで巻き込まないよう「直前に自分が監視していたサブフォルダ」
@@ -1651,6 +1920,15 @@ class LiveSyncWatcher(QtCore.QObject):
           - known_texture_sets_by_project の中身が変化したら
             structure_changed シグナルを発火し、UIの一覧テーブルと
             最終更新時刻を自動的に更新できるようにした。
+
+        2026.07.21追加(Phase 1, 複数プロジェクト並行対応の根治):
+          - watch_subfolder_by_project / final_subfolder_by_project を
+            対象に追加した。これらが無いと、SP側が新しいプロジェクトの
+            サブフォルダ名を記録しても、Mayaのメモリ上には反映されず
+            _active_watch_dirs()/_active_final_dirs()(複数形、後述)が
+            いつまでも古い集合しか返せなくなる(このリポジトリで報告
+            された「複数SPプロジェクトを動的に追跡できない」不具合の
+            直接的な修正箇所の1つ)。
         """
         try:
             latest = load_config()
@@ -1667,6 +1945,8 @@ class LiveSyncWatcher(QtCore.QObject):
             "texture_set_export_prefix_by_project",
             "texture_set_shading_engine_map_by_project",
             "known_texture_sets_by_project",
+            "watch_subfolder_by_project",
+            "final_subfolder_by_project",
         )
         for key in dynamic_keys:
             if key in latest:
@@ -1777,6 +2057,15 @@ class LiveSyncWatcher(QtCore.QObject):
         texture_set_shading_engine_map_by_project[project_key] にのみ
         書き込む。project_key が特定できない(未保存プロジェクト等)場合は
         何もしない(誤った紐付けを残すよりは記録しない方が安全)。
+
+        2026.07.21(Phase 1): project_key に正規化済みキー(links由来)が
+        渡された場合でも、texture_set_export_prefix_by_project と同じ
+        「SP側が書き込む未正規化キー」空間へ正しく書き込めるよう、
+        まず既存辞書の中に正規化後一致する既存キーが無いか探し、あれば
+        そのキー(＝SP側が実際に使っている表記)を再利用する。無ければ
+        渡されたキーをそのまま新規キーとして使う(次回SP側がexportした
+        際に、SP側の表記のキーで別エントリができても実害はない:
+        get_shading_engine_map()側で正規化して引くため両方とも読める)。
         """
         key = project_key if project_key is not None else self.config.get("active_project_key")
         if not key:
@@ -1787,28 +2076,40 @@ class LiveSyncWatcher(QtCore.QObject):
             )
             return
         by_project = dict(self.config.get("texture_set_shading_engine_map_by_project", {}))
-        project_map = dict(by_project.get(key, {}))
+        normalized_key = _normalize_project_key_for_compare(key)
+        actual_key = key
+        for existing_key in by_project:
+            if _normalize_project_key_for_compare(existing_key) == normalized_key:
+                actual_key = existing_key
+                break
+        project_map = dict(by_project.get(actual_key, {}))
         project_map[texture_set_name] = shading_engine_name
-        by_project[key] = project_map
+        by_project[actual_key] = project_map
         self.save_mapping_only({"texture_set_shading_engine_map_by_project": by_project})
 
     # -- 開始/停止 --------------------------------------------------------
 
     def _ensure_active_watch_watched(self):
-        """アクティブなLive/Previewサブフォルダ(所有権問題回避のため
-        2026.07.14-02で導入)がWatcherに登録済みか確認し、未登録
-        (＝SP側でプロジェクトが切り替わり新しいサブフォルダが誕生した、
-        または初回)であればフォルダを作成して監視に加える。
+        """このシーンに紐付けられた「全て」のSPプロジェクトについて、
+        Live/Previewサブフォルダ(所有権問題回避のため2026.07.14-02で
+        導入)がWatcherに登録済みか確認し、未登録(＝SP側でプロジェクトが
+        切り替わり新しいサブフォルダが誕生した、または初回)であれば
+        フォルダを作成して監視に加える。
         _ensure_active_final_watched() のLive/Preview版で、同じタイマー
         から呼ばれる。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 従来は
+        _active_watch_dir()(単数形、代表1件のみ)を対象にしていたため、
+        シーンに複数のSPプロジェクトを紐付けていても、実際に監視登録
+        されるフォルダは常に1つに限定されていた(このリポジトリで報告
+        された緊急バグの直接原因)。_active_watch_dirs()(複数形、この
+        シーンに紐付けられた全プロジェクト分の集合)へ差し替え、集合内の
+        未登録フォルダをすべて登録するループに変更した。
         """
         if not self.enabled:
             return
-        active_watch_dir = self._active_watch_dir()
-        if not active_watch_dir:
-            return
-        active_watch_dir = os.path.normpath(active_watch_dir)
-        if active_watch_dir in self.fs_watcher.directories():
+        active_watch_dirs = self._active_watch_dirs()
+        if not active_watch_dirs:
             return
         # 2026.07.15-04: サブフォルダが切り替わった瞬間の「直前の
         # アクティブサブフォルダ」を記録しておく。reload_textures() が
@@ -1816,52 +2117,67 @@ class LiveSyncWatcher(QtCore.QObject):
         # 際、watch_dir 直下の全サブフォルダ(＝他の無関係なプロジェクトの
         # ものも含む)を対象にすると誤爆の危険があるため、対象は
         # この「直前に自分が監視していたサブフォルダ」だけに限定する。
+        # (2026.07.21時点: この変数はどこからも参照されないデッドコードで
+        # あることが判明しているが、Phase 1では既存の記録動作自体は
+        # 変更せず据え置く。撤去はPhase 2で行う。)
         prev_dirs = [d for d in self.fs_watcher.directories()
                      if os.path.dirname(d) == os.path.normpath(self.config.get("watch_dir") or "")]
         if prev_dirs:
             self._last_active_watch_dir = prev_dirs[0]
-        try:
-            os.makedirs(active_watch_dir, exist_ok=True)
-            ok = self.fs_watcher.addPath(active_watch_dir)
-            if ok:
-                # UI導線改善(ご相談対応): 前回追加した「作業対象の自動切替」
-                # ログ([連携]プレフィックス)と、こちらのフォルダ監視追従
-                # ログが、どちらも「プロジェクトの切り替えを検知し」で
-                # 始まるため、ログを流し読みした際に別々の仕組みだと
-                # 気づきにくかった。[追従]プレフィックスを付け、区別できる
-                # ようにする(挙動自体は変更していない)。
-                self._emit_status("[追従] プロジェクトの切り替えを検知し、監視フォルダを更新しました: {0}".format(active_watch_dir))
-        except Exception as e:
-            self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
+
+        for active_watch_dir in active_watch_dirs:
+            if active_watch_dir in self.fs_watcher.directories():
+                continue
+            try:
+                os.makedirs(active_watch_dir, exist_ok=True)
+                ok = self.fs_watcher.addPath(active_watch_dir)
+                if ok:
+                    # UI導線改善(ご相談対応): 前回追加した「作業対象の自動切替」
+                    # ログ([連携]プレフィックス)と、こちらのフォルダ監視追従
+                    # ログが、どちらも「プロジェクトの切り替えを検知し」で
+                    # 始まるため、ログを流し読みした際に別々の仕組みだと
+                    # 気づきにくかった。[追従]プレフィックスを付け、区別できる
+                    # ようにする(挙動自体は変更していない)。
+                    self._emit_status("[追従] プロジェクトの切り替えを検知し、監視フォルダを更新しました: {0}".format(active_watch_dir))
+            except Exception as e:
+                self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
 
     def _ensure_active_final_watched(self):
-        """アクティブなFinalサブフォルダがWatcherに登録済みか確認し、
-        未登録(＝SP側でプロジェクトが切り替わり新しいサブフォルダが
-        誕生した、または初回)であればフォルダを作成して監視に加える。
+        """このシーンに紐付けられた「全て」のSPプロジェクトについて、
+        Finalサブフォルダがwatcherに登録済みか確認し、未登録(＝SP側で
+        プロジェクトが切り替わり新しいサブフォルダが誕生した、または
+        初回)であればフォルダを作成して監視に加える。
         3秒間隔の軽量ポーリングタイマーからのみ呼ばれる。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治):
+        _ensure_active_watch_watched() と同じ理由で、_active_final_dir()
+        (単数形)から _active_final_dirs()(複数形)へ差し替えた。
         """
         if not self.enabled:
             return
-        active_final_dir = self._active_final_dir()
-        if not active_final_dir:
-            return
-        active_final_dir = os.path.normpath(active_final_dir)
-        if active_final_dir in self.fs_watcher.directories():
+        active_final_dirs = self._active_final_dirs()
+        if not active_final_dirs:
             return
         # 2026.07.15-04: reload_final_textures() の古いサブフォルダ補正が
         # 対象を絞り込めるよう、直前のアクティブFinalサブフォルダを
         # 記録しておく(詳細は _ensure_active_watch_watched() 参照)。
+        # (2026.07.21時点: デッドコードと判明しているが、撤去はPhase 2で
+        # 行う方針のため、Phase 1では記録動作自体は据え置く。)
         prev_dirs = [d for d in self.fs_watcher.directories()
                      if os.path.dirname(d) == os.path.normpath(self.config.get("final_export_dir") or "")]
         if prev_dirs:
             self._last_active_final_dir = prev_dirs[0]
-        try:
-            os.makedirs(active_final_dir, exist_ok=True)
-            ok = self.fs_watcher.addPath(active_final_dir)
-            if ok:
-                self._emit_status("[追従] プロジェクトの切り替えを検知し、Finalフォルダの監視先を更新しました: {0}".format(active_final_dir))
-        except Exception as e:
-            self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
+
+        for active_final_dir in active_final_dirs:
+            if active_final_dir in self.fs_watcher.directories():
+                continue
+            try:
+                os.makedirs(active_final_dir, exist_ok=True)
+                ok = self.fs_watcher.addPath(active_final_dir)
+                if ok:
+                    self._emit_status("[追従] プロジェクトの切り替えを検知し、Finalフォルダの監視先を更新しました: {0}".format(active_final_dir))
+            except Exception as e:
+                self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
 
     def _ensure_active_dirs_watched(self):
         """Live/Preview・Final両方のアクティブサブフォルダ追従をまとめて
@@ -1880,27 +2196,42 @@ class LiveSyncWatcher(QtCore.QObject):
         Cube.sppを開いてしまう」といった事故的な組み合わせのまま
         テクスチャが誤反映される/シェーダーが誤って「対応済み」と
         判定されるのを防ぐための、最終防御ライン。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治で修正):
+        従来はこの不一致判定に _get_current_scene_project_link()(＝
+        現在アクティブな1linkのみ)を使っていたため、天板(proA)・脚
+        (proB)のように複数プロジェクトを1シーンに紐付けて運用している
+        場合、SP側でproAからproBへ切り替えた瞬間に「アクティブlinkは
+        まだproAのまま」と誤判定され、実際にはシーンに正しく紐付いている
+        にもかかわらず監視全体が強制停止してしまう欠陥があった(複数
+        プロジェクト運用そのものと矛盾する、Phase 1のレビューで発見)。
+        判定を「SP側の現在プロジェクトが、シーンに紐付いた“いずれかの”
+        link と一致するか」に修正した。事故防止(未登録の全く無関係な
+        プロジェクトを開いてしまった場合の防御)という本来の意図は
+        変えていない: linked_keys が1件も無い、またはSP側の
+        active_project_keyがどのlinkとも一致しない場合のみ、従来通り
+        安全側に倒して監視を自動停止する。
         """
         self._refresh_dynamic_config()
 
         if self.enabled:
-            linked_key = _get_current_scene_project_link()
+            linked_keys = set(self._linked_sp_project_keys())
             active_key = _normalize_project_key_for_compare(self.config.get("active_project_key"))
             # [DIAG-B2] 一次切り分け用: 不一致判定の材料を毎回ログに残す。
             # 「追跡できない」がここでの自動停止によるものかどうかを、
-            # linked_key(シーン紐付け)とactive_key(SP側現在値)の
-            # 実際の値を突き合わせて確定させる。
+            # linked_keys(シーンに紐付いた全プロジェクト)とactive_key
+            # (SP側現在値)の実際の値を突き合わせて確定させる。
             # (_DIAG_B2_VERBOSE = True にすると再度表示される)
             if _DIAG_B2_VERBOSE:
-                print("[DIAG-B2] linked_key={0!r} active_key={1!r} match={2}".format(
-                    linked_key, active_key, (linked_key == active_key) if (linked_key and active_key) else "N/A"))
-            if linked_key and active_key and linked_key != active_key:
+                print("[DIAG-B2] linked_keys={0!r} active_key={1!r} match={2}".format(
+                    linked_keys, active_key, (active_key in linked_keys) if (linked_keys and active_key) else "N/A"))
+            if linked_keys and active_key and active_key not in linked_keys:
                 if _DIAG_B2_VERBOSE:
                     print("[DIAG-B2] 不一致検出 -> 監視を自動停止します。これがB-2仮説の再現です。")
                 self.stop(reason="scene_change")
                 self._emit_status(
-                    "警告: このシーンの対応先SPプロジェクトと、SP側が今開いている"
-                    "プロジェクトが異なるため、事故防止のため監視を自動停止しました。"
+                    "警告: このシーンに紐付けられたどのSPプロジェクトとも、SP側が今開いている"
+                    "プロジェクトが一致しないため、事故防止のため監視を自動停止しました。"
                     "SP側で正しいプロジェクトを開くか、状態バーから紐付けを"
                     "設定し直してください。"
                 )
@@ -1939,17 +2270,23 @@ class LiveSyncWatcher(QtCore.QObject):
         # 2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
         # <watch_dir>/<アクティブなサブフォルダ>/ へ書き出されるように
         # なったため、Final同様にアクティブサブフォルダも監視対象に含める。
+        #
+        # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 従来は
+        # _active_watch_dir()/_active_final_dir()(単数形、代表1件のみ)を
+        # 初期登録していたため、複数のSPプロジェクトが紐付いている場合、
+        # 代表以外のプロジェクトの監視登録が project_poll_timer の次回
+        # 実行(最大3秒)まで遅延していた。実害は軽微だが、監視開始の
+        # 瞬間から全プロジェクトを一貫して対象にするため、複数形
+        # _active_watch_dirs()/_active_final_dirs() へ差し替えた。
         watch_targets = [watch_dir, final_dir]
-        active_watch_dir = self._active_watch_dir()
-        if active_watch_dir:
-            active_watch_dir = os.path.normpath(active_watch_dir)
-            os.makedirs(active_watch_dir, exist_ok=True)
-            watch_targets.append(active_watch_dir)
-        active_final_dir = self._active_final_dir()
-        if active_final_dir:
-            active_final_dir = os.path.normpath(active_final_dir)
-            os.makedirs(active_final_dir, exist_ok=True)
-            watch_targets.append(active_final_dir)
+        for d in self._active_watch_dirs():
+            d = os.path.normpath(d)
+            os.makedirs(d, exist_ok=True)
+            watch_targets.append(d)
+        for d in self._active_final_dirs():
+            d = os.path.normpath(d)
+            os.makedirs(d, exist_ok=True)
+            watch_targets.append(d)
         for d in watch_targets:
             if d not in self.fs_watcher.directories():
                 ok = self.fs_watcher.addPath(d)
@@ -1972,7 +2309,7 @@ class LiveSyncWatcher(QtCore.QObject):
         # ここでの明示的な start() 呼び出しは撤去した(常時起動している
         # タイマーに対して start() を呼んでも実害はないが、
         # 「監視ONで開始する」という誤った意図をコードに残さないため)。
-        self._emit_status("監視を開始しました: {0}".format(active_watch_dir or watch_dir))
+        self._emit_status("監視を開始しました: {0}".format(", ".join(sorted(watch_targets)) or watch_dir))
 
 
     def stop(self, reason="manual"):
@@ -2021,84 +2358,101 @@ class LiveSyncWatcher(QtCore.QObject):
         self.debounce_timer.start()
 
     def _process_pending_changes(self):
-        # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): Live/Preview
-        # も固定の watch_dir 直下ではなく、SP側のプロジェクト切り替えに
-        # 応じて変わるアクティブなサブフォルダを指す。Finalと同じ理由で、
-        # ここで最新の値を読み直し、まだ監視対象に入っていなければ
-        # 動的に追加する。
-        active_watch_dir = self._active_watch_dir()
-        watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
-            self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
-        if self.enabled and watch_dir not in self.fs_watcher.directories():
-            try:
-                os.makedirs(watch_dir, exist_ok=True)
-                self.fs_watcher.addPath(watch_dir)
-            except Exception as e:
-                self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
+        # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 従来は
+        # _active_watch_dir()/_active_final_dir()(単数形、代表1件のみ)を
+        # 基準にしていたため、このシーンに複数のSPプロジェクトが紐付いて
+        # いても、実際に監視・flag判定されるフォルダは常に1つに限定
+        # されていた。_active_watch_dirs()/_active_final_dirs()(複数形、
+        # 全プロジェクト分の集合)へ差し替え、以降の処理をすべて集合
+        # ベースのループに変更した。
+        active_watch_dirs = self._active_watch_dirs()
+        watch_root_fallback = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        watch_dirs = {os.path.normpath(d) for d in active_watch_dirs} or {watch_root_fallback}
+        if self.enabled:
+            for watch_dir in watch_dirs:
+                if watch_dir not in self.fs_watcher.directories():
+                    try:
+                        os.makedirs(watch_dir, exist_ok=True)
+                        self.fs_watcher.addPath(watch_dir)
+                    except Exception as e:
+                        self._emit_status("警告: 監視フォルダの追加に失敗しました: {0}".format(e))
 
         # 複数プロジェクト対応: 「Finalフォルダ」は固定の final_export_dir
-        # 直下ではなく、SP側のプロジェクト切り替えに応じて変わる
-        # アクティブなサブフォルダを指す。ここで最新の値を読み直し、
-        # まだ監視対象に入っていなければ動的に追加する
-        # (start() は監視開始時の1回しか対象を確定しないため、開始後に
-        # SP側でプロジェクトを切り替えて新しいサブフォルダができた場合、
-        # ここで追従しないと新フォルダの変更を一切検知できない)。
-        active_final_dir = self._active_final_dir()
-        final_dir = os.path.normpath(active_final_dir) if active_final_dir else os.path.normpath(
-            self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
-        if self.enabled and final_dir not in self.fs_watcher.directories():
-            try:
-                os.makedirs(final_dir, exist_ok=True)
-                self.fs_watcher.addPath(final_dir)
-            except Exception as e:
-                self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
+        # 直下ではなく、シーンに紐付いた各プロジェクトのアクティブな
+        # サブフォルダを指す。ここで最新の値を読み直し、まだ監視対象に
+        # 入っていなければ動的に追加する(start() は監視開始時の1回しか
+        # 対象を確定しないため、開始後にSP側でプロジェクトを切り替えて
+        # 新しいサブフォルダができた場合、ここで追従しないと新フォルダの
+        # 変更を一切検知できない)。
+        active_final_dirs = self._active_final_dirs()
+        final_root_fallback = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        final_dirs = {os.path.normpath(d) for d in active_final_dirs} or {final_root_fallback}
+        if self.enabled:
+            for final_dir in final_dirs:
+                if final_dir not in self.fs_watcher.directories():
+                    try:
+                        os.makedirs(final_dir, exist_ok=True)
+                        self.fs_watcher.addPath(final_dir)
+                    except Exception as e:
+                        self._emit_status("警告: Finalフォルダの監視追加に失敗しました: {0}".format(e))
 
-        # 2026.07.15-06(緊急修正): _last_flag_mtime_watch/_final は
-        # 「どのフォルダの完了フラグを最後に見たか」を区別しない、
-        # 単一のグローバルなmtime比較値だった。SP側でプロジェクトが
-        # 切り替わって watch_dir/final_dir(実体はサブフォルダ)が
-        # 変わっても、この比較値はリセットされないため、以下の不具合が
-        # あった:
-        #   - 前のプロジェクトで記録したmtimeの方が新しい値だった場合、
-        #     新しいプロジェクトの完了フラグの方が(ファイルとしては
-        #     新しく作られていても)mtime自体は小さいことがあり、
-        #     「まだ古い」と誤判定されて自動反映が一切トリガーされない
-        #   - この状態は表示品質を手動で切り替える(switch_texture_
-        #     quality)ことでしか解消されず、「一度直ってもすぐ手動
-        #     操作頼みに戻る」という体感の不具合として現れていた
-        # 対策として、監視中のフォルダ自体が変わったことを検知したら、
-        # 対応するmtime比較値を0にリセットし、新しいフォルダの完了
-        # フラグを確実に「新しい」と判定できるようにした。
-        if watch_dir != self._last_watch_dir_for_flag:
-            self._last_watch_dir_for_flag = watch_dir
-            self._last_flag_mtime_watch = 0.0
-        if final_dir != self._last_final_dir_for_flag:
-            self._last_final_dir_for_flag = final_dir
-            self._last_flag_mtime_final = 0.0
+        # 2026.07.15-06(緊急修正、2026.07.21のPhase 1でディレクトリ単位
+        # 辞書へ発展): _last_flag_mtime_watch/_final は元々「現在
+        # アクティブな1つのフォルダ」だけを前提にしたスカラー比較値
+        # だったため、複数のSPプロジェクトを並行して監視するようになると、
+        # あるプロジェクトの新しいflagのmtimeが、別プロジェクトで記録済み
+        # の(たまたま数値が大きい)mtimeより小さいというだけで「まだ古い」
+        # と誤判定され、自動反映が一切トリガーされない不具合があった
+        # (症状: 「リアルタイム追従ができず、Finalのみ追従できる」の
+        # 主要因)。_flag_mtimes_watch/_final(ディレクトリパスをキーにした
+        # mtime辞書)に変更し、プロジェクトごとに独立して新旧を判定できる
+        # ようにした。存在しなくなった(＝もうこのシーンに紐付いていない)
+        # フォルダのエントリは、辞書が際限なく肥大化しないようここで
+        # 刈り込む。
+        stale_watch_keys = set(self._flag_mtimes_watch) - watch_dirs
+        for k in stale_watch_keys:
+            del self._flag_mtimes_watch[k]
+        stale_final_keys = set(self._flag_mtimes_final) - final_dirs
+        for k in stale_final_keys:
+            del self._flag_mtimes_final[k]
 
-        watch_flag = os.path.join(watch_dir, "_sync_complete.flag")
-        if os.path.isfile(watch_flag):
+        # いずれかのプロジェクトのLive/Preview完了flagが更新されていれば
+        # reload_textures()を1回呼ぶ(reload_textures()自体がシーン内の
+        # 全fileノードを対象に、現在のwatch_dirs集合を基準として処理する
+        # ため、複数フォルダが同時に更新されていても1回の呼び出しで
+        # まとめて処理できる)。
+        watch_reload_needed = False
+        for watch_dir in watch_dirs:
+            watch_flag = os.path.join(watch_dir, "_sync_complete.flag")
+            if not os.path.isfile(watch_flag):
+                continue
             try:
                 mtime = os.path.getmtime(watch_flag)
             except OSError:
-                mtime = None
-            if mtime is not None and mtime > self._last_flag_mtime_watch:
-                self._last_flag_mtime_watch = mtime
-                self.reload_textures()
+                continue
+            if mtime > self._flag_mtimes_watch.get(watch_dir, 0.0):
+                self._flag_mtimes_watch[watch_dir] = mtime
+                watch_reload_needed = True
+        if watch_reload_needed:
+            self.reload_textures()
 
-        # Finalフォルダ側の完了フラグ。表示品質がFinalの間のみ、
+        # Finalフォルダ側の完了flag。表示品質がFinalの間のみ、
         # 該当ノードを強制再読込する(プレビュー表示中はFinalの
         # 更新を反映する必要が無いため何もしない)。
-        final_flag = os.path.join(final_dir, "_sync_complete.flag")
-        if os.path.isfile(final_flag):
+        final_reload_needed = False
+        for final_dir in final_dirs:
+            final_flag = os.path.join(final_dir, "_sync_complete.flag")
+            if not os.path.isfile(final_flag):
+                continue
             try:
                 mtime = os.path.getmtime(final_flag)
             except OSError:
-                mtime = None
-            if mtime is not None and mtime > self._last_flag_mtime_final:
-                self._last_flag_mtime_final = mtime
-                if self.using_final_quality:
-                    self.reload_final_textures()
+                continue
+            if mtime > self._flag_mtimes_final.get(final_dir, 0.0):
+                self._flag_mtimes_final[final_dir] = mtime
+                final_reload_needed = True
+        if final_reload_needed and self.using_final_quality:
+            self.reload_final_textures()
 
     # -- 再読込処理 ---------------------------------------------------------
 
@@ -2106,13 +2460,20 @@ class LiveSyncWatcher(QtCore.QObject):
         # 単独呼び出し(手動リロード等)でも最新のサブフォルダ名を
         # 確実に掴めるよう、念のためここでも読み直す。
         self._refresh_dynamic_config()
-        # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): file ノードは
-        # <watch_dir>/<アクティブサブフォルダ>/ を参照しているはずなので、
-        # 判定にもそちらを使う。
-        active_watch_dir = self._active_watch_dir()
-        watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
-            self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+
+        # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 従来は
+        # _active_watch_dir()(単数形、代表1件のみ)を基準にしていたため、
+        # このシーンに複数のSPプロジェクトが紐付いていても、実際に
+        # reloadされるのは常に1プロジェクト分のfileノードに限定されて
+        # いた(このリポジトリで報告された緊急バグの直接原因)。
+        # _active_watch_dirs()(複数形、全プロジェクト分の集合)を
+        # 基準にし、いずれかの監視対象フォルダを参照しているノードは
+        # すべてreload対象に含める。
         watch_root = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        active_watch_dirs = self._active_watch_dirs()
+        watch_dirs = {os.path.normpath(d) for d in active_watch_dirs}
+        if not watch_dirs:
+            watch_dirs = {watch_root}
 
         # 2026.07.15-03(緊急修正): 以前は「fileノードが今まさに現在の
         # watch_dir を参照しているか」の完全一致でしか対象を拾えず、
@@ -2154,12 +2515,22 @@ class LiveSyncWatcher(QtCore.QObject):
         # 確認してから補正するようにした。ディレクトリの一致ではなく
         # ファイル名のprefixで安全性を担保するため、無関係な他
         # プロジェクトのサブフォルダを巻き込む心配がない。
+        #
+        # 2026.07.21(Phase 1): 複数プロジェクト対応により、「現在
+        # アクティブでない」の基準が「watch_dirs集合に含まれない」に
+        # 変わった。また、補正先も「現在の1つのサブフォルダ」ではなく
+        # 「ファイル名prefixから逆引きした、該当プロジェクトのサブ
+        # フォルダ」に変更した(_match_known_texture_set_project() が
+        # プロジェクトキーまで特定できるようになったため)。該当
+        # プロジェクトの watch_subfolder_by_project エントリがまだ無い
+        # (一度もプレビュー書き出しされていない)場合は、安全側に倒して
+        # 補正しない。
         stale_subfolder_dirs = set()
         try:
             if os.path.isdir(watch_root):
                 for entry in os.listdir(watch_root):
                     candidate = os.path.normpath(os.path.join(watch_root, entry))
-                    if os.path.isdir(candidate) and candidate != watch_dir:
+                    if os.path.isdir(candidate) and candidate not in watch_dirs:
                         stale_subfolder_dirs.add(candidate)
         except OSError:
             pass
@@ -2168,6 +2539,8 @@ class LiveSyncWatcher(QtCore.QObject):
         if not file_nodes:
             self._emit_status("シーン内に file ノードが見つかりません。")
             return
+
+        watch_by_project_normalized = self._watch_subfolder_by_project_normalized()
 
         reloaded = []
         # v2.2 修正: stateWithoutFlush は「これから設定したいUndo有効/無効の
@@ -2190,17 +2563,27 @@ class LiveSyncWatcher(QtCore.QObject):
                 if not tex_path:
                     continue
                 tex_dir = os.path.normpath(os.path.dirname(tex_path))
-                if tex_dir == watch_dir:
-                    pass  # 既に最新のサブフォルダを参照している通常ケース
-                elif tex_dir in stale_subfolder_dirs and self._matches_known_texture_set_prefix(
-                        os.path.basename(tex_path)):
+                if tex_dir in watch_dirs:
+                    pass  # 既にいずれかの監視対象サブフォルダを参照している通常ケース
+                elif tex_dir in stale_subfolder_dirs:
                     # 古いプロジェクト用サブフォルダを参照したまま取り残
-                    # されたノード。ファイル名が現在のプロジェクトの
-                    # 既知テクスチャセットのprefixと一致することを確認
-                    # した上で(2026.07.15-05: 無関係な他プロジェクトを
-                    # 誤補正しないための安全確認)、現在のサブフォルダへ
-                    # パスを補正する。
-                    new_path = os.path.join(watch_dir, os.path.basename(tex_path))
+                    # されたノード。ファイル名がどのプロジェクトの既知
+                    # テクスチャセットのprefixと一致するかを特定し
+                    # (2026.07.15-05の安全確認を複数プロジェクト対応に
+                    # 拡張)、該当プロジェクトの現在のサブフォルダへ
+                    # パスを補正する。一致するプロジェクトが無い、または
+                    # 一致はしたがそのプロジェクトがまだ一度もプレビュー
+                    # 書き出しをしていない(watch_subfolder_by_projectに
+                    # エントリが無い)場合は、無関係な他プロジェクトを
+                    # 誤補正しないよう何もしない。
+                    matched_key = self._match_known_texture_set_project(os.path.basename(tex_path))
+                    subfolder = watch_by_project_normalized.get(matched_key) if matched_key else None
+                    if not subfolder:
+                        continue
+                    new_path = os.path.join(
+                        os.path.normpath(os.path.join(watch_root, subfolder)),
+                        os.path.basename(tex_path),
+                    )
                     tex_path = new_path
                     corrected.append(node)
                 else:
@@ -2270,18 +2653,25 @@ class LiveSyncWatcher(QtCore.QObject):
         _matches_known_texture_set_prefix() でファイル名の安全確認を
         行うことで、無関係な他プロジェクトを巻き込まずに救済範囲を
         広げた(詳細は reload_textures() のコメント参照)。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 従来の
+        _active_final_dir()(単数形、代表1件のみ)から _active_final_dirs()
+        (複数形、このシーンに紐付いた全プロジェクト分の集合)へ差し替えた。
+        補正先も、ファイル名prefixから逆引きした該当プロジェクトの
+        サブフォルダへ変更した(詳細は reload_textures() のコメント参照)。
         """
-        final_dir = self._active_final_dir()
-        final_dir = os.path.normpath(final_dir) if final_dir else os.path.normpath(
-            self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         final_root = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        active_final_dirs = self._active_final_dirs()
+        final_dirs = {os.path.normpath(d) for d in active_final_dirs}
+        if not final_dirs:
+            final_dirs = {final_root}
 
         stale_subfolder_dirs = set()
         try:
             if os.path.isdir(final_root):
                 for entry in os.listdir(final_root):
                     candidate = os.path.normpath(os.path.join(final_root, entry))
-                    if os.path.isdir(candidate) and candidate != final_dir:
+                    if os.path.isdir(candidate) and candidate not in final_dirs:
                         stale_subfolder_dirs.add(candidate)
         except OSError:
             pass
@@ -2289,6 +2679,8 @@ class LiveSyncWatcher(QtCore.QObject):
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
             return
+
+        final_by_project_normalized = self._final_subfolder_by_project_normalized()
 
         reloaded = []
         # v2.2 修正: reload_textures() と同様の理由で、呼び出し前の状態を
@@ -2305,15 +2697,24 @@ class LiveSyncWatcher(QtCore.QObject):
                 if not tex_path:
                     continue
                 tex_dir = os.path.normpath(os.path.dirname(tex_path))
-                if tex_dir == final_dir:
+                if tex_dir in final_dirs:
                     pass
-                elif tex_dir in stale_subfolder_dirs and self._matches_known_texture_set_prefix(
-                        os.path.basename(tex_path)):
-                    # 2026.07.15-05: ファイル名が現在のプロジェクトの
-                    # 既知テクスチャセットのprefixと一致することを
-                    # 確認した上で補正する(無関係な他プロジェクトを
-                    # 誤補正しないための安全確認)。
-                    new_path = os.path.join(final_dir, os.path.basename(tex_path))
+                elif tex_dir in stale_subfolder_dirs:
+                    # 2026.07.15-05・2026.07.21: ファイル名がどのプロジェ
+                    # クトの既知テクスチャセットのprefixと一致するかを
+                    # 特定し(無関係な他プロジェクトを誤補正しないための
+                    # 安全確認)、該当プロジェクトの現在のFinalサブ
+                    # フォルダへ補正する。一致するプロジェクトが無い、
+                    # またはそのプロジェクトがまだ一度もFinal書き出しを
+                    # していない場合は何もしない。
+                    matched_key = self._match_known_texture_set_project(os.path.basename(tex_path))
+                    subfolder = final_by_project_normalized.get(matched_key) if matched_key else None
+                    if not subfolder:
+                        continue
+                    new_path = os.path.join(
+                        os.path.normpath(os.path.join(final_root, subfolder)),
+                        os.path.basename(tex_path),
+                    )
                     tex_path = new_path
                     corrected.append(node)
                 else:
@@ -2448,7 +2849,95 @@ class LiveSyncWatcher(QtCore.QObject):
     # -- Phase 2: テクスチャセット構造への対応 -------------------------------
 
     def get_known_texture_sets(self):
-        return _active_texture_sets(self.config)
+        """マテリアル構造タブに表示するテクスチャセット名の一覧を返す。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治・論点2案A):
+        従来は self.config["active_project_key"](SP側が今開いている
+        1プロジェクトのみ)を基準にしていたため、シーンに複数プロジェクト
+        を紐付けていても、SP側で今開いていない方のテクスチャセットは
+        一覧から漏れ、is_texture_set_mapped() 経由でマテリアル未対応と
+        誤判定される一因になっていた(症状: 「Fileノードが存在するのに
+        一度再起動しなければマテリアルを認識しない」)。
+        このシーンに紐付けられた全プロジェクトのテクスチャセットの
+        和集合を返すよう変更した(論点2で合意した案A)。
+        同名テクスチャセットが複数プロジェクトに存在する場合、この
+        メソッドの戻り値(名前のみのリスト)では区別できない点に注意:
+        UI側でプロジェクトごとの内訳を示したい場合は
+        get_known_texture_sets_detailed() を使うこと。
+
+        2026.07.21 追加修正(緊急、実機報告): 当初はシーンにlinkが1件も
+        無い場合、後方互換のため _active_texture_sets()(self.config
+        ["active_project_key"]基準)へフォールバックしていた。しかし
+        active_project_key はMaya側のメモリ上でシーンをまたいで保持され
+        続ける値(SP側が今開いているプロジェクトを表すだけで、シーン
+        固有の情報ではない)であるため、「シーンAでプロジェクトXの
+        テクスチャセットを表示 → 紐付け未設定のシーンBへ切り替え」た
+        際にも、前のシーンで表示していたXの一覧が残り続けてしまう
+        欠陥があった(実機で「シーンを切り替えても作業対象が残ったまま」
+        として報告・再現)。
+        シーン固有でない値へのフォールバックはこの欠陥を再発させるため
+        廃止し、このシーンにlinkが1件も無い場合は空リストを返すように
+        変更した。これにより、シーンを切り替えた直後は(まだ「SP
+        プロジェクトを設定」等で紐付けていない限り)一覧が正しく空になる。
+        """
+        linked_keys = self._linked_sp_project_keys()
+        if not linked_keys:
+            return []
+
+        by_project = self.config.get("known_texture_sets_by_project", {}) or {}
+        # known_texture_sets_by_project のキーはSP側が書き込む未正規化の
+        # project_key。links側のsp_project_keyは正規化済みのため、
+        # 突き合わせ用に辞書キー側を正規化してから引く。
+        normalized_by_project = {
+            _normalize_project_key_for_compare(k): v for k, v in by_project.items()
+        }
+        names = set()
+        for key in linked_keys:
+            names.update(normalized_by_project.get(key, []))
+        return sorted(names)
+
+    def get_known_texture_sets_detailed(self):
+        """マテリアル一覧UI向けに、テクスチャセット名だけでなく
+        「どのプロジェクトのものか」も併せて返す(論点2案A)。
+
+        戻り値: [(texture_set_name, project_key(正規化済み),
+                  project_display_name), ...]
+        同名のテクスチャセットが複数プロジェクトに存在する場合は、
+        プロジェクトごとに別エントリとして列挙される(名前だけでは
+        区別できないため、テーブルには両方を表示しプロジェクト名列で
+        見分けられるようにする)。
+
+        2026.07.21 追加修正(緊急、実機報告): シーンにlinkが1件も無い
+        場合、get_known_texture_sets() が空リストを返すようになった
+        (シーン切替時に前のシーンの一覧が残留する不具合の修正、詳細は
+        get_known_texture_sets() のdocstring参照)ため、この関数も
+        自然に空リストを返す。以前は「後方互換」としてactive_project_key
+        基準の一覧を1件ずつ返していたが、これが残留バグの一因だった
+        ため廃止した。
+        """
+        linked_keys = self._linked_sp_project_keys()
+        if not linked_keys:
+            return [(name, None, None) for name in self.get_known_texture_sets()]
+
+        by_project = self.config.get("known_texture_sets_by_project", {}) or {}
+        normalized_by_project = {
+            _normalize_project_key_for_compare(k): v for k, v in by_project.items()
+        }
+        payload = _get_scene_project_links()
+        # プロジェクトキー -> このシーンでの表示名(labelがあればそちら優先)
+        display_name_by_key = {}
+        for link in payload.get("links", []):
+            key = link.get("sp_project_key")
+            if key:
+                display_name_by_key[key] = _link_display_name(link) or _project_display_name(key)
+
+        rows = []
+        for key in linked_keys:
+            names = sorted(normalized_by_project.get(key, []))
+            display_name = display_name_by_key.get(key) or _project_display_name(key)
+            for name in names:
+                rows.append((name, key, display_name))
+        return rows
 
     def get_active_project_label(self):
         """マテリアル構造タブに表示する「今どのプロジェクトの一覧を
@@ -2459,10 +2948,34 @@ class LiveSyncWatcher(QtCore.QObject):
         SP側が今実際に開いているプロジェクトが食い違っている場合は
         その旨も明示する(状態バー上部の表示と合わせて、一覧が
         「別プロジェクトのものかもしれない」と気づけるようにするため)。
+
+        2026.07.21(Phase 1, 論点2案A): get_known_texture_sets() が
+        和集合を返すようになったため、この説明文も「和集合表示中」で
+        あることが伝わるよう文言を調整した(複数プロジェクトが紐付いて
+        いる場合のみ)。
+
+        2026.07.21 追加修正(緊急、実機報告): 従来は linked_keys が0件
+        または1件の場合に active_key(SP側が今開いているプロジェクト、
+        シーンをまたいでメモリに残り続ける値)を無条件で使ってラベルを
+        組み立てていたため、「このシーンにはまだ何も紐付けていない」の
+        に、前のシーンで開いていたSPプロジェクトの名前が表示され続ける
+        欠陥があった(get_known_texture_sets() と同一の根本原因。
+        実機で「シーンを切り替えても作業対象が残ったまま」として報告・
+        再現)。linked_keys が0件の場合を明示的に分岐させ、
+        「このシーンには紐付けが無い」ことが伝わるラベルを返すように
+        変更した。active_key ベースのラベルは、このシーンに紐付けが
+        1件だけある場合に限定する。
         """
         by_project = self.config.get("known_texture_sets_by_project", {})
         active_key = self.config.get("active_project_key")
         linked_key = _get_current_scene_project_link()
+        linked_keys = self._linked_sp_project_keys()
+
+        if len(linked_keys) >= 2:
+            return "このシーンに紐付けられた {0} 件のSPプロジェクト分をまとめて表示中".format(len(linked_keys))
+
+        if not linked_keys:
+            return "このシーンにはまだSPプロジェクトが紐付けられていません。"
 
         if active_key and active_key in by_project:
             name = os.path.basename(active_key) if active_key != "__unsaved__" else "(未保存のプロジェクト)"
@@ -2481,12 +2994,24 @@ class LiveSyncWatcher(QtCore.QObject):
         空の辞書を返す(従来の「全部混ぜて返す」フォールバックは、
         誤って別プロジェクトのシェーダーを「対応済み」と誤判定する
         危険の方が大きいため、あえて行わない)。
+
+        2026.07.21(Phase 1): project_key には2種類の呼ばれ方がある。
+        (a) 省略時のself.config["active_project_key"](SP側由来、未正規化)
+        (b) 呼び出し元がget_known_texture_sets_detailed()等から得た
+            links由来のキー(_normalize_project_key_for_compare 通過後)
+        texture_set_shading_engine_map_by_project のキー自体は常に(a)と
+        同じ未正規化空間のため、(b)のキーをそのまま辞書に渡すと
+        Windows環境で区切り文字の違いにより一致しないことがある。
+        双方を吸収するため、辞書側のキーを正規化してから引く。
         """
         key = project_key if project_key is not None else self.config.get("active_project_key")
         if not key:
             return {}
         by_project = self.config.get("texture_set_shading_engine_map_by_project", {})
-        return dict(by_project.get(key, {}))
+        normalized_by_project = {
+            _normalize_project_key_for_compare(k): v for k, v in by_project.items()
+        }
+        return dict(normalized_by_project.get(_normalize_project_key_for_compare(key), {}))
 
     def _matches_known_texture_set_prefix(self, filename):
         """ファイル名が、現在アクティブなSPプロジェクトの既知テクスチャ
@@ -2500,13 +3025,43 @@ class LiveSyncWatcher(QtCore.QObject):
         ディレクトリの一致ではなくファイル名のprefixで判定するため、
         「本当にこのプロジェクトが書き出したファイルか」をより確実に
         確認できる。
+
+        2026.07.21(Phase 1)以降、真偽値ではなく後方互換のため引き続き
+        真偽値を返す(呼び出し元を壊さないため)。プロジェクトキーまで
+        必要な呼び出し元は _match_known_texture_set_project() を使う。
         """
-        known = self.get_known_texture_sets()
-        for name in known:
-            prefix = _export_prefix(self.config, name) + "_"
-            if filename.startswith(prefix):
-                return True
-        return False
+        return self._match_known_texture_set_project(filename) is not None
+
+    def _match_known_texture_set_project(self, filename):
+        """ファイル名が、このシーンに紐付けられた「いずれかの」SP
+        プロジェクトの既知テクスチャセットのprefixと一致するかを確認し、
+        一致した場合はそのプロジェクトキー(正規化済み)を返す。
+        一致しなければNoneを返す。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 従来の
+        _matches_known_texture_set_prefix()(真偽値のみ)は
+        get_known_texture_sets()(旧: アクティブ1件のみ)と
+        _export_prefix(self.config, name)(project_key省略 = active_
+        project_key基準)の組み合わせのため、実質「今SP側が開いている
+        1プロジェクト」しか照合できなかった。reload_textures()/
+        reload_final_textures() の「古いサブフォルダを参照したまま
+        取り残されたノード」の補正先を、複数プロジェクトの中から正しく
+        1つ特定できるよう、プロジェクトキーごとに get_known_texture_
+        sets_detailed() のエントリとexport_prefixを照合する形に拡張した。
+
+        注意(正規化キー空間の不一致): get_known_texture_sets_detailed()
+        が返す project_key は links 由来で正規化済み(_normalize_
+        project_key_for_compare 通過後)。_export_prefix() 自体が
+        (2026.07.21のPhase 1改修で)辞書側のキーを都度正規化してから
+        引くようになったため、ここでは正規化済みキーをそのまま渡せば
+        よい(自前での正規化辞書構築は不要になった)。
+        """
+        detailed = self.get_known_texture_sets_detailed()
+        for name, project_key, _display_name in detailed:
+            prefix = _export_prefix(self.config, name, project_key=project_key)
+            if filename.startswith(prefix + "_"):
+                return project_key
+        return None
 
     def _managed_dirs(self):
         """ライブ同期パイプラインが把握しているフォルダ(監視用の
@@ -2521,20 +3076,25 @@ class LiveSyncWatcher(QtCore.QObject):
         2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
         <watch_dir>/<active_watch_subfolder>/ へ書き出されるようになった
         ため、Finalと同じくアクティブサブフォルダも対象に含める。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 単数形の
+        _active_watch_dir()/_active_final_dir()(代表1件)ではなく、
+        複数形の _active_watch_dirs()/_active_final_dirs()(このシーンに
+        紐付けられた全プロジェクト分の集合)を対象に含めるよう変更した。
+        これにより、is_texture_set_mapped() のフォールバック走査が
+        「今SP側でアクティブなプロジェクト以外」のfileノードも正しく
+        管理対象と認識できるようになる(症状: 「Fileノードが存在するのに
+        一度再起動しなければマテリアルを認識しない」の根治)。
         """
         dirs = set()
         watch_dir = self.config.get("watch_dir")
         if watch_dir:
             dirs.add(os.path.normpath(watch_dir))
-            active_watch = self._active_watch_dir()
-            if active_watch:
-                dirs.add(os.path.normpath(active_watch))
+        dirs |= self._active_watch_dirs()
         final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
         if final_dir:
             dirs.add(os.path.normpath(final_dir))
-            active_dir = self._active_final_dir()
-            if active_dir:
-                dirs.add(os.path.normpath(active_dir))
+        dirs |= self._active_final_dirs()
         return dirs
 
     def _active_watch_dir(self):
@@ -2563,6 +3123,11 @@ class LiveSyncWatcher(QtCore.QObject):
         active_final_subfolder が共有設定に無ければ(未対応の古いSP側や、
         まだ一度もFinalを書き出していない場合)、後方互換として
         final_export_dir 直下を返す。
+
+        2026.07.21(Phase 1)以降、この関数(単数形)は「UI表示・aiSSの
+        フォルダ欄自動入力用に代表1件を返す」役割に限定される。監視・
+        reload・マッピング判定など、複数プロジェクトを同時に扱う必要が
+        ある処理は _active_final_dirs()(複数形、下記)を使うこと。
         """
         final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
         if not final_dir:
@@ -2572,7 +3137,147 @@ class LiveSyncWatcher(QtCore.QObject):
             return os.path.join(final_dir, subfolder)
         return final_dir
 
-    def is_texture_set_mapped(self, name):
+    def _watch_subfolder_for_project_key(self, raw_project_key):
+        """SP側が書き込む未正規化のproject_key(watch_subfolder_by_project
+        のキー)から、監視先サブフォルダ名を引く。内部ヘルパー。
+        """
+        by_project = self.config.get("watch_subfolder_by_project", {}) or {}
+        return by_project.get(raw_project_key)
+
+    def _final_subfolder_for_project_key(self, raw_project_key):
+        """SP側が書き込む未正規化のproject_key(final_subfolder_by_project
+        のキー)から、Final書き出し先サブフォルダ名を引く。内部ヘルパー。
+        """
+        by_project = self.config.get("final_subfolder_by_project", {}) or {}
+        return by_project.get(raw_project_key)
+
+    def _linked_sp_project_keys(self):
+        """現在のシーンに紐付けられた全linkのsp_project_key(正規化済み、
+        _normalize_project_key_for_compare 通過後)を重複無く返す。
+
+        2026.07.21(Phase 1): 複数プロジェクト並行対応の根治で新設。
+        従来は self.config["active_project_key"](SP側が今開いている
+        1プロジェクトのみ)を追跡の起点にしていたが、これだと「シーンに
+        紐付いているが今SP側では開いていない、もう一方のプロジェクト」の
+        監視が抜け落ちる。ここでは _get_scene_project_links() の
+        全linkを起点にすることで、シーンに紐付いた全プロジェクトを
+        等しく対象にする(SP側の現在の開閉状態には依存しない)。
+        """
+        try:
+            payload = _get_scene_project_links()
+        except Exception:
+            return []
+        keys = []
+        seen = set()
+        for link in payload.get("links", []):
+            key = link.get("sp_project_key")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
+
+    def _watch_subfolder_by_project_normalized(self):
+        """watch_subfolder_by_project(SP側の未正規化キー)を、
+        _normalize_project_key_for_compare() 通過後のキーに揃え直した
+        辞書として返す。links側のsp_project_key(正規化済み)と直接
+        突き合わせられるようにするための内部ヘルパー。
+
+        同一プロジェクトが正規化前後で衝突するケースは実質無い
+        (正規化はスラッシュ区切りの統一のみで、値の実体は変えない)ため、
+        単純な上書きで問題ない。
+        """
+        by_project = self.config.get("watch_subfolder_by_project", {}) or {}
+        return {
+            _normalize_project_key_for_compare(k): v
+            for k, v in by_project.items()
+        }
+
+    def _final_subfolder_by_project_normalized(self):
+        """final_subfolder_by_project版の _watch_subfolder_by_project_normalized()。"""
+        by_project = self.config.get("final_subfolder_by_project", {}) or {}
+        return {
+            _normalize_project_key_for_compare(k): v
+            for k, v in by_project.items()
+        }
+
+    def _active_watch_dirs(self):
+        """現在のシーンに紐付けられた「全て」のSPプロジェクトについて、
+        Live(プレビュー)監視先の実パスを集合で返す。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): このリポジトリで
+        報告された緊急バグ(「複数SPプロジェクトを動的に追跡できず、最初に
+        設定したSPプロジェクトのみを追跡している」)の直接の修正箇所。
+
+        従来の _active_watch_dir()(単数形)は self.config["active_watch_
+        subfolder"](SP側が今開いている1プロジェクトのみを指すスカラー値)
+        を参照していたため、複数のSPプロジェクトを1シーンに紐付けて
+        並行作業すると、後から開いた方のサブフォルダで前の方が上書きされ、
+        Maya側が同時に追跡できるプロジェクトが実質1つに限定されていた。
+
+        この関数は「今SP側で何が開いているか」ではなく「このシーンに
+        紐付けられている全プロジェクト」を起点にし、watch_subfolder_
+        by_project(プロジェクトキー単位のネスト辞書、SP側がexportの
+        たびに更新)からそれぞれのサブフォルダを引いて実パスを組み立てる。
+        該当プロジェクトがまだ辞書に無い(一度もプレビュー書き出しを
+        行っていない)場合は、そのプロジェクト分は watch_dir 直下への
+        フォールバックとせず、スキップする(直下フォルダを複数プロジェクト
+        分のフォールバック先として共有すると、かえって混線の原因になる
+        ため。直下フォルダは後方互換の1プロジェクト運用専用に残す)。
+
+        シーンにlinkが1件も無い場合(従来通りの単一プロジェクト運用、
+        または紐付け未設定)は、後方互換のため単数形 _active_watch_dir()
+        の結果1件を返す。
+        """
+        watch_dir = self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"]
+        if not watch_dir:
+            return set()
+
+        linked_keys = self._linked_sp_project_keys()
+        if not linked_keys:
+            # 紐付けが無い(または旧バージョンのシーン)場合の後方互換:
+            # 従来通り単数形の代表1件のみを返す。
+            single = self._active_watch_dir()
+            return {os.path.normpath(single)} if single else set()
+
+        by_project_normalized = self._watch_subfolder_by_project_normalized()
+        dirs = set()
+        for key in linked_keys:
+            subfolder = by_project_normalized.get(key)
+            if not subfolder:
+                # このプロジェクトはまだプレビュー書き出しの実績が無い。
+                # watch_dir直下を共有フォールバック先にすると別プロジェクト
+                # 同士が混線するため、追跡対象に含めない(次にSP側で
+                # exportされた時点で自動的に追跡対象へ加わる)。
+                continue
+            dirs.add(os.path.normpath(os.path.join(watch_dir, subfolder)))
+        return dirs
+
+    def _active_final_dirs(self):
+        """_active_watch_dirs() のFinal版。現在のシーンに紐付けられた
+        全SPプロジェクトについて、Final書き出し先の実パスを集合で返す。
+        設計方針・フォールバック方針は _active_watch_dirs() と同一
+        (詳細はそちらのdocstring参照)。
+        """
+        final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
+        if not final_dir:
+            return set()
+
+        linked_keys = self._linked_sp_project_keys()
+        if not linked_keys:
+            single = self._active_final_dir()
+            return {os.path.normpath(single)} if single else set()
+
+        by_project_normalized = self._final_subfolder_by_project_normalized()
+        dirs = set()
+        for key in linked_keys:
+            subfolder = by_project_normalized.get(key)
+            if not subfolder:
+                continue
+            dirs.add(os.path.normpath(os.path.join(final_dir, subfolder)))
+        return dirs
+
+    def is_texture_set_mapped(self, name, project_key=None):
         """このテクスチャセットに対応するシェーディンググループが
         シーン内に既に存在するかどうかを判定する(副作用として監視を
         再起動しない: Phase 2最適化で save_mapping_only() に変更済み)。
@@ -2581,14 +3286,23 @@ class LiveSyncWatcher(QtCore.QObject):
         SPプロジェクトにスコープされたため、別プロジェクトの同名
         テクスチャセット(例: 別プロジェクトの "Body")に割り当てられた
         シェーダーを誤って「対応済み」と判定することが無くなった。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治・論点2案A):
+        project_key を新設した。get_known_texture_sets_detailed() が
+        同名テクスチャセットを複数プロジェクトから返しうるようになった
+        ため、name だけでは一意に特定できない(例: proAの"Body"とproBの
+        "Body")。project_key を明示することで、該当プロジェクトの
+        シェーダー割当・prefixだけを見て判定する。省略時は従来通り
+        self.config["active_project_key"] 基準にフォールバックする
+        (後方互換)。
         """
-        mapping = self.get_shading_engine_map()
+        mapping = self.get_shading_engine_map(project_key=project_key)
         sg_name = mapping.get(name)
         if sg_name and cmds.objExists(sg_name):
             return True, sg_name
 
         managed_dirs = self._managed_dirs()
-        prefix = _export_prefix(self.config, name) + "_"
+        prefix = _export_prefix(self.config, name, project_key=project_key) + "_"
         for node in cmds.ls(type="file") or []:
             try:
                 tex_path = cmds.getAttr(node + ".fileTextureName")
@@ -2602,13 +3316,26 @@ class LiveSyncWatcher(QtCore.QObject):
                 sgs = cmds.listConnections(node, type="shadingEngine") or []
                 found_sg = sgs[0] if sgs else None
                 if found_sg:
-                    self.save_shading_engine_mapping(name, found_sg)
+                    self.save_shading_engine_mapping(name, found_sg, project_key=project_key)
                 return True, found_sg
         return False, None
 
     def find_orphan_file_nodes(self):
+        """managed_dirs配下を参照しているが、既知のどのテクスチャセットの
+        prefixとも一致しないfileノード(＝孤立ノード)を列挙する。
+
+        2026.07.21 追加修正(緊急、実機報告関連の点検で発見): 従来は
+        _export_prefix(self.config, name) を project_key省略(＝
+        active_project_key基準)で呼んでいたため、known(このシーンに
+        紐付いた全プロジェクトのテクスチャセット名の和集合)に複数
+        プロジェクト分の名前が混在する場合、SP側で今開いていない方の
+        プロジェクトの名前には誤ったprefix(_safe_name()による予測値)が
+        使われてしまい、実際には対応済みのノードを誤って「孤立」と
+        判定する恐れがあった。_match_known_texture_set_project()
+        (プロジェクトキーごとに正しいprefixで照合する、Phase 1で導入済み)
+        に委譲するよう修正した。
+        """
         managed_dirs = self._managed_dirs()
-        known = set(self.get_known_texture_sets())
         orphans = []
         for node in cmds.ls(type="file") or []:
             try:
@@ -2620,12 +3347,7 @@ class LiveSyncWatcher(QtCore.QObject):
             if os.path.normpath(os.path.dirname(tex_path)) not in managed_dirs:
                 continue
             base = os.path.basename(tex_path)
-            matched = False
-            for name in known:
-                if base.startswith(_export_prefix(self.config, name) + "_"):
-                    matched = True
-                    break
-            if not matched:
+            if self._match_known_texture_set_project(base) is None:
                 orphans.append(node)
         return orphans
 
@@ -2650,17 +3372,19 @@ class LiveSyncWatcher(QtCore.QObject):
         2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
         <watch_dir>/<active_watch_subfolder>/ へ書き出されるようになった
         ため、Watch側も直下+アクティブサブフォルダの両方を対象にする。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 単数形の
+        _active_final_dir()/_active_watch_dir()(代表1件のみ)から、
+        複数形の _active_final_dirs()/_active_watch_dirs()(このシーンに
+        紐付いた全プロジェクト分の集合)へ差し替えた。この関数は判定のみ
+        (書き込みを伴わない)ため、switch_texture_quality()と異なり
+        複数プロジェクト対応しても既存の「全体を1つの品質に揃える」
+        仕様と衝突しない。
         """
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
-        active_final_dir = self._active_final_dir()
-        final_dirs = {final_dir}
-        if active_final_dir:
-            final_dirs.add(os.path.normpath(active_final_dir))
+        final_dirs = {final_dir} | {os.path.normpath(d) for d in self._active_final_dirs()}
         watch_dir = os.path.normpath(self.config.get("watch_dir") or "")
-        watch_dirs = {watch_dir} if watch_dir else set()
-        active_watch_dir = self._active_watch_dir()
-        if active_watch_dir:
-            watch_dirs.add(os.path.normpath(active_watch_dir))
+        watch_dirs = ({watch_dir} if watch_dir else set()) | {os.path.normpath(d) for d in self._active_watch_dirs()}
         found_final = False
         found_watch = False
         for node in cmds.ls(type="file") or []:
@@ -2811,7 +3535,7 @@ class LiveSyncWatcher(QtCore.QObject):
             )
         return len(switched) + already
 
-    def create_shader_network(self, texture_set_name, channels=None):
+    def create_shader_network(self, texture_set_name, channels=None, project_key=None):
         """Arnold 用の標準シェーダーネットワークを自動生成する。
         戻り値: 作成した shadingEngine 名。
         どのジオメトリに割り当てるかはここでは行わない(手動作業)。
@@ -2830,8 +3554,16 @@ class LiveSyncWatcher(QtCore.QObject):
         シーンの紐付け機能(_on_link_scene_to_sp_project)で既に採用して
         いるのと同じ方針で、未保存の間はシェーダー生成自体をブロックし、
         先にSP側で保存するよう案内する。
+
+        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治・論点2案A):
+        project_key を新設した。マテリアル一覧が複数プロジェクト分の
+        テクスチャセットを同時に表示するようになったため(get_known_
+        texture_sets_detailed())、どのプロジェクト向けにシェーダーを
+        生成するかを明示できる必要がある。省略時は従来通り
+        self.config["active_project_key"] 基準にフォールバックする
+        (後方互換)。
         """
-        active_key = self.config.get("active_project_key")
+        active_key = project_key if project_key is not None else self.config.get("active_project_key")
         if active_key == "__unsaved__":
             raise RuntimeError(
                 "SP側のプロジェクトがまだ保存されていません。"
@@ -2856,7 +3588,7 @@ class LiveSyncWatcher(QtCore.QObject):
         # (export_prefix)。両者は初回エクスポート前は同じ値になりうるが、
         # スペース・日本語等を含む名前では異なる場合がある。
         safe = _safe_name(texture_set_name)
-        export_prefix = _export_prefix(self.config, texture_set_name)
+        export_prefix = _export_prefix(self.config, texture_set_name, project_key=active_key)
 
         # Phase 2 最適化: 名前の衝突を事前チェックする。Mayaに自動リネーム
         # させると意図しない名前のノードができてマッピングが崩れるため。
@@ -2869,11 +3601,20 @@ class LiveSyncWatcher(QtCore.QObject):
             )
 
         # 複数プロジェクト対応(所有権問題回避、2026.07.14-02): 生成する
-        # file ノードは、固定の watch_dir 直下ではなく現在アクティブな
-        # プロジェクトのサブフォルダを参照するようにする。
-        active_watch_dir = self._active_watch_dir()
-        watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else os.path.normpath(
-            self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        # file ノードは、固定の watch_dir 直下ではなく該当プロジェクトの
+        # サブフォルダを参照するようにする。
+        # 2026.07.21(Phase 1): 従来の _active_watch_dir()(単数形、代表
+        # 1件のみ)は「今SP側で開いているプロジェクト」に固定されており、
+        # project_key で明示的に別プロジェクトを指定してもそちらの
+        # フォルダは考慮されなかった。watch_subfolder_by_project から
+        # active_key に対応するサブフォルダを直接引くよう変更した。
+        # まだそのプロジェクトのプレビュー書き出し実績が無い(エントリが
+        # 無い)場合は、後方互換として watch_dir 直下にフォールバックする。
+        watch_root = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        by_project_normalized = self._watch_subfolder_by_project_normalized()
+        normalized_active_key = _normalize_project_key_for_compare(active_key) if active_key else None
+        subfolder = by_project_normalized.get(normalized_active_key) if normalized_active_key else None
+        watch_dir = os.path.normpath(os.path.join(watch_root, subfolder)) if subfolder else watch_root
         ext = self.config.get("file_format", "png")
         raw_suffixes = set(self.config.get("raw_colorspace_suffixes", []))
 
@@ -2993,7 +3734,7 @@ class LiveSyncWatcher(QtCore.QObject):
                     pass
             raise
 
-        self.save_shading_engine_mapping(texture_set_name, sg)
+        self.save_shading_engine_mapping(texture_set_name, sg, project_key=active_key)
 
         self._emit_status(
             "'{0}' 用のシェーダーを生成しました({1})。"
@@ -3565,8 +4306,15 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.channel_checkboxes[suffix] = cb
         mat_layout.addWidget(channel_group)
 
-        self.material_table = QtWidgets.QTableWidget(0, 3)
-        self.material_table.setHorizontalHeaderLabels(["テクスチャセット", "状態", "シェーディンググループ"])
+        self.material_table = QtWidgets.QTableWidget(0, 4)
+        self.material_table.setHorizontalHeaderLabels(["テクスチャセット", "状態", "シェーディンググループ", "SPプロジェクト"])
+        # 2026.07.21(Phase 1, 論点2案A): このシーンに複数のSPプロジェクトが
+        # 紐付いている場合、同じテクスチャセット名(例: "Body")が複数
+        # プロジェクトから並んで表示されうる。名前だけでは区別できないため、
+        # 4列目にプロジェクト名(表示名)を追加し、一覧上で見分けられる
+        # ようにした。単一プロジェクト運用時(紐付けが1件以下)はこの列は
+        # 常に空欄になる(get_known_texture_sets_detailed() が
+        # project_key=None を返すため)。
         self.material_table.horizontalHeader().setStretchLastSection(True)
         self.material_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.material_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -3650,9 +4398,20 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # いるシーンのfileノードを無差別に上書きしようとする不具合が
         # あった。ウィンドウが閉じられてインスタンスが破棄される際に
         # 確実に解除できるよう、コールバックIDをインスタンスに保持する。
+        # 2026.07.21 追加(緊急、実機報告): kAfterNew(新規シーン作成)の
+        # 場合のみ、未保存シーン用の共有スロットを自動クリアする必要が
+        # あるため(_on_scene_changed()のis_new_scene引数、詳細は
+        # そちらのdocstring参照)、MSceneMessage.addCallback自体は
+        # イベント種別を引数でコールバックへ渡さない仕様のため、
+        # kAfterOpen/kAfterNewそれぞれ専用のラムダを介して
+        # is_new_sceneを明示的に渡すようにした。
         self._scene_callback_ids = [
-            om.MSceneMessage.addCallback(om.MSceneMessage.kAfterOpen, self._on_scene_changed),
-            om.MSceneMessage.addCallback(om.MSceneMessage.kAfterNew, self._on_scene_changed),
+            om.MSceneMessage.addCallback(
+                om.MSceneMessage.kAfterOpen,
+                lambda *_a: self._on_scene_changed(is_new_scene=False)),
+            om.MSceneMessage.addCallback(
+                om.MSceneMessage.kAfterNew,
+                lambda *_a: self._on_scene_changed(is_new_scene=True)),
         ]
 
         # Phase 5: 前回終了時に監視がONだった場合は自動的に再開する
@@ -4112,14 +4871,56 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             "一覧の最終更新: {0}".format(_now())
         )
 
-    def _on_scene_changed(self, *_args):
+    def _on_scene_changed(self, is_new_scene=False, *_args):
         """2026.07.15-01: MSceneMessage(kAfterOpen/kAfterNew)から呼ばれる。
         シーンが切り替わったら、直前のシーン向けの監視を安全に停止し、
         新しいシーンの状態(紐付け・一覧)でUIを更新する。監視の自動再開は
         行わない(紐付いたSPプロジェクトが無いまま再開すると、前のシーンの
         設定を引き継いでしまう危険があるため、ユーザーの一手を挟む)。
+
+        is_new_scene: kAfterNew(新規シーン作成)からの呼び出しならTrue、
+        kAfterOpen(既存ファイルを開いた)ならFalse。登録元
+        (open_setup_wizard()呼び出し箇所付近のコールバック登録)で
+        ラムダ経由により明示的に渡される。
+
+        2026.07.21 追加(緊急、実機報告): 複数SPプロジェクトの紐付け
+        情報は、未保存シーンでは共有設定ファイル上の固定スロット
+        (last_scene_project_links["__unsaved__"])を経由するため、
+        直前に別の未保存シーンで設定していた作業対象がそのまま
+        引き継がれてしまうことがある(構造的な限界、詳細は
+        _is_scene_unsaved() のdocstring参照)。
+
+        2026.07.21 追加修正(緊急、実機報告: 「新規シーンを作成すると
+        必ず出る」): 当初はポップアップでの案内のみを行っていたが、
+        新規シーン作成のたびに引き継ぎ自体は起き続けるため、ポップアップ
+        も毎回表示され続けてしまっていた。「新規シーン(New Scene)」は
+        「白紙から始める」という明確なユーザー意図の操作であり、前の
+        未保存シーンの紐付けを引き継ぐべき理由が無いため、is_new_scene
+        の場合は _clear_unsaved_scene_link_slot() で共有スロットを
+        まず自動クリアしてから、通常の更新処理(_refresh_scene_link_
+        label()等)を行うようにした。これにより新規シーンでは常に
+        「未設定」から始まるため、引き継ぎ自体が起きなくなり、
+        ポップアップも(新規シーン作成の直後は)表示されなくなる。
+        kAfterOpen(既存ファイルを開いた)の場合もクリア対象にしている
+        (次に未保存シーンへ移った際に古い情報を拾わないための予防)。
+        ポップアップ機構自体は、上記の自動クリアでは対処しきれない
+        経路(例: 既存の未保存シーンのまま複数回SPプロジェクトの紐付け
+        操作を行った後、保存せずに別の未保存シーンを開いた場合など)の
+        保険として残している。
+        シーンコールバックの内部で直接モーダルダイアログ(exec_()で
+        ブロックするもの)を出すと、Maya本体のシーン読み込み処理や他の
+        プラグインの後続コールバックをブロックする恐れがあるため、
+        QTimer.singleShot(0, ...) でMayaのイベントループへ一度処理を
+        戻した直後に出すようにしている(この関数自体は即座にreturnする)。
         """
         try:
+            if is_new_scene or not _is_scene_unsaved():
+                # 新規シーン、または保存済みファイルを開いた場合は
+                # 未保存スロットをクリアする(詳細は上記docstring参照)。
+                # 「保存済みシーンを開いた場合もクリアする」のは、次に
+                # 未保存シーンへ移った際に古い情報を拾わないための予防。
+                _clear_unsaved_scene_link_slot()
+
             if self.watcher.enabled:
                 self.watcher.stop(reason="scene_change")
                 self.enable_btn.blockSignals(True)
@@ -4128,10 +4929,46 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 self.enable_btn.blockSignals(False)
             self._refresh_scene_link_label()
             self._refresh_material_table()
+
+            if _is_scene_unsaved():
+                try:
+                    payload = _get_scene_project_links()
+                except Exception:
+                    payload = _empty_scene_links_payload()
+                if payload.get("links"):
+                    # 案内文言はここで組み立てておき、singleShot後の
+                    # クロージャに渡す(コールバック終了後にシーンが
+                    # さらに切り替わっている可能性を考慮し、表示直前に
+                    # 再取得はしない: 「切り替わった直後の状態」を
+                    # 案内する目的のため、この時点の情報で十分)。
+                    names = ", ".join(
+                        _link_display_name(link) or "(不明なプロジェクト)"
+                        for link in payload.get("links", [])
+                    )
+                    QtCore.QTimer.singleShot(0, lambda: self._show_unsaved_scene_link_warning(names))
         except Exception as e:
             # コールバック内で例外を外に漏らすとMaya本体が不安定になる
             # ことがあるため、ここでは握りつぶしてログにのみ残す。
             print("[maya_live_sync] _on_scene_changed でエラー: {0}".format(e))
+
+    def _show_unsaved_scene_link_warning(self, names):
+        """_on_scene_changed() から遅延呼び出しされる、未保存シーンでの
+        作業対象引き継ぎ案内ポップアップの本体。
+        """
+        try:
+            QtWidgets.QMessageBox.warning(
+                self, "Live Sync",
+                "このシーンはまだ保存されていません。\n\n"
+                "未保存のシーンでは、作業対象(SPプロジェクトの紐付け)を"
+                "シーンごとに区別して記憶できないため、直前に別の未保存"
+                "シーンで設定していた作業対象「{0}」がこのシーンにも"
+                "引き継がれています。\n\n"
+                "このシーン専用の作業対象にしたい場合は、状態バーから"
+                "紐付けを設定し直してください。一度「名前を付けて保存」"
+                "すれば、以降はシーンごとに区別して記憶されます。".format(names)
+            )
+        except Exception as e:
+            print("[maya_live_sync] _show_unsaved_scene_link_warning でエラー: {0}".format(e))
 
     def closeEvent(self, event):
         """2026.07.15-01: ウィンドウが実際に閉じられる(workspaceControlごと
@@ -4187,14 +5024,27 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # 問題があったため、こちらでも明示的に読み直す。
         self.watcher._refresh_dynamic_config()
         self.active_project_label.setText(self.watcher.get_active_project_label())
-        known = self.watcher.get_known_texture_sets()
-        self.material_table.setRowCount(len(known))
-        for row, name in enumerate(known):
-            mapped, sg_name = self.watcher.is_texture_set_mapped(name)
+        # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治・論点2案A):
+        # get_known_texture_sets()(名前のみのリスト)から
+        # get_known_texture_sets_detailed()((名前, project_key,
+        # プロジェクト表示名)のリスト)へ切り替えた。同名テクスチャ
+        # セットが複数プロジェクトに存在する場合も、行ごとに正しい
+        # project_keyでマッピング状況を判定できるようにするため。
+        detailed = self.watcher.get_known_texture_sets_detailed()
+        self.material_table.setRowCount(len(detailed))
+        for row, (name, project_key, project_display_name) in enumerate(detailed):
+            mapped, sg_name = self.watcher.is_texture_set_mapped(name, project_key=project_key)
             status = "対応済み" if mapped else "未対応"
-            self.material_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+            name_item = QtWidgets.QTableWidgetItem(name)
+            # project_key(正規化済み、Noneの場合もある)を選択時に
+            # 再取得できるよう、0列目アイテムのUserRoleに保持しておく。
+            # _on_create_shader_clicked() がここから読み出して
+            # create_shader_network()/is_texture_set_mapped() へ渡す。
+            name_item.setData(QtCore.Qt.UserRole, project_key)
+            self.material_table.setItem(row, 0, name_item)
             self.material_table.setItem(row, 1, QtWidgets.QTableWidgetItem(status))
             self.material_table.setItem(row, 2, QtWidgets.QTableWidgetItem(sg_name or "-"))
+            self.material_table.setItem(row, 3, QtWidgets.QTableWidgetItem(project_display_name or "-"))
 
     def _on_create_shader_clicked(self):
         rows = sorted(set(idx.row() for idx in self.material_table.selectedIndexes()))
@@ -4208,8 +5058,13 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             if item is None:
                 continue
             name = item.text()
+            # 2026.07.21(Phase 1, 論点2案A): _refresh_material_table() が
+            # 0列目アイテムのUserRoleに格納したproject_keyを読み出し、
+            # 同名テクスチャセットが複数プロジェクトに存在する場合でも
+            # 正しいプロジェクト向けにシェーダーを生成できるようにする。
+            project_key = item.data(QtCore.Qt.UserRole)
             try:
-                self.watcher.create_shader_network(name, channels=channels)
+                self.watcher.create_shader_network(name, channels=channels, project_key=project_key)
                 created.append(name)
             except Exception as e:
                 failed.append("{0}: {1}".format(name, e))

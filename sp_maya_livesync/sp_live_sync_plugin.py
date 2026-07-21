@@ -283,7 +283,19 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 #   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
 #   MINOR: 後方互換のある機能追加
 #   PATCH: 後方互換のあるバグ修正
-__version__ = "1.0.0"
+# 2026.07.21-01(Phase 1, 緊急修正: 複数SPプロジェクト並行対応の根治):
+#     Maya側(maya_live_sync.py 1.2.0)と対になる変更。_do_export()が
+#     従来書き込んでいた active_watch_subfolder/active_final_subfolder
+#     (SP側が今開いている1プロジェクトのみを表すスカラー値、export毎に
+#     上書きされる)に加えて、texture_set_export_prefix_by_project と
+#     同じ「project_key -> サブフォルダ名」のネスト辞書
+#     (watch_subfolder_by_project/final_subfolder_by_project)へも記録
+#     するようにした。既存の単一値はMaya側旧バージョンとの後方互換
+#     およびaiSSのフォルダ欄自動入力用に引き続き更新する。
+#     詳細な経緯・症状はmaya_live_sync.py 1.2.0の変更履歴コメントを参照。
+#     設定ファイルへのキー追加のみで既存キーの意味は変えておらず、
+#     後方互換を維持しているため、SemVerのルールに従いMINORを上げる。
+__version__ = "1.1.0"
 
 import os
 import re
@@ -367,6 +379,24 @@ DEFAULT_CONFIG = {
     # <watch_dir>/<subfolder>/ に書き出す。現在アクティブなプロジェクトの
     # 監視先サブフォルダ名を共有し、Maya側(監視処理)が追従できるようにする。
     "active_watch_subfolder": None,
+    # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 上記の
+    # active_watch_subfolder / active_final_subfolder は「SP側が今
+    # 開いている1プロジェクト」でグローバル上書きされるスカラー値の
+    # ため、複数のSPプロジェクトを同一Mayaシーンに並行して紐付けて
+    # 作業すると、後から開いた方の値で前の方が上書きされてしまい、
+    # Maya側が同時に追跡できるプロジェクトが実質1つに限定される
+    # 不具合があった(このリポジトリで報告された緊急バグの根本原因)。
+    # 対策として、texture_set_export_prefix_by_project と同じ
+    # 「project_key -> 値」のネスト辞書形式でサブフォルダ名を記録する
+    # キーを新設した。既存の active_watch_subfolder / active_final_
+    # subfolder は後方互換のため残置し、以下の役割に限定する:
+    #   - 未対応の古いMaya側との互換性を保つためのフォールバック値
+    #   - aiSS(sp_to_aiStandardSurface.py)のフォルダ欄自動入力用の
+    #     「代表1件(直近アクティブなプロジェクト)」の値
+    # 複数プロジェクトの並行追跡そのものは、Maya側がこちらの
+    # by_project 辞書を正として参照するようになる。
+    "watch_subfolder_by_project": {},
+    "final_subfolder_by_project": {},
     # Phase 3: SP側が実際に書き出したファイル名のprefixを記録する。
     # Maya側はテクスチャセット名を自前で安全化(_safe_name)して予測する
     # 代わりに、この値があれば最優先で使うことで、スペースや日本語を
@@ -1177,6 +1207,10 @@ class LiveSyncEngine(QtCore.QObject):
                 return
 
         subfolder = _project_subfolder_name()
+        # 2026.07.21(Phase 1): 以下のブロックすべてで project_key を
+        # 使うため、_project_subfolder_name() 内部で計算済みの値を
+        # 二重に計算しないよう、ここで一度だけ取得しておく。
+        project_key = _current_project_key()
         if preview:
             # 複数プロジェクト対応(所有権問題の回避、2026.07.14-02):
             # 当初はライブプレビューを watch_dir 直下に一律で書き出して
@@ -1190,9 +1224,25 @@ class LiveSyncEngine(QtCore.QObject):
             dest_root = os.path.join(cfg["watch_dir"], subfolder)
             # Maya 側(監視処理)が「現在アクティブなプロジェクトの監視先
             # サブフォルダ」を追従できるよう、共有設定に記録する。
+            # 2026.07.21(Phase 1, 複数プロジェクト並行対応の根治):
+            # 従来はこの active_watch_subfolder(スカラー値)しか記録して
+            # おらず、複数のSPプロジェクトを行き来しながら作業すると
+            # 後から開いた方の値で前の方が上書きされ、Maya側が同時に
+            # 追跡できるプロジェクトが実質1つに限定される不具合が
+            # あった。既存の active_watch_subfolder は後方互換のため
+            # 引き続き更新しつつ(未対応の古いMaya側・aiSSの代表値用)、
+            # 新たに project_key をキーとしたネスト辞書
+            # (watch_subfolder_by_project)へも記録する。Maya側の
+            # 監視・reload処理はこちらの辞書を正として複数プロジェクトを
+            # 並行追跡できるようになる。
             if cfg.get("active_watch_subfolder") != subfolder:
                 cfg["active_watch_subfolder"] = subfolder
                 save_config({"active_watch_subfolder": subfolder})
+            watch_by_project = dict(cfg.get("watch_subfolder_by_project", {}))
+            if watch_by_project.get(project_key) != subfolder:
+                watch_by_project[project_key] = subfolder
+                cfg["watch_subfolder_by_project"] = watch_by_project
+                save_config({"watch_subfolder_by_project": watch_by_project})
         else:
             # Final は複数プロジェクトが同じフォルダに混在・上書きするのを
             # 防ぐため、プロジェクトごとのサブフォルダへ書き出す。
@@ -1200,9 +1250,16 @@ class LiveSyncEngine(QtCore.QObject):
             dest_root = os.path.join(cfg["final_export_dir"], subfolder)
             # Maya 側(aiSSボタン)が「現在アクティブなプロジェクトのFinal
             # フォルダ」を自動入力できるよう、サブフォルダ名を共有設定に記録。
+            # 2026.07.21(Phase 1): Preview側と同じ理由で、project_key を
+            # キーとしたネスト辞書(final_subfolder_by_project)へも記録する。
             if cfg.get("active_final_subfolder") != subfolder:
                 cfg["active_final_subfolder"] = subfolder
                 save_config({"active_final_subfolder": subfolder})
+            final_by_project = dict(cfg.get("final_subfolder_by_project", {}))
+            if final_by_project.get(project_key) != subfolder:
+                final_by_project[project_key] = subfolder
+                cfg["final_subfolder_by_project"] = final_by_project
+                save_config({"final_subfolder_by_project": final_by_project})
         stage_root = cfg["staging_dir"]
         os.makedirs(stage_root, exist_ok=True)
         os.makedirs(dest_root, exist_ok=True)
