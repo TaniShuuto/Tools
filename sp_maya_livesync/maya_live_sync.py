@@ -127,6 +127,15 @@ import uuid
 import base64
 import datetime
 import subprocess
+import unicodedata
+import contextlib
+try:
+    import msvcrt
+except ImportError:
+    # このツールはWindows専用設計(C:/SPMayaLiveSync のハードコード等)
+    # だが、念のためimport失敗時は設定ファイルロックを無効化して
+    # 動作は継続できるようにする(_config_file_lock()参照)。
+    msvcrt = None
 
 import maya.cmds as cmds
 import maya.OpenMayaUI as omui
@@ -149,6 +158,14 @@ from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 # 表示/非表示切り替え。仮説の再現性確認自体はまだ済んでいないため計装は
 # 残すが、通常運用時はエディタ/コンソールを圧迫しないよう既定でFalse
 # (非表示)にしておく。再度切り分けが必要になった場合はTrueにする。
+#
+# 2026.07.24(診断ビルド 1.4.4.1、切り分け完了): 「fileノードは実在する
+# のに『見つからない』とログが出て自動反映が無効化される」という報告の
+# 切り分けのため、診断ビルド1.4.4.1(テストバージョン、x.x.x.x形式)
+# 限定で既定Trueにして出荷した。実機ログでlinked_keys/active_keyの
+# match=Trueが確認され、原因は別箇所(watch_subfolder_by_project等の
+# プロジェクト別辞書の記録漏れ、実体はSP側プラグインのバージョン差異)と
+# 判明したため、本来の既定値であるFalseに戻す。
 _DIAG_B2_VERBOSE = False
 
 
@@ -573,7 +590,136 @@ def diag_c1_check_qobject_validity(window):
 #     ラムダ経由でis_new_sceneを明示的に渡す方式に変更した。
 #     重大なバグ修正であり後方互換を維持しているため、SemVerのルールに
 #     従いPATCHを上げる。
-__version__ = "1.3.1"
+#
+# 2026.07.22(表示品質のプロジェクト別管理化):
+#     複数のSPプロジェクトを1つのシーンで扱う運用で、表示品質切替
+#     ボタンがシーン全体で1つのグローバルな品質しか持てず、選択中で
+#     ない作業対象のノードまで巻き込んで切り替わり・再読込されて
+#     しまう不具合を修正した。self.using_final_quality(単一bool)を
+#     self.quality_by_project(project_key単位の辞書)へ置き換え、
+#     switch_texture_quality()/detect_quality_by_project()を含む
+#     関連関数をプロジェクト単位で動作するよう変更した。「▸ プロジェクト
+#     連携」欄に、選択中の作業対象の現在の表示品質を示すラベルを追加した。
+#     既存の設定ファイル・シーン紐付けとの互換性は維持しつつ、既定の
+#     挙動(全体を1つの品質に揃える)が変わる後方互換の機能追加のため、
+#     SemVerのルールに従いMINORを上げる。
+#
+# 2026.07.23(シーン再オープン時のUDIMプレビュー未生成対応):
+#     シーンを閉じて開き直すと、UDIM(複数UVタイル)テクスチャを使っている
+#     オブジェクトが未割り当てのようにグレー表示される不具合を修正した。
+#     原因はViewport 2.0がUDIMのプレビュー画像をシーンを開いた直後には
+#     自動生成しない仕様(_flush_viewport_cache()のコメント参照)である
+#     一方、そのプレビュー再生成(generateAllUvTilePreviews)はこれまで
+#     表示品質切替ボタンを押した時(_flush_with_settle()経由)にしか
+#     呼ばれておらず、シーン読み込みコールバック(_on_scene_changed())側
+#     には対応する処理が無かったこと。_on_scene_changed()内で
+#     generateAllUvTilePreviewsのみを軽量に呼ぶようにした(cmds.ogs(
+#     reset=True)相当の重いキャッシュ全体破棄はシーンを開いた直後には
+#     不要と判断し、あえて呼んでいない)。既存の動作を壊さない不具合
+#     修正のため、SemVerのルールに従いPATCHを上げる。
+#
+# 2026.07.23-02(UDIM対応の再修正: シーン再オープンでも直らない場合が
+# あった件・Reference Editorでの参照読み込みにも対応):
+#     上記のシーン再オープン対応が実機で効果を発揮しない場合があると
+#     再報告された。原因は、kAfterOpen/kAfterNew等のシーンコールバックが
+#     発火する時点ではMayaのシーン読み込み処理自体がまだ完了しきって
+#     いない場合があり、その場でgenerateAllUvTilePreviewsを同期的に
+#     呼んでも効果が無かったため。_on_scene_changed()内の別の警告
+#     ポップアップが既に採用しているQTimer.singleShot(0, ...)による
+#     遅延実行パターンに倣い、UDIMプレビュー再生成を独立した
+#     _regenerate_udim_previews_deferred()へ切り出し、遅延実行に変更した。
+#     あわせて、Reference Editorで別シーンから参照(reference)を持ち込んだ
+#     場合も同じ症状(kAfterOpen/kAfterNewが発火しないため従来は救済
+#     対象外だった)が報告されたため、kAfterCreateReference/
+#     kAfterLoadReferenceからも同じ再生成処理を呼ぶようにした。
+#     既存の動作を壊さない不具合修正のため、SemVerのルールに従い
+#     PATCHを上げる。
+#
+# 2026.07.23-03(緊急修正: generateAllUvTilePreviewsが「プロシージャが
+# 見つかりません」で失敗していた根本原因への対応):
+#     上記07.23-02の対策後もUDIM不具合が直らないと再々報告され、
+#     実機のMaya2027(mayapyバッチセッション)で直接検証した結果、
+#     generateAllUvTilePreviews自体がMEL側で「プロシージャ
+#     "generateAllUvTilePreviews" が見つかりません」というエラーで
+#     失敗していたことを確認した。このprocは
+#     others/generateUvTilePreview.mel で定義されているが、Maya起動直後
+#     や特定のUI操作を経ていないタイミングでは自動ソースされておらず、
+#     従来のコードは呼び出し失敗を例外として握りつぶしログに警告を
+#     出すだけだったため、原因が長らく見えていなかった。
+#     _flush_viewport_cache()と_regenerate_udim_previews_deferred()の
+#     両方で、呼び出し前に明示的に
+#     mel.eval('source "generateUvTilePreview.mel";') を実行するよう
+#     修正し、Mayaの自動ロードタイミングに依存せず確実にproc定義済みの
+#     状態にした(mayapyで単体動作を再現・修正確認済み)。既存の動作を
+#     壊さない不具合修正のため、SemVerのルールに従いPATCHを上げる。
+#
+# 2026.07.23-04(根治修正: 上記3回の対策がいずれも効かなかった真因への
+# 対応): 07.23/-02/-03のUDIM対策後も直らないとの再々報告を受け実機調査
+# した結果、これら3回の対策は全て LiveSyncWindow.__init__() 内でしか
+# 登録されないシーンコールバック(kAfterOpen等)に依存しており、
+# LiveSyncWindow が一度も生成されていなければ丸ごと効かないという
+# 共通の弱点があることが判明した。install.py の既定設定
+# (register_user_setup(auto_open=False))では、userSetup.py は
+# Maya起動時に maya_live_sync をimportするだけでshow_ui()を呼ばない
+# ため、「Mayaを再起動 → LiveSyncパネルを開く前に対象シーンを開く」
+# という通常の操作順序では、最初の kAfterOpen 発火時点でリスナーが
+# 1つも登録されていなかった(uvTileProxyQuality属性のガード条件や
+# SP側・udim_setup.py側は原因ではないことも実機・mayapyで確認済み)。
+# 対策として、UDIMプレビュー再生成の実処理をモジュールレベル関数
+# _regenerate_udim_previews() へ切り出し、LiveSyncWindow の生成有無に
+# 関わらずモジュールimport時点で無条件にシーンコールバックを登録する
+# ようにした(ファイル末尾の登録ブロック参照)。LiveSyncWindow側の
+# 既存登録は冗長になるが実害が無いためそのまま残した。既存の動作を
+# 壊さない不具合修正のため、SemVerのルールに従いPATCHを上げる。
+#
+# 2026.07.24(診断ビルド、1.4.4.1): 「fileノードは実在するのに『見つから
+# ない』とログが出て自動反映が無効化される」という報告を受け、原因切り
+# 分けのためだけの診断ビルド。_DIAG_B2_VERBOSE を既定でTrueにし、
+# _ensure_active_dirs_watched() の不一致判定材料(linked_keys/
+# active_key/一致結果)を毎回ログへ出すようにした。動作自体の変更は
+# 無く、ログ出力を有効化しただけのため、SemVerのバージョン番号は
+# 正式なPATCHではなく4桁目(ビルド識別用サフィックス)を追加するに
+# 留めた。
+#
+# 【新ルール】バージョン表記の桁数について: この診断ビルドを機に、
+# 「テスト/診断目的の暫定ビルドは x.x.x.x(4桁、末尾がビルド識別用
+# サフィックス)」「通常のリリースは x.x.x(3桁、SemVer)」と表記を
+# 使い分けることとした。4桁のバージョンはこのファイル・履歴ログ・
+# エディタのタイトルバー等で一目で「検証用の暫定ビルドである」と
+# 判別できるようにするためのもので、正式リリースにこの形式を使っては
+# ならない。
+#
+# 2026.07.24(恒久修正一式、上記診断ビルドの原因判明後の本対応):
+# 上記診断ビルドのログにより、B-2仮説(シーン⇔SPプロジェクトキーの
+# 大文字小文字/Unicode正規化不足による不一致誤判定)は実機では発生して
+# いないことを確認したため _DIAG_B2_VERBOSE を既定Falseへ戻した。
+# その後、客観的な視点での不具合監査(5並列のコード監査)を実施し、
+# 実際にトレースして再現条件まで特定できた不具合のうち高+中優先度の
+# ものをまとめて修正した。詳細な経緯・個別の判断根拠は各修正箇所の
+# コメントを参照。要旨:
+#   - _migrate_legacy_flat_maps(): 兄弟関数_migrate_legacy_active_
+#     subfolder()と同じ「by_project辞書が空の時のみ移行」ガードを追加し、
+#     再実行のたびに他プロジェクトのデータを誤って上書きしうるバグを修正。
+#   - _normalize_project_key_for_compare(): 大文字小文字・Unicode正規化
+#     (NFC)を追加し、表記ゆれによる誤ったプロジェクト不一致判定を防止。
+#   - _match_known_texture_set_project(): 最長一致方式に変更し、接頭辞が
+#     互いに包含関係にあるプロジェクト同士の誤判定を防止。
+#   - reload_textures()/reload_final_textures(): 古いサブフォルダの
+#     パス補正に実在チェック(UDIM対応)を追加し、存在しないパスへの
+#     誤った書き換えを防止。
+#   - switch_texture_quality(): 一部ノードの切り替えに失敗した場合、
+#     品質フラグを誤って「完了」にしないよう修正。
+#   - show_ui()/_window_instance: shiboken生死判定を追加し、破棄済み
+#     ウィンドウへの無反応呼び出しを解消。reload時にインスタンス単位の
+#     シーンコールバックがリークする不具合も、モジュールレベルの
+#     _EXITING_CALLBACK_IDと同じglobals()保持パターンで修正。
+#   - save_config(): msvcrt.lockingによるOSレベルのファイルロックを
+#     追加し、Maya側・SP側の同時書き込みによるlost updateを防止
+#     (プロセスクラッシュ時もOSが自動的にロックを解放するため、
+#     ロックの固着は発生しない設計であることを実機テストで確認済み)。
+# いずれも既存の動作を壊さない不具合修正のため、SemVerのルールに従い
+# PATCHを上げる。
+__version__ = "1.4.5"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -1009,6 +1155,20 @@ def _migrate_legacy_flat_maps(cfg):
     この関数は破壊的に cfg を書き換えず、移行後のcfgを新たに返す。
     移行が発生した場合は cfg["_migrated_legacy_maps"] = True を立てる
     (呼び出し側が保存要否を判断できるようにするための内部マーカー)。
+
+    2026.07.24(緊急バグ修正): 従来はby_project辞書の中身に関わらず
+    load_config()のたびに無条件で移行を試みていたが、これは
+    _migrate_legacy_active_subfolder()で既に発見・修正済みの
+    バグと同じクラスだった。「1回限りの移行」を意図したコードが
+    毎回実行されるため、レガシーのフラットキー(texture_set_export_
+    prefix等)が(何らかの理由で)残ったままだと、その時点でたまたま
+    アクティブなプロジェクトへ、guessした(不正確な可能性がある)
+    値を毎回上書きし続けてしまう。_migrate_legacy_active_subfolder()
+    と同じ方針(by_project辞書が完全に空の場合、＝まだ一度もこの
+    形式が使われていない真にレガシーな設定ファイルの場合にのみ
+    移行する)に揃え、一度でも実際のexportでby_project辞書に何らかの
+    内容が記録された後は、レガシーのフラットキーを移行元として
+    信頼しないようにした。
     """
     legacy_prefix = cfg.get("texture_set_export_prefix")
     legacy_sg = cfg.get("texture_set_shading_engine_map")
@@ -1030,7 +1190,7 @@ def _migrate_legacy_flat_maps(cfg):
         return active_key
 
     prefix_by_project = dict(cfg.get("texture_set_export_prefix_by_project", {}))
-    if legacy_prefix:
+    if legacy_prefix and not prefix_by_project:
         for name, prefix in legacy_prefix.items():
             key = _guess_project_key(name)
             if not key:
@@ -1040,7 +1200,7 @@ def _migrate_legacy_flat_maps(cfg):
         cfg["texture_set_export_prefix_by_project"] = prefix_by_project
 
     sg_by_project = dict(cfg.get("texture_set_shading_engine_map_by_project", {}))
-    if legacy_sg:
+    if legacy_sg and not sg_by_project:
         for name, sg in legacy_sg.items():
             key = _guess_project_key(name)
             if not key:
@@ -1096,14 +1256,32 @@ def _migrate_legacy_active_subfolder(cfg):
 
     migrated = False
 
+    # 2026.07.23(緊急バグ修正): 従来は「active_key が by_project辞書に
+    # まだ無ければ」を条件に移行していたが、これは「1回限りの移行」を
+    # 意図したコードであるにもかかわらず load_config() のたびに実行される
+    # ため、複数のSPプロジェクトを行き来する運用では、まだ一度も自分自身の
+    # exportを行っていない新しいプロジェクトがアクティブになるたびに、
+    # その時点でたまたま残っていた「直前にアクティブだった別プロジェクト
+    # 由来」のスカラー値を誤って書き込んでしまっていた。
+    # 実機で、"Poker_Table.spp" と "Poker_Table_StandUnder.spp" という
+    # 別々のプロジェクトが、by_project辞書上で全く同じサブフォルダ名を
+    # 指してしまう(後者のexport結果を前者が誤って引き継ぐ)形で
+    # このデータ汚染が確認された。
+    # 本来の「レガシー設定ファイルからの1回限りの移行」という意図に
+    # 忠実に、by_project辞書が完全に空の場合(＝まだ一度もこの形式が
+    # 使われていない、真にレガシーな設定ファイル)にのみ移行するよう
+    # 修正した。一度でも実際のexportでby_project辞書に何らかの内容が
+    # 記録された後は、スカラー値は「直近にどれかのプロジェクトが
+    # exportした一時的な値」でしかなく、任意の別プロジェクトへの
+    # 移行元として信頼できないため。
     watch_by_project = dict(cfg.get("watch_subfolder_by_project", {}))
-    if legacy_watch and active_key not in watch_by_project:
+    if legacy_watch and not watch_by_project:
         watch_by_project[active_key] = legacy_watch
         cfg["watch_subfolder_by_project"] = watch_by_project
         migrated = True
 
     final_by_project = dict(cfg.get("final_subfolder_by_project", {}))
-    if legacy_final and active_key not in final_by_project:
+    if legacy_final and not final_by_project:
         final_by_project[active_key] = legacy_final
         cfg["final_subfolder_by_project"] = final_by_project
         migrated = True
@@ -1143,9 +1321,96 @@ def load_config():
         return dict(DEFAULT_CONFIG)
 
 
-def save_config(cfg):
-    """設定を保存する(監視の再起動は行わない、副作用の無いバージョン)。"""
+# ---------------------------------------------------------------------------
+# 2026.07.24: 設定ファイルの同時書き込み競合対策(ファイルロック)
+# ---------------------------------------------------------------------------
+#
+# 背景: save_config() は「ディスク上の最新内容を読み込む -> 呼び出し元の
+# 変更をマージ -> 一時ファイル経由で書き戻す」という読み取り〜書き込み
+# 区間を持つが、この区間自体はロックされていなかった。Maya側・SP側
+# (別プロセス)がほぼ同時にこの区間を実行すると、後から書き込んだ側が
+# 「自分が読んだ後に相手が書いた差分」を認識できず、その差分を丸ごと
+# 巻き戻してしまう(lost update)。実機で、watch_subfolder_by_project
+# 辞書のエントリが片方の保存で消えるという形でこの実害を確認している。
+#
+# 対策方針: 専用のロックファイル(CONFIG_PATH + ".lock")に対して
+# msvcrt.locking() でOSレベルの排他ロックを取得し、この区間全体を
+# 挟む。これは「ロックファイルが存在するかどうか」を自前でチェックする
+# 素朴な実装(セッションロックで使っている方式)とは異なり、開いた
+# ファイルディスクリプタに対するOS自体のロックのため、ロック保持中に
+# プロセスがクラッシュしてもOSがプロセス終了時に自動的に解放する
+# (スタックしたロックが残り続けて以後の保存が全て止まる、という
+# 事態が起こらない)。
+# ロック取得はノンブロッキング(LK_NBLCK)でポーリングしつつ、
+# タイムアウト(既定3秒)を設ける。相手側がロックを長時間離さない
+# 異常事態でもMaya/SPのUIスレッドを無期限にブロックしないためで、
+# タイムアウトした場合は _ConfigLockTimeout を送出し、呼び出し元
+# (save_config())が「ロック無しで今回の保存だけ進める」フォールバックを
+# 選べるようにする。
+CONFIG_LOCK_PATH = CONFIG_PATH + ".lock"
+_CONFIG_LOCK_TIMEOUT_SECONDS = 3.0
+_CONFIG_LOCK_POLL_INTERVAL_SECONDS = 0.05
+
+
+class _ConfigLockTimeout(Exception):
+    """設定ファイルロックの取得がタイムアウトした場合に送出する。"""
+    pass
+
+
+@contextlib.contextmanager
+def _config_file_lock():
+    """live_sync_config.json の読み取り〜書き込み区間を、Maya側・SP側
+    双方から排他制御するためのコンテキストマネージャ。sp_live_sync_
+    plugin.py側にも同名の仕組みを独立実装しており、ロックファイルの
+    パス・タイムアウト値を完全に一致させている(共有モジュールが無い
+    構成のため、ロジック自体はやむを得ず重複実装)。
+    """
+    if msvcrt is None:
+        # importに失敗する環境(Windows専用設計のため通常は起こらない)
+        # では排他制御自体を諦め、従来通りロック無しで進める。
+        yield
+        return
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    lock_file = open(CONFIG_LOCK_PATH, "a+b")
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            # msvcrt.locking() がロックするバイト範囲を確保するため、
+            # 空ファイルの場合は1バイトだけ書いておく。
+            lock_file.write(b"0")
+            lock_file.flush()
+        deadline = time.time() + _CONFIG_LOCK_TIMEOUT_SECONDS
+        locked = False
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(_CONFIG_LOCK_POLL_INTERVAL_SECONDS)
+        if not locked:
+            raise _ConfigLockTimeout(
+                "設定ファイルロックの取得がタイムアウトしました: {0}".format(CONFIG_LOCK_PATH))
+        try:
+            yield
+        finally:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+    finally:
+        lock_file.close()
+
+
+def _merge_and_write_config(cfg):
+    """ディスク上の最新内容を読み込んでcfgをマージし、一時ファイル経由で
+    原子的に書き戻す(save_config()の実処理本体、ロック取得の成否に
+    関わらず共通で使う)。
+    """
     merged = {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -1160,6 +1425,21 @@ def save_config(cfg):
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, CONFIG_PATH)
+
+
+def save_config(cfg):
+    """設定を保存する(監視の再起動は行わない、副作用の無いバージョン)。"""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with _config_file_lock():
+            _merge_and_write_config(cfg)
+    except _ConfigLockTimeout as e:
+        # 2026.07.24: ロックが取得できなかった場合、UIスレッドを止めない
+        # ことを優先し、ロック無し(従来の挙動)で今回の保存を進める。
+        # 呼び出し元は変更したキーだけを渡す設計のため、1回このフォール
+        # バックを踏んでも実害は小さい。
+        print("[maya_live_sync] {0} ロック無しで保存を続行します。".format(e))
+        _merge_and_write_config(cfg)
 
 
 def _all_known_texture_sets(cfg):
@@ -1258,10 +1538,28 @@ def _normalize_project_key_for_compare(key):
     正規化した文字列を使うようにし、危険な unicode_escape 変換自体を
     撤去した。SP側から来る active_project_key(正規化していない生の
     パス)と比較する際も、必ずこの関数を通してから比較する。
+
+    2026.07.24(見落とし修正): スラッシュ区切りの統一しか行っておらず、
+    (1) Windowsのドライブレター・パスは大文字小文字を区別しないにも
+    かかわらず文字列としては区別してしまう、(2) 日本語パスがNFC/NFD
+    いずれの正規化形式で渡ってくるかはOS・入力元次第で保証が無く、
+    見た目は同じでも文字列としては不一致になりうる、という2点を
+    吸収できていなかった。実機で「シーンに紐付いたSPプロジェクトと
+    SP側が今開いているプロジェクトが一致しない」という誤判定・
+    「fileノードは実在するのに監視対象から漏れる」という誤判定の
+    両方が、この正規化不足に起因する可能性がある(表記ゆれにより
+    本来同一のプロジェクトキーが別物として比較されるため)。
+    この関数の戻り値は比較専用(辞書のキーとして一時的に組み直す
+    用途を含む)であり、共有設定ファイル上の生のキー自体を書き換える
+    ものではないため、Unicode正規化(NFC)と大文字小文字の統一
+    (casefold)をここに追加しても、呼び出し元が既に両辺をこの関数
+    経由で比較している限り安全(ディスク上のキー形式には影響しない)。
     """
     if not key:
         return key
-    return key.replace("\\", "/")
+    normalized = key.replace("\\", "/")
+    normalized = unicodedata.normalize("NFC", normalized)
+    return normalized.casefold()
 
 
 def _generate_link_id():
@@ -1825,7 +2123,17 @@ class LiveSyncWatcher(QtCore.QObject):
         # Phase 6: 現在file ノードがプレビュー(監視フォルダ)と高画質版
         # (Finalフォルダ)のどちらを参照しているか。自動切り替えは行わず、
         # switch_texture_quality() の明示的な呼び出しでのみ変化する。
-        self.using_final_quality = False
+        #
+        # 2026.07.22(表示品質のプロジェクト別管理化): 従来は単一のboolで
+        # シーン全体の品質を1つに揃える仕様だったが、複数のSPプロジェクトを
+        # 1つのシーンで扱う運用(天板/脚など)では、無関係なプロジェクトの
+        # ノードまで毎回一緒に切り替わり・再読込されてしまう不具合の
+        # 原因になっていた。正規化済みproject_key(scene linksが1件も
+        # 無いレガシー運用ではNone)をキーにした辞書へ変更し、
+        # プロジェクトごとに独立して品質を保持できるようにした。
+        # 未登録のプロジェクトはPreview(False)扱いとみなす
+        # (quality_for_project() 参照)。
+        self.quality_by_project = {}
 
         self.stats = {
             "reload_count": 0,
@@ -2436,10 +2744,24 @@ class LiveSyncWatcher(QtCore.QObject):
         if watch_reload_needed:
             self.reload_textures()
 
-        # Finalフォルダ側の完了flag。表示品質がFinalの間のみ、
-        # 該当ノードを強制再読込する(プレビュー表示中はFinalの
-        # 更新を反映する必要が無いため何もしない)。
-        final_reload_needed = False
+        # Finalフォルダ側の完了flag。表示品質がFinalになっているプロジェクト
+        # の分だけ、該当ノードを強制再読込する(プレビュー表示中の
+        # プロジェクトについては、Finalの更新を反映する必要が無いため
+        # 何もしない)。
+        #
+        # 2026.07.22(表示品質のプロジェクト別管理化): 従来はシーン全体で
+        # 1つの self.using_final_quality だけを見ていたため、あるプロジェクト
+        # がFinal表示中に別プロジェクトのFinalが更新されると、Preview表示の
+        # ままの他プロジェクトまで巻き込んで再読込されてしまっていた。
+        # フォルダ→project_keyの逆引きを作り、更新があった各フォルダについて
+        # 「そのフォルダの持ち主のプロジェクトが今Final表示かどうか」を
+        # 個別に判定するよう変更した。
+        final_by_project_normalized = self._final_subfolder_by_project_normalized()
+        final_dir_to_project = {
+            os.path.normpath(os.path.join(final_root_fallback, subfolder)): key
+            for key, subfolder in final_by_project_normalized.items()
+        }
+        final_reload_dirs = set()
         for final_dir in final_dirs:
             final_flag = os.path.join(final_dir, "_sync_complete.flag")
             if not os.path.isfile(final_flag):
@@ -2450,9 +2772,11 @@ class LiveSyncWatcher(QtCore.QObject):
                 continue
             if mtime > self._flag_mtimes_final.get(final_dir, 0.0):
                 self._flag_mtimes_final[final_dir] = mtime
-                final_reload_needed = True
-        if final_reload_needed and self.using_final_quality:
-            self.reload_final_textures()
+                project_key = final_dir_to_project.get(final_dir)
+                if self.quality_for_project(project_key):
+                    final_reload_dirs.add(final_dir)
+        if final_reload_dirs:
+            self.reload_final_textures(only_dirs=final_reload_dirs)
 
     # -- 再読込処理 ---------------------------------------------------------
 
@@ -2580,10 +2904,25 @@ class LiveSyncWatcher(QtCore.QObject):
                     subfolder = watch_by_project_normalized.get(matched_key) if matched_key else None
                     if not subfolder:
                         continue
+                    base = os.path.basename(tex_path)
                     new_path = os.path.join(
                         os.path.normpath(os.path.join(watch_root, subfolder)),
-                        os.path.basename(tex_path),
+                        base,
                     )
+                    # 2026.07.24(緊急バグ修正): switch_texture_quality()には
+                    # 補正先ファイルの実在チェックがあるのに、この補正処理
+                    # には無く、実在しないパスへも無条件でsetAttrしていた。
+                    # switch_texture_quality()と同じ、<UDIM>トークンを含む
+                    # 場合はグロブで少なくとも1タイルの実在を確認するチェックを
+                    # 移植する。実在しない場合は補正せず(誤ったパスへ書き換え
+                    # ない)、そのノードは今回のreload対象から外す
+                    # (「見つからない」旨は既存のログにまとめて計上される)。
+                    if "<UDIM>" in base:
+                        udim_glob = new_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
+                        if not glob.glob(udim_glob):
+                            continue
+                    elif not os.path.isfile(new_path):
+                        continue
                     tex_path = new_path
                     corrected.append(node)
                 else:
@@ -2616,21 +2955,34 @@ class LiveSyncWatcher(QtCore.QObject):
                 self.stats["last_node_count"] = len(reloaded)
                 self.stats_changed.emit(dict(self.stats))
                 self._emit_status("{0} 個のテクスチャを再読込しました。".format(len(reloaded)))
-            elif not self.using_final_quality:
-                # Phase 6: 高画質表示中は file ノードが監視フォルダを
-                # 参照していないのが正常な状態のため、この場合は
-                # 「見つからない」という誤解を招くログを出さない。
+            elif not any(self.quality_by_project.values()):
+                # Phase 6: 高画質表示中のプロジェクトがある場合、そのぶんの
+                # file ノードは監視フォルダを参照していないのが正常な状態
+                # なので、この場合は「見つからない」という誤解を招くログを
+                # 出さない。2026.07.22(表示品質のプロジェクト別管理化):
+                # 品質はプロジェクトごとに独立して持つようになったため、
+                # 「シーン内のどれか1つでもFinal表示中のプロジェクトが
+                # あるか」を緩い近似として使う(全プロジェクトがPreviewの
+                # 時だけこのログを出す)。
                 self._emit_status("監視フォルダを参照する file ノードが見つかりませんでした。")
         finally:
             cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
-    def reload_final_textures(self):
+    def reload_final_textures(self, only_dirs=None):
         """Finalフォルダ配下のfileノードを強制再読込する
         (reload_textures()のFinal版)。表示品質をFinalにしたまま
         SP側で保存・高画質書き出しが行われても、Live⇔Finalを
         往復切り替えしなくても自動的に反映されるようにするためのもの。
-        呼び出し元(_process_pending_changes)でusing_final_qualityが
-        True の場合のみ呼ばれる想定。
+
+        only_dirs: 2026.07.22(表示品質のプロジェクト別管理化)で追加。
+        指定した場合、実際に再読込の対象にするフォルダをこの集合との
+        積集合に絞り込む(古いサブフォルダの検出・補正自体は従来通り
+        final_root全体を対象に行うが、実際に強制再読込するのは
+        呼び出し元が「今Final表示中」と判断したプロジェクトのフォルダ
+        だけにする)。呼び出し元(_process_pending_changes)は、
+        quality_for_project() がTrueのプロジェクトのフォルダだけを
+        渡す。Noneの場合は全フォルダを対象にする(手動呼び出し用、
+        後方互換)。
 
         複数プロジェクト対応: 「Finalフォルダ」は final_export_dir 直下
         ではなく、現在アクティブなプロジェクトのサブフォルダ
@@ -2662,16 +3014,27 @@ class LiveSyncWatcher(QtCore.QObject):
         """
         final_root = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         active_final_dirs = self._active_final_dirs()
-        final_dirs = {os.path.normpath(d) for d in active_final_dirs}
-        if not final_dirs:
-            final_dirs = {final_root}
+        all_final_dirs = {os.path.normpath(d) for d in active_final_dirs}
+        if not all_final_dirs:
+            all_final_dirs = {final_root}
+
+        # 2026.07.22: 古いサブフォルダの検出("stale"判定)は、必ず
+        # all_final_dirs(このシーンに紐付いた全プロジェクト分)を基準に
+        # 行う。only_dirsで絞り込んだ後の集合を基準にしてしまうと、
+        # 「今回はFinal表示ではないため対象外にしただけ」の別プロジェクトの
+        # 正当なフォルダまで「古い」と誤判定し、無関係な補正が走ってしまう。
+        final_dirs = all_final_dirs
+        if only_dirs is not None:
+            final_dirs = all_final_dirs & {os.path.normpath(d) for d in only_dirs}
+            if not final_dirs:
+                return
 
         stale_subfolder_dirs = set()
         try:
             if os.path.isdir(final_root):
                 for entry in os.listdir(final_root):
                     candidate = os.path.normpath(os.path.join(final_root, entry))
-                    if os.path.isdir(candidate) and candidate not in final_dirs:
+                    if os.path.isdir(candidate) and candidate not in all_final_dirs:
                         stale_subfolder_dirs.add(candidate)
         except OSError:
             pass
@@ -2711,10 +3074,20 @@ class LiveSyncWatcher(QtCore.QObject):
                     subfolder = final_by_project_normalized.get(matched_key) if matched_key else None
                     if not subfolder:
                         continue
+                    base = os.path.basename(tex_path)
                     new_path = os.path.join(
                         os.path.normpath(os.path.join(final_root, subfolder)),
-                        os.path.basename(tex_path),
+                        base,
                     )
+                    # 2026.07.24(緊急バグ修正): reload_textures()と同じ理由
+                    # で、補正先ファイルの実在チェック(switch_texture_
+                    # quality()と同じ<UDIM>グロブ対応)を追加する。
+                    if "<UDIM>" in base:
+                        udim_glob = new_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
+                        if not glob.glob(udim_glob):
+                            continue
+                    elif not os.path.isfile(new_path):
+                        continue
                     tex_path = new_path
                     corrected.append(node)
                 else:
@@ -2839,8 +3212,21 @@ class LiveSyncWatcher(QtCore.QObject):
         # generateAllUvTilePreviews は上記プレビュー生成をスクリプトから
         # 明示的に行うMELコマンド。ここで毎回呼んでおくことで、選択操作を
         # 挟まなくてもビューポート表示が正しく更新されるようにする。
+        #
+        # 2026.07.23-03(緊急修正): generateAllUvTilePreviews は
+        # Maya本体の others/generateUvTilePreview.mel で定義されている
+        # グローバルprocだが、この定義ファイルはMaya起動直後や、UI操作を
+        # 何も経由していないタイミングでは自動ソースされておらず、
+        # 「プロシージャ "generateAllUvTilePreviews" が見つかりません」と
+        # いうMELエラーで失敗することが実機(mayapy バッチセッション)で
+        # 確認された。従来はこの呼び出しが例外を握りつぶしてログに警告を
+        # 出すだけだったため、失敗に気付きにくかった。呼び出し前に明示的に
+        # 定義元のMELファイルをsourceすることで、Maya側の自動ロード
+        # タイミングに依存せず確実にprocが定義された状態にする
+        # (source自体は既にロード済みでも安全に再実行できる)。
         try:
             import maya.mel as mel
+            mel.eval('source "generateUvTilePreview.mel";')
             mel.eval("generateAllUvTilePreviews;")
         except Exception as e:
             self._emit_status("UVタイルプレビューの再生成に失敗: {0}".format(e))
@@ -3055,13 +3441,37 @@ class LiveSyncWatcher(QtCore.QObject):
         (2026.07.21のPhase 1改修で)辞書側のキーを都度正規化してから
         引くようになったため、ここでは正規化済みキーをそのまま渡せば
         よい(自前での正規化辞書構築は不要になった)。
+
+        2026.07.24(緊急バグ修正・接頭辞衝突): 従来は最初にマッチした
+        候補を無条件で返していたが、あるプロジェクトの書き出し
+        接頭辞(prefix)が別プロジェクトの接頭辞の先頭部分と一致する
+        場合(例: "table" と "table_legs")、"table_legs_BaseColor.png"
+        のようなファイルが detailed の走査順で先に来た "table" 側に
+        誤って一致してしまう不具合があった。全候補を走査し、一致した
+        中で最も長い(＝最も具体的な)prefixを持つプロジェクトを採用
+        するよう修正した。同じ長さのprefixが異なるプロジェクトから
+        複数一致した場合は、どちらを選ぶべきか一意に決められないため、
+        誤って別プロジェクトへ補正してしまうより安全側に倒してNoneを
+        返す(=呼び出し元は「一致しない」扱いとして何もしない)。
         """
         detailed = self.get_known_texture_sets_detailed()
+        best_prefix_len = -1
+        best_project_key = None
+        ambiguous = False
         for name, project_key, _display_name in detailed:
             prefix = _export_prefix(self.config, name, project_key=project_key)
-            if filename.startswith(prefix + "_"):
-                return project_key
-        return None
+            if not filename.startswith(prefix + "_"):
+                continue
+            prefix_len = len(prefix)
+            if prefix_len > best_prefix_len:
+                best_prefix_len = prefix_len
+                best_project_key = project_key
+                ambiguous = False
+            elif prefix_len == best_prefix_len and project_key != best_project_key:
+                ambiguous = True
+        if ambiguous:
+            return None
+        return best_project_key
 
     def _managed_dirs(self):
         """ライブ同期パイプラインが把握しているフォルダ(監視用の
@@ -3150,6 +3560,45 @@ class LiveSyncWatcher(QtCore.QObject):
         """
         by_project = self.config.get("final_subfolder_by_project", {}) or {}
         return by_project.get(raw_project_key)
+
+    def _watch_dir_for_project(self, project_key):
+        """指定した1つのSPプロジェクト(未正規化・正規化済みいずれのキーでも
+        可、Noneも可)のLive/Preview書き出し先の実パスを返す。
+
+        2026.07.22(表示品質のプロジェクト別管理化)で新設。
+        _active_watch_dir()(単数形、「今SP側が開いているプロジェクト」
+        固定)と異なり、任意のプロジェクトを明示的に指定できる。
+        create_shader_network() と同じ方針で、そのプロジェクトがまだ
+        プレビュー書き出しの実績が無い(サブフォルダ未登録)場合は
+        watch_dir 直下へフォールバックする(_active_watch_dirs()複数形の
+        ように「未登録なら追跡対象から外す」設計とは意図的に違う。
+        単一プロジェクトを明示的に対象にするこの関数では、フォールバック
+        先が無いよりは watch_dir 直下を暫定候補として返す方が親切なため)。
+        """
+        watch_dir = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
+        normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
+        subfolder = self._watch_subfolder_by_project_normalized().get(normalized_key) if normalized_key else None
+        return os.path.normpath(os.path.join(watch_dir, subfolder)) if subfolder else watch_dir
+
+    def _final_dir_for_project(self, project_key):
+        """_watch_dir_for_project() のFinal版。"""
+        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+        normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
+        subfolder = self._final_subfolder_by_project_normalized().get(normalized_key) if normalized_key else None
+        return os.path.normpath(os.path.join(final_dir, subfolder)) if subfolder else final_dir
+
+    def quality_for_project(self, project_key):
+        """指定したSPプロジェクトの現在の表示品質を返す
+        (True=高画質/Final、False=プレビュー)。
+
+        2026.07.22(表示品質のプロジェクト別管理化)で新設。
+        quality_by_project に未登録のプロジェクト(まだ一度も
+        switch_texture_quality()で明示的に切り替えていない)はプレビュー
+        (False)扱いとみなす。project_keyがNone(scene linksが1件も無い
+        レガシー運用)の場合は、専用のNoneキーに保存された値を返す。
+        """
+        normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
+        return self.quality_by_project.get(normalized_key, False)
 
     def _linked_sp_project_keys(self):
         """現在のシーンに紐付けられた全linkのsp_project_key(正規化済み、
@@ -3351,81 +3800,76 @@ class LiveSyncWatcher(QtCore.QObject):
                 orphans.append(node)
         return orphans
 
-    def detect_current_quality(self):
+    def detect_quality_by_project(self):
         """シーン内のfileノードが実際に監視フォルダ(プレビュー)と
-        Finalフォルダのどちらを参照しているかを調べる。
+        Finalフォルダのどちらを参照しているかを、このシーンに紐付いた
+        プロジェクトごとに調べる。
         Maya再起動をまたぐとGUIの表示品質ボタンは初期化されるが、
         fileノードのパス自体はシーンファイルに保存されたまま残るため、
         起動直後にここで実態を検出し、ボタンの見た目を合わせることで
         「ボタンはプレビュー表示なのに実際はFinalのまま切り替えられない」
         というズレを防ぐ。
-        戻り値: Finalのみを参照していればTrue、監視フォルダのみを参照
-        していればFalse、fileノードが無い/両方混在している等で判別
-        できない場合はNone。
 
-        複数プロジェクト対応: Finalは final_export_dir 直下だけでなく
-        現在アクティブなプロジェクトのサブフォルダ(_active_final_dir())
-        にも書き出される。直下しか見ないと、サブフォルダを参照している
-        (=switch_texture_qualityで正しく用いた)ノードが「Finalではない」
-        と誤判定され、Maya再起動後にボタンの見た目がプレビューに戻って
-        しまう。両方を「Final」として扱う。
-        2026.07.14-02: 所有権問題回避のため、Live/Preview側も同様に
-        <watch_dir>/<active_watch_subfolder>/ へ書き出されるようになった
-        ため、Watch側も直下+アクティブサブフォルダの両方を対象にする。
+        2026.07.22(表示品質のプロジェクト別管理化): 従来の
+        detect_current_quality()(シーン全体で1つの判定結果しか返せず、
+        「全体を1つの品質に揃える」という旧仕様を前提にしていた)を、
+        プロジェクトごとの辞書を返す形に置き換えた。
 
-        2026.07.21(Phase 1, 複数プロジェクト並行対応の根治): 単数形の
-        _active_final_dir()/_active_watch_dir()(代表1件のみ)から、
-        複数形の _active_final_dirs()/_active_watch_dirs()(このシーンに
-        紐付いた全プロジェクト分の集合)へ差し替えた。この関数は判定のみ
-        (書き込みを伴わない)ため、switch_texture_quality()と異なり
-        複数プロジェクト対応しても既存の「全体を1つの品質に揃える」
-        仕様と衝突しない。
+        戻り値: {project_key(正規化済み、scene linksが無ければNone):
+        True(Finalのみ参照)/False(Previewのみ参照)} の辞書。
+        fileノードが無い/両方混在している等で判別できないプロジェクトは
+        キー自体を含めない(既定のPreview扱いのまま据え置く)。
         """
-        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
-        final_dirs = {final_dir} | {os.path.normpath(d) for d in self._active_final_dirs()}
-        watch_dir = os.path.normpath(self.config.get("watch_dir") or "")
-        watch_dirs = ({watch_dir} if watch_dir else set()) | {os.path.normpath(d) for d in self._active_watch_dirs()}
-        found_final = False
-        found_watch = False
-        for node in cmds.ls(type="file") or []:
+        linked_keys = self._linked_sp_project_keys()
+        keys_to_check = linked_keys if linked_keys else [None]
+
+        file_nodes = cmds.ls(type="file") or []
+        node_dirs = []
+        for node in file_nodes:
             try:
                 tex_path = cmds.getAttr(node + ".fileTextureName")
             except Exception:
                 continue
             if not tex_path:
                 continue
-            d = os.path.normpath(os.path.dirname(tex_path))
-            if d in final_dirs:
-                found_final = True
-            elif d in watch_dirs:
-                found_watch = True
-        if found_final and not found_watch:
-            return True
-        if found_watch and not found_final:
-            return False
-        return None
+            node_dirs.append(os.path.normpath(os.path.dirname(tex_path)))
 
-    def switch_texture_quality(self, use_final):
+        result = {}
+        for key in keys_to_check:
+            final_dir = self._final_dir_for_project(key)
+            watch_dir = self._watch_dir_for_project(key)
+            found_final = any(d == final_dir for d in node_dirs)
+            found_watch = any(d == watch_dir for d in node_dirs)
+            if found_final and not found_watch:
+                result[key] = True
+            elif found_watch and not found_final:
+                result[key] = False
+        return result
+
+    def switch_texture_quality(self, use_final, project_key=None):
         """file ノードを監視フォルダ(プレビュー)⇔Finalフォルダ(高画質)の
         間で明示的に切り替える。両フォルダで書き出しファイル名
         (prefix_suffix.ext)は共通のため、フォルダ部分だけを付け替える。
         自動切り替えは行わない(切り替わったタイミングが分かりにくく
         なることを避けるため、常にGUIのボタン操作からのみ呼び出される)。
 
-        複数プロジェクト対応: 「Final」は final_export_dir 直下ではなく
-        現在アクティブなプロジェクトのサブフォルダ(_active_final_dir())を
-        指す。旧バージョンで final_export_dir 直下に書き出されたノードや、
-        別プロジェクトのサブフォルダを参照したままのノードも、切り替え
-        対象として拾えるよう managed_dirs には両方を含める。
-        2026.07.14-02: 「プレビュー」側も同様に、固定の watch_dir 直下
-        ではなく現在アクティブなプロジェクトのサブフォルダ
-        (_active_watch_dir())を指すようにした。共有PC環境で、watch_dir
-        直下に過去の別Windowsユーザーが残したファイルが混在していると、
-        NTFSの所有権(ACL)により別ユーザーからは読めず
-        (PermissionError)、プレビューへ切り替えてもテクスチャが
-        表示されない不具合として実機で確認された。切り替え先を必ず
-        「自分が今回新規作成したサブフォルダ」にすることで、この種の
-        所有権衝突を回避する。
+        project_key: 2026.07.22(表示品質のプロジェクト別管理化)で追加。
+        切り替え対象のSPプロジェクトを明示する。呼び出し元
+        (LiveSyncWindow._on_quality_toggled)は、状態バーで選択中の
+        作業対象(active_link_id)のsp_project_keyを渡す。
+
+        背景: 従来はシーン全体で1つの品質に揃える仕様で、切り替え先の
+        判定にも「今SP側で開いているプロジェクト」という単一の
+        グローバルな値(_active_watch_dir()/_active_final_dir())を
+        使っていた。複数のSPプロジェクトを1つのシーンで扱う運用
+        (天板/脚など)では、この値がMaya側でユーザーが選んでいる
+        「作業対象」と一致するとは限らず、意図しない(選んでいない)
+        プロジェクトのノードまで一緒に切り替わり・再読込されてしまう
+        不具合の原因になっていた。project_keyを必須相当の引数にし、
+        指定した1プロジェクト分のノードだけを対象にするよう変更した。
+        project_keyを省略した場合(シーンにscene linksが1件も無い、
+        従来通りの単一プロジェクト運用)は、後方互換のため旧来の
+        「今SP側で開いているプロジェクト」基準にフォールバックする。
 
         戻り値: 実際に切り替えたノード数。
         """
@@ -3436,22 +3880,33 @@ class LiveSyncWatcher(QtCore.QObject):
         # 最大3秒のズレが生じうるため)。
         self._refresh_dynamic_config()
 
-        watch_dir = os.path.normpath(self.config["watch_dir"])
-        active_watch_dir = self._active_watch_dir()
-        active_watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else watch_dir
-        final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
-        active_final_dir = self._active_final_dir()
-        active_final_dir = os.path.normpath(active_final_dir) if active_final_dir else final_dir
-        dest_dir = active_final_dir if use_final else active_watch_dir
-        managed_dirs = {watch_dir, active_watch_dir, final_dir, active_final_dir}
+        linked_keys = self._linked_sp_project_keys()
+        if project_key is None and not linked_keys:
+            # 後方互換: scene linksが1件も無い(従来通りの単一プロジェクト
+            # 運用)場合は、旧来通り「今SP側で開いているプロジェクト」を
+            # 対象にする。managed_dirsにwatch_dir/final_dir直下も含めるのは、
+            # 旧バージョンでfinal_export_dir/watch_dir直下に書き出された
+            # ノードを救済するため(この運用ではプロジェクトが実質1つしか
+            # 無いため、直下フォルダを共有しても他プロジェクトとの混線は
+            # 起こらない)。
+            watch_dir = os.path.normpath(self.config["watch_dir"])
+            active_watch_dir = self._active_watch_dir()
+            active_watch_dir = os.path.normpath(active_watch_dir) if active_watch_dir else watch_dir
+            final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
+            active_final_dir = self._active_final_dir()
+            active_final_dir = os.path.normpath(active_final_dir) if active_final_dir else final_dir
+            dest_dir = active_final_dir if use_final else active_watch_dir
+            managed_dirs = {watch_dir, active_watch_dir, final_dir, active_final_dir}
+        else:
+            # 複数プロジェクト運用: 指定された1プロジェクトのフォルダ
+            # だけをmanaged_dirsに含める。他プロジェクトのフォルダを
+            # 意図的に含めないことで、無関係なノードが巻き込まれる
+            # (今回修正した)不具合を防ぐ。
+            watch_dir_for_this = self._watch_dir_for_project(project_key)
+            final_dir_for_this = self._final_dir_for_project(project_key)
+            dest_dir = final_dir_for_this if use_final else watch_dir_for_this
+            managed_dirs = {watch_dir_for_this, final_dir_for_this}
 
-        # Phase 6不具合修正: 以前はボタンの状態から推測した「切り替え元」
-        # フォルダのノードだけを対象にしていたが、Maya再起動でボタンの
-        # 見た目は初期化されてもシーン内のfileノードのパスはそのまま
-        # 保存されているため、両者がズレて一切切り替えられなくなる
-        # 不具合があった。監視フォルダ・Finalフォルダ(直下・アクティブ
-        # サブフォルダの両方)のどれかを参照しているノードも対象に含め、
-        # 常に希望の状態(dest_dir)へ収束させる。
         nodes = []
         for node in cmds.ls(type="file") or []:
             try:
@@ -3461,10 +3916,38 @@ class LiveSyncWatcher(QtCore.QObject):
             if tex_path and os.path.normpath(os.path.dirname(tex_path)) in managed_dirs:
                 nodes.append(node)
 
+        # 2026.07.23(緊急バグ修正): watch_subfolder_by_project/
+        # final_subfolder_by_project の記録内容が(_migrate_legacy_
+        # active_subfolder()の過去のバグ等により)不正確な場合、上記の
+        # フォルダ一致判定だけでは対象のノードを1件も拾えないことが
+        # 実機で確認された。reload_textures()/reload_final_textures()の
+        # 「古いサブフォルダ補正」と同じ安全策として、フォルダ一致で
+        # 何も見つからなかった場合に限り、このシーンに紐付いた全プロ
+        # ジェクトの監視対象フォルダ(_managed_dirs())の中から、ファイル名
+        # のprefixが指定プロジェクトの既知テクスチャセットと一致する
+        # ノードを拾う経路を追加した。フォルダの記録内容がどうであれ、
+        # 「このファイル名は間違いなくこのプロジェクトが書き出した
+        # ものだ」という、より確実な手がかりで対象を特定できる。
+        if not nodes and project_key is not None:
+            normalized_target = _normalize_project_key_for_compare(project_key)
+            managed_dirs_all = self._managed_dirs()
+            for node in cmds.ls(type="file") or []:
+                try:
+                    tex_path = cmds.getAttr(node + ".fileTextureName")
+                except Exception:
+                    continue
+                if not tex_path:
+                    continue
+                if os.path.normpath(os.path.dirname(tex_path)) not in managed_dirs_all:
+                    continue
+                if self._match_known_texture_set_project(os.path.basename(tex_path)) == normalized_target:
+                    nodes.append(node)
+
         if not nodes:
             self._emit_status(
                 "切り替え対象の file ノードが見つかりませんでした"
-                "(監視フォルダ・Finalフォルダのいずれを参照しているノードもありません)。"
+                "(選択中の作業対象が参照している監視フォルダ・Finalフォルダの"
+                "いずれのノードもありません)。"
             )
             return 0
 
@@ -3513,7 +3996,18 @@ class LiveSyncWatcher(QtCore.QObject):
 
         if switched or already:
             self._flush_with_settle(switched)
-            self.using_final_quality = use_final
+            normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
+            # 2026.07.24(緊急バグ修正): missingが1件でもある(＝切り替え先の
+            # 画像が無く一部ノードが旧品質のまま据え置かれた)場合にも
+            # quality_by_project へ無条件でuse_finalを立てていたため、
+            # UIの品質ボタン/ラベルが「全てFinalに切り替わった」かのように
+            # 誤表示していた。missingが無い(=全対象ノードが実際に目的の
+            # 品質へ切り替わった、または既にその品質だった)場合のみ
+            # フラグを更新する。部分的な失敗はこの下の missing ブロックの
+            # ログでユーザーに伝わるため、フラグ自体は直前の状態を維持する
+            # (実態より「進んでいる」と偽るより、更新を保留する方が安全)。
+            if not missing:
+                self.quality_by_project[normalized_key] = use_final
             label = "高画質版(Final)" if use_final else "リアルタイムプレビュー"
             if switched and already:
                 self._emit_status(
@@ -3892,7 +4386,32 @@ class SetupWizard(QtWidgets.QWizard):
 
 # ユーザーセットアップ/shelfボタンから呼ばれる、
 # ウィンドウのシングルトンインスタンス。
-_window_instance = None
+#
+# 2026.07.24(緊急バグ修正・reload時のコールバックリーク): 従来はここで
+# 無条件に _window_instance = None としており、reload(maya_live_sync)を
+# 実行してから show_ui() を呼ぶと、直前まで生きていた旧インスタンスへの
+# 参照が closeEvent() を一切経由せずに破棄されていた。closeEvent() は
+# self._scene_callback_ids に登録されたシーンコールバック
+# (kAfterOpen/kAfterNew等)を解除する役目を持つため、この経路では
+# 解除されないまま新しいインスタンスが作られ、reload+show_ui()を
+# 繰り返すたびにコールバック登録が際限なく蓄積していた(ファイル末尾の
+# _EXITING_CALLBACK_ID/_UDIM_SCENE_CALLBACK_IDS で既に対策済みの
+# 「reloadのたびに重複登録される」バグと同じクラス)。
+# それらと同じ、globals()経由でreloadをまたいで前回のインスタンスを
+# 引き継ぐパターンを踏襲し、まだ有効な(_shiboken_is_validでtrueな)
+# 旧インスタンスがあれば、破棄前にそのシーンコールバックを解除する。
+_window_instance = globals().get("_window_instance", None)
+if _window_instance is not None:
+    try:
+        if _shiboken_is_valid(_window_instance):
+            for _cb_id in getattr(_window_instance, "_scene_callback_ids", []):
+                try:
+                    om.MMessage.removeCallback(_cb_id)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    _window_instance = None
 
 
 class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
@@ -4072,6 +4591,20 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.scene_link_combo.currentIndexChanged.connect(self._on_scene_link_combo_changed)
         scene_link_switch_row.addWidget(switch_label)
         scene_link_switch_row.addWidget(combo_frame, stretch=1)
+
+        # 2026.07.22(表示品質のプロジェクト別管理化): 表示品質(Preview/Final)
+        # がプロジェクトごとに独立するようになったため、「今ドロップダウンで
+        # 選んでいる作業対象は今どちらの品質か」が一目で分かるよう、
+        # 作業対象の右側に小さなラベルを追加する。表示品質ボタン自体は
+        # このシーン全体ではなく「選択中の作業対象」だけを対象にする点も、
+        # このラベルと合わせて理解しやすくなる。
+        self.link_quality_label = QtWidgets.QLabel("[Preview]")
+        self.link_quality_label.setToolTip(
+            "選択中の作業対象(SPプロジェクト)の現在の表示品質です。\n"
+            "下の「表示品質」ボタンは、このシーン全体ではなく選択中の"
+            "作業対象だけを切り替えます。"
+        )
+        scene_link_switch_row.addWidget(self.link_quality_label)
         link_detail_layout.addLayout(scene_link_switch_row)
 
         # UI導線改善: 「追加」「削除」を独立した行にすることで、
@@ -4372,15 +4905,13 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # Phase 6不具合修正: 起動時にシーンの実際の状態を検出し、
         # 表示品質ボタンをそれに合わせておく(常にプレビュー扱いで
         # 初期化すると、実際はFinalのままの場合に切り替え不能になる)。
-        detected_final = self.watcher.detect_current_quality()
-        if detected_final is not None:
-            self.watcher.using_final_quality = detected_final
-            self.quality_btn.blockSignals(True)
-            self.quality_btn.setChecked(detected_final)
-            self.quality_btn.setText(
-                "表示品質: {0}".format("高画質(Final)" if detected_final else "プレビュー(リアルタイム)")
-            )
-            self.quality_btn.blockSignals(False)
+        # 2026.07.22(表示品質のプロジェクト別管理化): 品質はプロジェクト
+        # ごとの辞書になったため、まず全プロジェクト分をまとめて検出して
+        # quality_by_project へ反映し、ボタンの見た目の更新自体は
+        # (選択中の作業対象に応じて出し分ける必要があるため)後段の
+        # _refresh_scene_link_label() 内の _refresh_quality_display() に
+        # 委ねる。
+        self.watcher.quality_by_project.update(self.watcher.detect_quality_by_project())
 
         self.watcher.status_changed.connect(self.log_view.appendPlainText)
         self.watcher.stats_changed.connect(self._on_stats_changed)
@@ -4405,14 +4936,53 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         # イベント種別を引数でコールバックへ渡さない仕様のため、
         # kAfterOpen/kAfterNewそれぞれ専用のラムダを介して
         # is_new_sceneを明示的に渡すようにした。
-        self._scene_callback_ids = [
-            om.MSceneMessage.addCallback(
-                om.MSceneMessage.kAfterOpen,
-                lambda *_a: self._on_scene_changed(is_new_scene=False)),
-            om.MSceneMessage.addCallback(
-                om.MSceneMessage.kAfterNew,
-                lambda *_a: self._on_scene_changed(is_new_scene=True)),
-        ]
+        #
+        # 2026.07.24(見落とし修正): 従来はこの2件をリスト内包で一括登録
+        # しており、1件目の登録後・2件目の登録中に例外が発生した場合、
+        # 1件目のコールバックIDがどこにも保持されずリークする(後段の
+        # closeEvent()でも解除できない)経路があった。直後の
+        # kAfterCreateReference/kAfterLoadReferenceループと同じスタイル
+        # (1件ずつtry/exceptで囲み、成功した分だけappendする)に揃える。
+        self._scene_callback_ids = []
+        for event_const, is_new_scene in (
+            (om.MSceneMessage.kAfterOpen, False),
+            (om.MSceneMessage.kAfterNew, True),
+        ):
+            try:
+                self._scene_callback_ids.append(
+                    om.MSceneMessage.addCallback(
+                        event_const,
+                        lambda *_a, _is_new=is_new_scene: self._on_scene_changed(is_new_scene=_is_new))
+                )
+            except Exception as e:
+                print("[maya_live_sync] シーン切り替えコールバックの登録に失敗しました: {0}".format(e))
+
+        # 2026.07.23 追加(実機報告: Reference Editorで別シーンから
+        # 参照(reference)として持ち込んだオブジェクトも、UDIMテクスチャが
+        # 未割り当てのようにグレー表示される):
+        # 参照の読み込みは kAfterOpen/kAfterNew を発火しないため、上記の
+        # シーン切替コールバックだけでは救済できない。UDIMプレビュー
+        # 再生成(_regenerate_udim_previews_deferred())だけを、参照が
+        # 新規作成された時(kAfterCreateReference)・既存の参照を
+        # 読み込み直した時(kAfterLoadReference)にも呼ぶ。
+        # _on_scene_changed()自体(監視の停止・シーン紐付け表示の更新等)
+        # は「現在開いているシーン」が変わったわけではない参照読み込みでは
+        # 呼ばない。
+        # Mayaのバージョンによってこの定数が無い可能性を考慮し、
+        # getattr()で存在確認してから登録する(無ければ静かにスキップし、
+        # 他の機能には影響させない)。
+        for const_name in ("kAfterCreateReference", "kAfterLoadReference"):
+            event_const = getattr(om.MSceneMessage, const_name, None)
+            if event_const is None:
+                continue
+            try:
+                self._scene_callback_ids.append(
+                    om.MSceneMessage.addCallback(
+                        event_const,
+                        lambda *_a: self._regenerate_udim_previews_deferred())
+                )
+            except Exception as e:
+                print("[maya_live_sync] {0}コールバックの登録に失敗しました: {1}".format(const_name, e))
 
         # Phase 5: 前回終了時に監視がONだった場合は自動的に再開する
         # (毎回手動でONを押す手間を無くすため)。setChecked(True)が
@@ -4511,6 +5081,43 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             chevron = "▾" if visible else "▸"
             self.link_summary_btn.setText("{0} {1}".format(chevron, summary_text))
 
+    def _current_quality_target_project_key(self):
+        """表示品質ボタンが対象とすべき、現在ドロップダウンで選択中の
+        作業対象のsp_project_keyを返す。
+
+        2026.07.22(表示品質のプロジェクト別管理化)で新設。
+        作業対象が1件も登録されていない(scene linksが無い、従来通りの
+        単一プロジェクト運用)場合はNoneを返す
+        (watcher.switch_texture_quality()側でNoneを後方互換のレガシー
+        フォールバックとして扱う)。
+        """
+        payload = _get_scene_project_links()
+        links = payload.get("links", [])
+        if not links:
+            return None
+        active_link_id = payload.get("active_link_id")
+        selected_link = _find_link(payload, active_link_id) or links[0]
+        return selected_link.get("sp_project_key")
+
+    def _refresh_quality_display(self, project_key):
+        """選択中の作業対象(project_key)の表示品質を、表示品質ボタンと
+        「▸ プロジェクト連携」欄の品質ラベルへ反映する。
+
+        2026.07.22(表示品質のプロジェクト別管理化)で新設。呼び出し元:
+        - _refresh_scene_link_label()(自動追従・手動でのドロップダウン
+          選択変更の両方でここ経由になる)
+        - _on_quality_toggled()(ボタン操作直後の見た目更新)
+        """
+        is_final = self.watcher.quality_for_project(project_key)
+        self.quality_btn.blockSignals(True)
+        self.quality_btn.setChecked(is_final)
+        self.quality_btn.setText(
+            "表示品質: {0}".format("高画質(Final)" if is_final else "プレビュー(リアルタイム)")
+        )
+        self.quality_btn.blockSignals(False)
+        if hasattr(self, "link_quality_label"):
+            self.link_quality_label.setText("[{0}]".format("Final" if is_final else "Preview"))
+
     def _refresh_scene_link_label(self):
         """状態バー上部の「シーン ⇔ SPプロジェクト」表示と、複数SP
         プロジェクト切り替え用ドロップダウンを更新する。
@@ -4582,6 +5189,18 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         active_key = _normalize_project_key_for_compare(self.watcher.config.get("active_project_key"))
 
         self._rebuild_scene_link_combo(links, active_link_id)
+
+        # 2026.07.22(表示品質のプロジェクト別管理化): このメソッドは
+        # ドロップダウンの選択が変わるたび(自動追従・手動選択の両方)に
+        # 呼ばれるため、ここで選択中の作業対象の表示品質をボタン・ラベルへ
+        # 反映しておく。以降の分岐(未設定/未保存/不一致/正常)いずれの
+        # 場合でも実行してよい(品質表示は紐付けの状態文言とは独立した情報
+        # のため)。
+        selected_link_for_quality = _find_link(payload, active_link_id) or (links[0] if links else None)
+        selected_key_for_quality = (
+            selected_link_for_quality.get("sp_project_key") if selected_link_for_quality else None
+        )
+        self._refresh_quality_display(selected_key_for_quality)
 
         if not links:
             self.scene_link_label.setText(
@@ -4871,6 +5490,48 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             "一覧の最終更新: {0}".format(_now())
         )
 
+    def _regenerate_udim_previews_deferred(self):
+        """UDIM(複数UVタイル)のfileノードについて、Viewport 2.0の
+        タイルプレビュー画像を再生成する。generateAllUvTilePreviews
+        (MEL)の実行自体を、Mayaのイベントループへ一度制御を戻した直後
+        まで遅延させる。
+
+        2026.07.23 追加(実機報告): シーンを閉じて開き直すとUDIM
+        テクスチャを使っているオブジェクトが未割り当てのように
+        グレー表示されてしまう不具合の対策として新設。背景は
+        _flush_viewport_cache()のコメントを参照
+        (Viewport 2.0はUDIMのプレビュー画像をシーンを開いた直後には
+        自動生成しない、というAutodesk公式仕様)。
+
+        2026.07.23 再修正(実機再報告: 「シーンを開き直すと直らない」):
+        当初は _on_scene_changed() の中でこの再生成処理を同期的に
+        (シーンコールバックが発火したその場で)実行していたが、
+        実機で改善が確認できなかった。原因は、kAfterOpen/kAfterNew等の
+        シーンコールバックが発火する時点では、Mayaのシーン読み込み処理
+        自体(DGの評価やシェーディング割り当て等)がまだ完了しきって
+        いない場合があるためと考えられる。_on_scene_changed()内の
+        「未保存シーンの紐付け引き継ぎ」警告ポップアップが、全く同じ
+        理由から既に QtCore.QTimer.singleShot(0, ...) で遅延実行して
+        いるのに倣い、ここでも同じパターンを適用した。
+
+        2026.07.23 追加(実機報告: Reference Editorで別シーンから
+        参照(reference)を持ち込んだ場合も同じ症状が出る):
+        参照の読み込みは kAfterOpen/kAfterNew を一切発火しないため、
+        従来の _on_scene_changed() 経由の対策では救済できなかった。
+        本メソッドを独立した関数として切り出し、__init__ での
+        コールバック登録箇所で kAfterCreateReference/kAfterLoadReference
+        からも呼ぶようにした(詳細は __init__ 内のコールバック登録
+        コメント参照)。
+
+        2026.07.23-04(根治修正): 実処理(旧・内部関数 _do_regenerate)は
+        self を一切使っていなかったため、モジュールレベル関数
+        _regenerate_udim_previews() へ切り出した。LiveSyncWindow の
+        インスタンスに依存しないモジュールレベルのシーンコールバック
+        (ファイル末尾の登録ブロック参照)からも同じ処理を呼べるようにする
+        ためで、詳細な経緯はそちらのコメントを参照。
+        """
+        QtCore.QTimer.singleShot(0, _regenerate_udim_previews)
+
     def _on_scene_changed(self, is_new_scene=False, *_args):
         """2026.07.15-01: MSceneMessage(kAfterOpen/kAfterNew)から呼ばれる。
         シーンが切り替わったら、直前のシーン向けの監視を安全に停止し、
@@ -4929,6 +5590,16 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 self.enable_btn.blockSignals(False)
             self._refresh_scene_link_label()
             self._refresh_material_table()
+
+            # 2026.07.23 追加(実機報告: シーンを閉じて開き直すとUDIM
+            # テクスチャを使っているオブジェクトが未割り当てのように
+            # グレー表示されてしまう):
+            # 詳細・再修正の経緯は _regenerate_udim_previews_deferred()
+            # のdocstringを参照(当初ここで同期的にgenerateAllUvTile
+            # Previewsを呼んでいたが、シーン読み込み直後は効果が無い
+            # ことが実機で再確認されたため、シングルショットタイマー
+            # 経由の遅延実行に変更した)。
+            self._regenerate_udim_previews_deferred()
 
             if _is_scene_unsaved():
                 try:
@@ -4990,11 +5661,12 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         super(LiveSyncWindow, self).closeEvent(event)
 
     def _on_quality_toggled(self, checked):
-        switched = self.watcher.switch_texture_quality(checked)
+        # 2026.07.22(表示品質のプロジェクト別管理化): このシーン全体では
+        # なく、今ドロップダウンで選択中の作業対象1件だけを対象にする。
+        project_key = self._current_quality_target_project_key()
+        switched = self.watcher.switch_texture_quality(checked, project_key)
         if switched:
-            self.quality_btn.setText(
-                "表示品質: {0}".format("高画質(Final)" if checked else "プレビュー(リアルタイム)")
-            )
+            self._refresh_quality_display(project_key)
         elif checked:
             # 切り替えが1件も行われなかった場合、ボタンだけがONの
             # 見た目になって実態とズレるのを避けるため元に戻す。
@@ -5163,6 +5835,16 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 def show_ui():
     global _window_instance
     print("[maya_live_sync] show_ui() called - version {0}".format(__version__))
+    # 2026.07.24(緊急バグ修正): _window_instanceはQtウィジェットが実際に
+    # 破棄された(hideではなく、deleteUIやレイアウトリセット等でC++側の
+    # 実体が消えた)後も None に戻らないままだった。この状態で
+    # show_ui()を呼ぶと、既に無効なオブジェクトへ.show()/.raise_()を
+    # 呼ぶだけで(いずれもbare exceptで握りつぶされる)何も起きず、
+    # モジュールをreloadするまでシェルフボタンが無反応になる不具合が
+    # あった。既にimport済みの_shiboken_is_valid()で実体の生死を確認し、
+    # 破棄済みなら新規生成分岐へフォールバックする。
+    if _window_instance is not None and not _shiboken_is_valid(_window_instance):
+        _window_instance = None
     first_creation = False
     if _window_instance is None:
         _window_instance = LiveSyncWindow()
@@ -5196,6 +5878,42 @@ def show_ui():
         if not _window_instance.watcher.config.get("setup_wizard_completed"):
             _window_instance.open_setup_wizard()
     return _window_instance
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.23-04: UDIMプレビュー再生成(モジュールレベル共通処理)
+# ---------------------------------------------------------------------------
+#
+# 経緯: 従来 LiveSyncWindow._regenerate_udim_previews_deferred() の内部に
+# ネストして定義されていた処理(_do_regenerate)を、self を一切使って
+# いなかったためモジュールレベル関数として独立させた。LiveSyncWindow が
+# 一度も生成されていないMayaセッションでも同じ処理を呼べるようにする
+# ためで、詳細な背景はファイル末尾のモジュールレベル・シーンコールバック
+# 登録ブロックのコメントを参照。
+def _regenerate_udim_previews():
+    """UDIM(複数UVタイル)のfileノードについて、Viewport 2.0のタイル
+    プレビュー画像を再生成する。呼び出し側(LiveSyncWindowのインスタンス
+    メソッド・モジュールレベルのシーンコールバックの両方)が
+    QTimer.singleShot(0, ...) 経由で遅延実行することを前提とする
+    (シーンコールバックが発火した時点ではシーン読み込み処理自体が
+    まだ完了しきっていない場合があるため)。
+
+    2026.07.23-03(緊急修正): generateAllUvTilePreviews は定義元のMEL
+    ファイル(others/generateUvTilePreview.mel)が自動ソースされていない
+    タイミングでは「プロシージャが見つかりません」というMELエラーで
+    失敗することが実機(mayapyバッチセッション)で確認された。呼び出し前に
+    明示的にsourceすることで確実にproc定義済みの状態にする。
+    """
+    try:
+        import maya.mel as mel
+        mel.eval('source "generateUvTilePreview.mel";')
+        mel.eval("generateAllUvTilePreviews;")
+    except Exception as e:
+        print("[maya_live_sync] UVタイルプレビューの再生成に失敗: {0}".format(e))
+    try:
+        cmds.refresh(force=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -5258,3 +5976,61 @@ try:
     _EXITING_CALLBACK_ID = om.MSceneMessage.addCallback(om.MSceneMessage.kMayaExiting, _on_maya_exiting)
 except Exception as _e:
     print("[maya_live_sync] Could not register exit callback: {0}".format(_e))
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.23-04(根治修正): UDIMプレビュー再生成のモジュールレベル・
+# シーンコールバック
+# ---------------------------------------------------------------------------
+#
+# 背景: 2026.07.23/-02/-03 の3回にわたるUDIM対策(MELの明示的source、
+# QTimer.singleShotによる遅延実行、kAfterCreateReference/
+# kAfterLoadReferenceの追加)は、いずれも LiveSyncWindow.__init__() 内で
+# しか登録されないシーンコールバックに乗っていた。しかし install.py の
+# _register_autostart() は register_user_setup(auto_open=False) を
+# 使っているため、userSetup.py は Maya起動時に "import maya_live_sync"
+# するだけで show_ui()(≒LiveSyncWindow の生成)を呼ばない。
+# ユーザーの通常の操作順序である「Mayaを再起動 → (LiveSyncパネルを
+# 開く前に)対象シーンを開く」では、この最初の kAfterOpen が発火する
+# 時点でリスナーが1つも登録されておらず、UDIMプレビュー再生成が
+# 一切実行されないままだった。これが実機報告(3回の対策後も直らない)の
+# 真因であり、他の2ファイル(install.py / sp_live_sync_plugin.py /
+# udim_setup.py)側には原因が無いことも確認済み。
+#
+# 対策: LiveSyncWindow の生成有無に関わらず、モジュールが import された
+# 時点(＝maya_live_sync が一度でも使われた時点)で無条件にこれらの
+# コールバックを登録する。LiveSyncWindow.__init__() 側の既存登録は
+# そのまま残す(_on_scene_changed() はUDIM再生成以外にも監視停止・UI
+# 更新等の処理を担っているため)。ウィンドウが開いている状態では
+# UDIM再生成がモジュールレベル分と合わせて二重に走ることになるが、
+# generateAllUvTilePreviews + cmds.refresh は冪等かつ軽量なため実害はない。
+#
+# reload-safety は直前の kMayaExiting ブロックと同じパターン
+# (モジュールグローバルにIDを保持し、reload() のたびに前回分を解除して
+# から登録し直す)を踏襲する。
+def _on_udim_scene_event(*_args):
+    QtCore.QTimer.singleShot(0, _regenerate_udim_previews)
+
+
+_UDIM_SCENE_CALLBACK_IDS = globals().get("_UDIM_SCENE_CALLBACK_IDS", None)
+
+if _UDIM_SCENE_CALLBACK_IDS:
+    for _cb_id in _UDIM_SCENE_CALLBACK_IDS:
+        try:
+            om.MSceneMessage.removeCallback(_cb_id)
+        except Exception as _e:
+            print("[maya_live_sync] Could not remove previous UDIM scene callback (id={0}): {1}".format(
+                _cb_id, _e))
+    print("[maya_live_sync] Removed {0} previous UDIM scene callback(s) before re-registering.".format(
+        len(_UDIM_SCENE_CALLBACK_IDS)))
+
+_UDIM_SCENE_CALLBACK_IDS = []
+for _const_name in ("kAfterOpen", "kAfterNew", "kAfterCreateReference", "kAfterLoadReference"):
+    _event_const = getattr(om.MSceneMessage, _const_name, None)
+    if _event_const is None:
+        continue
+    try:
+        _UDIM_SCENE_CALLBACK_IDS.append(
+            om.MSceneMessage.addCallback(_event_const, _on_udim_scene_event))
+    except Exception as _e:
+        print("[maya_live_sync] Could not register module-level {0} callback: {1}".format(_const_name, _e))

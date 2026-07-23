@@ -218,6 +218,24 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
     - 設定ファイル(save_config())の書き込み頻度も見直したが、既存の
       呼び出し箇所はいずれも「値が実際に変化した場合のみ書き込む」
       ガードが既に入っており、追加の変更は不要と判断した。
+
+2026.07.23(緊急修正: Preview差分集合のプロジェクト間持ち越し):
+    フェーズ2(2026.07.19-03)でFinal専用の差分集合(dirty_stack_ids_final)
+    を新設した際、on_project_closing()/on_project_edition_entered()の
+    両方でそれをリセットするようにしたが、Preview用のdirty_stack_idsは
+    リセット対象から漏れていた。stack_idはPainter内部でドキュメントを
+    またいで一意である保証が無いため、テクスチャ編集直後(debounce_timer
+    始動中)にプロジェクトを切り替えると、on_project_closing()の
+    debounce_timer.stop()で予定されていたrequest_export()自体は
+    キャンセルされる一方、dirty_stack_idsの中身は消費されずに残る。
+    次のプロジェクトで_resolve_stack_names()がこの古いstack_idを
+    (たまたま新ドキュメント側でも有効なidとして)解決してしまうと、
+    _build_export_config()のPreview差分フィルタが誤ったテクスチャ
+    セット名で汚染され、実際に編集したセットが対象から漏れる、または
+    無関係なセットが余分に対象になる恐れがあった。両ハンドラで
+    dirty_stack_idsもdirty_stack_ids_finalと同様に無条件でリセット
+    するよう修正した(空の場合は無害なno-op)。既存の動作を壊さない
+    不具合修正のため、SemVerのルールに従いPATCHを上げる。
 """
 
 # バージョン情報。SP起動時に必ずPythonログへ出力し、「今動いているのが
@@ -295,16 +313,61 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 #     詳細な経緯・症状はmaya_live_sync.py 1.2.0の変更履歴コメントを参照。
 #     設定ファイルへのキー追加のみで既存キーの意味は変えておらず、
 #     後方互換を維持しているため、SemVerのルールに従いMINORを上げる。
-__version__ = "1.1.0"
+#
+# 2026.07.23 緊急修正(Preview差分集合のプロジェクト間持ち越し):
+#     on_project_closing()/on_project_edition_entered()がFinal専用の
+#     差分集合(dirty_stack_ids_final)はリセットする一方、Preview用の
+#     dirty_stack_idsをリセットし忘れていたため、プロジェクト切替直後に
+#     前プロジェクトのstack_idが残留し、新ドキュメント側で偶然有効な
+#     idとして解決されるとPreview差分フィルタが汚染される恐れがあった。
+#     詳細は本ファイル冒頭のdocstring「2026.07.23」の項を参照。既存の
+#     動作を壊さない不具合修正のため、SemVerのルールに従いPATCHを上げる。
+#
+# 2026.07.24(恒久修正一式): maya_live_sync.py側と合わせて実施した、
+# 客観的な視点での不具合監査(5並列のコード監査)のうち、実際にトレース
+# して再現条件まで特定できた不具合の高+中優先度分をまとめて修正した。
+# 要旨(詳細は各修正箇所のコメント参照):
+#   - _do_export(): ステージング→監視/Finalフォルダへのテクスチャ移動で、
+#     クロスボリューム時のフォールバック経路(shutil.copyfile)が最終
+#     ファイル名へ直接書き込んでおり、Maya側のポーリングが書き込み途中を
+#     読む(torn read)恐れがあった。同一ディレクトリへの一時ファイル
+#     コピー→os.replace()の2段構えに変更し、常に原子的にした。あわせて
+#     不要だったos.remove(dest)(destが一瞬消える窓を作っていた)を削除。
+#   - _sync_complete.flag の書き込みも、他の書き込み箇所と同じ
+#     「一時ファイル→os.replace()」の原子的パターンに揃えた。
+#   - load_config()/save_config(): 読み込み失敗時のログを追加し、
+#     設定ファイルが存在するのに読めない場合は書き込みを強行せず中断
+#     するよう変更(他アプリのデータを丸ごと消す事故を防止)。
+#     DEFAULT_CONFIGのコピーを深いコピーに変更し、ネストした辞書が
+#     フォールバック経路を通るたびに共有されてしまう不具合も修正。
+#   - save_config(): msvcrt.lockingによるOSレベルのファイルロックを
+#     追加し、Maya側との同時書き込みによるlost updateを防止
+#     (プロセスクラッシュ時もOSが自動的にロックを解放するため、
+#     ロックの固着は発生しない設計であることを実機テストで確認済み)。
+#   - start_plugin(): 既存の_engine/_panelが残っている場合に先に後始末
+#     してから差し替えるようにし、プラグインの多重起動でイベント購読が
+#     多重登録される不具合を防止。
+# いずれも既存の動作を壊さない不具合修正のため、SemVerのルールに従い
+# PATCHを上げる。
+__version__ = "1.1.2"
 
 import os
 import re
 import json
+import copy
 import time
 import shutil
 import hashlib
 import tempfile
 import datetime
+import contextlib
+try:
+    import msvcrt
+except ImportError:
+    # このツールはWindows専用設計(C:/SPMayaLiveSync のハードコード等)
+    # だが、念のためimport失敗時は設定ファイルロックを無効化して
+    # 動作は継続できるようにする(_config_file_lock()参照)。
+    msvcrt = None
 
 import substance_painter.event as event
 import substance_painter.export as export
@@ -514,14 +577,118 @@ def _cleanup_orphaned_staging_dirs(stage_root, max_age_hours=24):
 # ---------------------------------------------------------------------------
 
 def load_config():
+    # 2026.07.24(緊急バグ修正): (1) 読み込み失敗時にログが一切出ておらず
+    # (このファイルの他の例外処理は全て_log()を呼んでいる)、設定ファイルが
+    # 破損していても無言で既定値にフォールバックしていたため原因調査が
+    # 困難だった。(2) dict(DEFAULT_CONFIG)は浅いコピーのため、
+    # DEFAULT_CONFIG内のネストした辞書(watch_subfolder_by_project等)が
+    # このフォールバック経路を通るたびに同じオブジェクトとして共有されて
+    # おり、呼び出し元がその場でin-place更新すると、モジュールレベルの
+    # "定数"であるはずのDEFAULT_CONFIGを汚染しうる不具合があった。
+    # copy.deepcopy()に変更して解消する。
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-        cfg = dict(DEFAULT_CONFIG)
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg.update(loaded)
         return cfg
-    except Exception:
-        return dict(DEFAULT_CONFIG)
+    except Exception as e:
+        if os.path.exists(CONFIG_PATH):
+            _log("warning", "設定ファイルの読み込みに失敗したため、既定値にフォールバックします: {0}".format(e))
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.24: 設定ファイルの同時書き込み競合対策(ファイルロック)
+# ---------------------------------------------------------------------------
+#
+# maya_live_sync.py 側に実装した _config_file_lock() と同じ設計・同じ
+# ロックファイルパス・同じタイムアウト値を、共有モジュールが無いため
+# ここでも独立実装する(詳細な背景・設計理由はmaya_live_sync.py側の
+# コメント参照)。専用ロックファイル(CONFIG_PATH + ".lock")に対する
+# msvcrt.locking()はOSレベルのロックのため、保持中にプロセスが
+# クラッシュしてもOSがプロセス終了時に自動解放する(手動でのstale判定・
+# 強制解除が不要)。取得はノンブロッキングでポーリングしつつタイムアウト
+# (既定3秒)を設け、取得できなければロック無しで保存を続行する。
+CONFIG_LOCK_PATH = CONFIG_PATH + ".lock"
+_CONFIG_LOCK_TIMEOUT_SECONDS = 3.0
+_CONFIG_LOCK_POLL_INTERVAL_SECONDS = 0.05
+
+
+class _ConfigLockTimeout(Exception):
+    """設定ファイルロックの取得がタイムアウトした場合に送出する。"""
+    pass
+
+
+@contextlib.contextmanager
+def _config_file_lock():
+    if msvcrt is None:
+        yield
+        return
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    lock_file = open(CONFIG_LOCK_PATH, "a+b")
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"0")
+            lock_file.flush()
+        deadline = time.time() + _CONFIG_LOCK_TIMEOUT_SECONDS
+        locked = False
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(_CONFIG_LOCK_POLL_INTERVAL_SECONDS)
+        if not locked:
+            raise _ConfigLockTimeout(
+                "設定ファイルロックの取得がタイムアウトしました: {0}".format(CONFIG_LOCK_PATH))
+        try:
+            yield
+        finally:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+    finally:
+        lock_file.close()
+
+
+def _merge_and_write_config(cfg):
+    """ディスク上の最新内容を読み込んでcfgをマージし、一時ファイル経由で
+    原子的に書き戻す(save_config()の実処理本体、ロック取得の成否に
+    関わらず共通で使う)。
+
+    2026.07.24(緊急バグ修正): 設定ファイルが存在するのに読み込みに失敗
+    した(破損・書き込み途中との衝突等)場合、従来はmerged={}のまま
+    書き込みを強行しており、他アプリ(Maya側)が保持している全キーを
+    丸ごと消してしまう恐れがあった。ファイルが存在するのに読めない
+    ケースでは、空のマージ結果で書き込みを強行するより「今回の保存を
+    諦める」方が安全なため、ここで中断する(呼び出し元の変更は失われる
+    が、次回の保存機会に委ねる。ファイルがそもそも存在しない初回起動時は
+    この分岐に入らず従来通りmerged={}のまま進む)。
+    """
+    merged = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                merged = json.load(f)
+        except Exception as e:
+            _log("error", "設定ファイルの読み込みに失敗したため保存を中断しました: {0}".format(e))
+            return
+    merged.update(cfg)
+    # Phase 3 最適化: 一時ファイルに書いてから os.replace() で原子的に
+    # 置き換える。SPとMayaが同時に保存/読込を行った際に、書き込み途中の
+    # 不完全なJSONを相手側が読んでしまう(torn read)のを防ぐため。
+    tmp_path = CONFIG_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CONFIG_PATH)
 
 
 def save_config(cfg):
@@ -531,22 +698,19 @@ def save_config(cfg):
     意図せず上書き・消去してしまわないようにする。
     呼び出し側は、変更したキーだけを渡すこと(全体を渡すと、渡した側が
     保持している値が古い場合に他アプリの変更を巻き戻す恐れがある)。
+
+    2026.07.24: 読み込み〜書き込み区間全体を _config_file_lock() で
+    挟み、Maya側との同時書き込みによるlost updateを防ぐ。ロックが
+    タイムアウトした場合はロック無しで続行する(UIスレッドを無期限に
+    ブロックしないことを優先)。
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    merged = {}
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            merged = json.load(f)
-    except Exception:
-        pass
-    merged.update(cfg)
-    # Phase 3 最適化: 一時ファイルに書いてから os.replace() で原子的に
-    # 置き換える。SPとMayaが同時に保存/読込を行った際に、書き込み途中の
-    # 不完全なJSONを相手側が読んでしまう(torn read)のを防ぐため。
-    tmp_path = CONFIG_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, CONFIG_PATH)
+        with _config_file_lock():
+            _merge_and_write_config(cfg)
+    except _ConfigLockTimeout as e:
+        _log("warning", "{0} ロック無しで保存を続行します。".format(e))
+        _merge_and_write_config(cfg)
 
 
 def _current_project_key():
@@ -864,6 +1028,22 @@ class LiveSyncEngine(QtCore.QObject):
         self.dirty_stack_ids_final = set()
         self.final_baseline_established = False
         self._final_export_force_full = False
+        # 2026.07.23(緊急修正: Preview差分集合のプロジェクト間持ち越し):
+        # 上記のdirty_stack_ids_final同様、Preview用のself.dirty_stack_ids
+        # もプロジェクト単位でリセットする必要があったが、これまで漏れて
+        # いた。stack_idはPainter内部でドキュメントをまたいで一意である
+        # 保証が無いため、直前の編集(debounce_timer始動直後)を残したまま
+        # プロジェクトを切り替えると、上のdebounce_timer.stop()で
+        # 予定されていたrequest_export()自体はキャンセルされる一方、
+        # dirty_stack_idsの中身は消費されずに残ってしまう。次のプロジェクト
+        # で_resolve_stack_names()がこの古いstack_idを(たまたま新ドキュ
+        # メント側でも有効なidとして)解決できてしまった場合、_build_
+        # export_config()のPreview差分フィルタが誤った/無関係なテクスチャ
+        # セット名で汚染され、実際に編集したテクスチャセットが対象から
+        # 漏れる、または無関係なセットが余分に対象になる恐れがある。
+        # dirty_stack_idsが既に空の場合はresetしても単なる無害な
+        # no-opなので、常に無条件でクリアする。
+        self.dirty_stack_ids = set()
         # 2026.07.19-04(フェーズ3): _unchanged()用のキャッシュ
         # (last_hashes/last_sizes)はdest_pathがプロジェクト別サブ
         # フォルダを含む絶対パスのため、他プロジェクトのエントリは
@@ -897,6 +1077,10 @@ class LiveSyncEngine(QtCore.QObject):
         # 遷移が万一あった場合の保険)。
         self.dirty_stack_ids_final = set()
         self.final_baseline_established = False
+        # 2026.07.23(緊急修正): on_project_closing()と同じ理由で、Preview
+        # 用のself.dirty_stack_idsもここで念のためリセットする(詳細は
+        # on_project_closing()内の同日コメント参照)。
+        self.dirty_stack_ids = set()
         # 2026.07.19-04(フェーズ3): 同上の理由でキャッシュも念のため
         # ここでも刈り込む。
         self.last_hashes = {}
@@ -1295,12 +1479,25 @@ class LiveSyncEngine(QtCore.QObject):
                         self.stats["skip_count"] += 1
                         continue
                     try:
-                        if os.path.exists(dest):
-                            os.remove(dest)
+                        # os.replace()はWindows上で上書きも原子的に行うため、
+                        # 直前にos.remove(dest)する必要は無い(それを行うと
+                        # destが一瞬存在しない窓ができ、Maya側のポーリングが
+                        # 「消えた」と誤認する余地を作ってしまう)。
                         os.replace(src, dest)
                         moved_any = True
                     except OSError:
-                        shutil.copyfile(src, dest)
+                        # 2026.07.24(緊急バグ修正): ステージングと監視/Final
+                        # フォルダが別ボリューム(共有PCでネットワークドライブを
+                        # 指定する運用等)の場合、os.replace()はクロスデバイス
+                        # エラーでOSErrorを送出する。従来はここで直接destへ
+                        # shutil.copyfile()していたため、Maya側のポーリングが
+                        # 書き込み途中のファイル(torn read)を読む可能性が
+                        # あった。dest と同じディレクトリに一時ファイルとして
+                        # コピーしてから os.replace() で置き換えることで、
+                        # 同一ボリューム内のrenameとして常に原子的にする。
+                        tmp_dest = dest + ".tmp"
+                        shutil.copyfile(src, tmp_dest)
+                        os.replace(tmp_dest, dest)
                         os.remove(src)
                         moved_any = True
 
@@ -1328,9 +1525,17 @@ class LiveSyncEngine(QtCore.QObject):
 
             if preview:
                 if moved_any:
+                    # 2026.07.24(緊急バグ修正): 直接flag_pathへ"w"で開くと
+                    # 書き込み開始時点で0バイトへtruncateされるため、
+                    # Maya側のポーリングが読み取りタイミング次第で空/
+                    # 途中のファイルを読む可能性があった(他の書き込み箇所
+                    # と違い、ここだけ非原子的だった)。save_config()と
+                    # 同じ「一時ファイル→os.replace()」パターンに揃える。
                     flag_path = os.path.join(dest_root, "_sync_complete.flag")
-                    with open(flag_path, "w", encoding="utf-8") as f:
+                    tmp_flag_path = flag_path + ".tmp"
+                    with open(tmp_flag_path, "w", encoding="utf-8") as f:
                         f.write(str(time.time()))
+                    os.replace(tmp_flag_path, flag_path)
                     self._emit_status("プレビュー同期完了({0}件更新)".format(
                         sum(len(v) for v in result.textures.values())
                     ))
@@ -1340,9 +1545,17 @@ class LiveSyncEngine(QtCore.QObject):
                 # おらず、表示品質をFinalにしたままだと新しい高画質版が
                 # 自動反映されない不具合があったため追加)。
                 if moved_any:
+                    # 2026.07.24(緊急バグ修正): 直接flag_pathへ"w"で開くと
+                    # 書き込み開始時点で0バイトへtruncateされるため、
+                    # Maya側のポーリングが読み取りタイミング次第で空/
+                    # 途中のファイルを読む可能性があった(他の書き込み箇所
+                    # と違い、ここだけ非原子的だった)。save_config()と
+                    # 同じ「一時ファイル→os.replace()」パターンに揃える。
                     flag_path = os.path.join(dest_root, "_sync_complete.flag")
-                    with open(flag_path, "w", encoding="utf-8") as f:
+                    tmp_flag_path = flag_path + ".tmp"
+                    with open(tmp_flag_path, "w", encoding="utf-8") as f:
                         f.write(str(time.time()))
+                    os.replace(tmp_flag_path, flag_path)
                 # 2026.07.19-01: クラッシュとの相関を後から検証しやすい
                 # よう、Preview側と同様に書き出し件数をログへ残す
                 # (所要時間は _safe_export() 側で stats に記録済みで、
@@ -2096,6 +2309,25 @@ def start_plugin():
     # 最初に必ずバージョンをログへ出す(Pythonログに出力される)。
     _log("info", "[sp_live_sync_plugin] loaded version: {0}  (file: {1})".format(
         __version__, os.path.abspath(__file__)))
+    # 2026.07.24(緊急バグ修正): 従来は既存の_engineの有無を確認せず
+    # 無条件で新規LiveSyncEngine()を作成していた。SPのプラグイン無効化→
+    # 再有効化を経由せずstart_plugin()が二重に呼ばれた場合(Mayaの
+    # reload()後にshow_ui()を呼ぶと旧インスタンスがリークしていた不具合
+    # と同じクラス)、旧エンジンのevent.DISPATCHER購読(connect_strongの
+    # 強参照)が解除されないまま残り、同期処理が多重発火する恐れが
+    # あった。close_plugin()と同じ後始末を先に行ってから差し替える。
+    if _engine is not None:
+        try:
+            _engine.shutdown()
+        except Exception as e:
+            _log("error", "既存エンジンの後始末に失敗しました: {0}".format(e))
+        _engine = None
+    if _panel is not None:
+        try:
+            ui.delete_ui_element(_panel)
+        except Exception as e:
+            _log("error", "既存パネルの後始末に失敗しました: {0}".format(e))
+        _panel = None
     try:
         _engine = LiveSyncEngine()
         # 2026.07.19-01: クラッシュ等でfinally節が実行されず残った

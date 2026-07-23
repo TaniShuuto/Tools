@@ -41,6 +41,17 @@ NOTE:
     ASCII(英語)に統一しています(コメントは UTF-8 のまま影響ありません)。
 
 変更履歴:
+    1.0.3 (2026.07.24):
+        - AISS_COMMAND(シェルフボタンの起動コマンド文字列、シェルフの
+          .melファイルへそのまま永続化される)に日本語コメント行が直接
+          埋め込まれており、本ファイル自身の方針(39-41行目、シェルフ
+          埋め込み文字列はASCIIのみに保つ)に反していた不具合を修正。
+          該当コメントをPython側の通常コメントへ移動した。
+        - uninstall.py側の見落とし(アイコン削除がudim_setup_icon.pngの
+          みで、maya_live_sync_icon.png / sp_to_aiStandardSurface_icon.png
+          がアンインストール後も残り続けていた)にあわせた対応として、
+          uninstall.py にも本ファイルと同じアイコン定数を追加した
+          (uninstall.py側の変更点、詳細はそちら参照)。
     1.0.2 (2026.07.20):
         - シェルフボタンのツールヒント(annotation)を、ホバーしただけで
           機能が伝わるよう全ボタンで文言を統一・具体化。
@@ -63,7 +74,7 @@ NOTE:
         - 初版(SemVer導入)。
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 import os
 import sys
@@ -122,6 +133,16 @@ LIVESYNC_ICON_NAME = "maya_live_sync_icon.png"
 #  取り込みへ自然に誘導できる。sp_to_aiStandardSurface.py には手を加えず、
 #  公開されている _gui_state["dir_field"] を使って外側から設定している。
 AISS_LABEL = "aiSS"
+# 2026.07.24(見落とし修正): このファイルの方針(39-41行目)通り、シェルフに
+# 永続化される文字列自体はASCIIのみに保つ必要があるが、AISS_COMMAND内に
+# 日本語コメント行が直接埋め込まれており、Windows+日本語ロケール環境で
+# シェルフの.melファイル保存・再読込時に文字化けするリスクがあった
+# (sp_to_aiStandardSurface.py側で過去に確認された文字化け不具合と同じ
+# 経路)。該当コメントをここ(Python側の通常コメント)へ移動し、
+# シェルフに実際に埋め込まれる文字列自体からは日本語を除去した。
+#
+# 複数プロジェクト対応: アクティブなプロジェクトのサブフォルダが
+# 分かっていれば、それを取り込み先として自動入力する。
 AISS_ANNOTATION = "aiSS: build aiStandardSurface materials from the SP Final export (folder auto-filled)"
 AISS_COMMAND = (
     "import os\n"
@@ -133,8 +154,6 @@ AISS_COMMAND = (
     "    _cfg = _mls.load_config()\n"
     "    _final = _cfg.get('final_export_dir') or ''\n"
     "    _sub = _cfg.get('active_final_subfolder')\n"
-"    # 複数プロジェクト対応: アクティブなプロジェクトのサブフォルダが\n"
-    "    # 分かっていれば、それを取り込み先として自動入力する。\n"
     "    if _final and _sub:\n"
     "        _target = os.path.join(_final, _sub)\n"
     "    else:\n"

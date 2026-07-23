@@ -19,8 +19,9 @@ uninstall.py  -  SP -> Maya Live Sync : Maya drag-and-drop uninstaller
          - maya_live_sync.py
          - sp_to_aiStandardSurface.py
          - udim_setup.py
-    5. Maya の icons フォルダから UDIM 用のシェルフアイコン
-       (udim_setup_icon.png)を削除
+    5. Maya の icons フォルダから3ツール分のシェルフアイコン
+       (maya_live_sync_icon.png / sp_to_aiStandardSurface_icon.png /
+        udim_setup_icon.png)を削除
          (install.py がコピーした場合のみ存在する任意ファイルのため、
           見つからなくてもエラーにはしない)
     6. 完了メッセージを表示
@@ -50,7 +51,21 @@ udim_setup.py・UDIMシェルフボタン・アイコン画像が一切含まれ
 install.py 側で udim_setup.py を導入した環境でアンインストールを実行しても、
 UDIM関連だけが残り続ける不具合があったため、install.py 側の定義
 (UDIM_LABEL 等)と対になるよう追加した。
+
+変更履歴:
+    1.0.0 (2026.07.24):
+        - このファイルにも install.py と同じ SemVer での __version__
+          管理を導入した(従来はバージョン番号を持たず、日付ベースの
+          コメントのみだった)。導入と同時に、install.py がコピーする
+          3つのアイコンのうち udim_setup_icon.png しか削除対象になって
+          おらず、maya_live_sync_icon.png / sp_to_aiStandardSurface_
+          icon.png がアンインストール後も残り続けていた見落としを修正
+          した(install.py の LIVESYNC_ICON_NAME / AISS_ICON_NAME と
+          同じ値をここでも独立して持ち、3つとも削除するようにした)。
+          この初回バージョンには、上記2026.07.20の修正も含まれている。
 """
+
+__version__ = "1.0.0"
 
 import os
 import sys
@@ -82,6 +97,14 @@ TOOL_FILE_NAMES = ["maya_live_sync.py", "sp_to_aiStandardSurface.py", "udim_setu
 LIVESYNC_LABEL = "LiveSync"
 AISS_LABEL = "aiSS"
 UDIM_LABEL = "UDIM"
+# 2026.07.24(見落とし修正): install.py がコピーする3つのアイコンのうち
+# udim_setup_icon.png しか削除対象になっておらず、maya_live_sync_icon.png /
+# sp_to_aiStandardSurface_icon.png がアンインストール後も残り続けていた。
+# install.py の LIVESYNC_ICON_NAME / AISS_ICON_NAME と同じ値をここでも
+# 独立して持つ(このファイルの他の定数と同じ理由: install.py が既に
+# 削除された後でも単体で動作できるようにするため)。
+LIVESYNC_ICON_NAME = "maya_live_sync_icon.png"
+AISS_ICON_NAME = "sp_to_aiStandardSurface_icon.png"
 UDIM_ICON_NAME = "udim_setup_icon.png"
 REGISTER_MARKER = "# === SP_LIVE_SYNC_AUTO_REGISTER ==="
 
@@ -117,7 +140,7 @@ def _remove_icon_files():
     """
     dst_dir = _icons_dir()
     removed = []
-    for name in [UDIM_ICON_NAME]:
+    for name in [LIVESYNC_ICON_NAME, AISS_ICON_NAME, UDIM_ICON_NAME]:
         path = os.path.join(dst_dir, name)
         if not os.path.isfile(path):
             print("[Live Sync Uninstaller] Icon not found (already removed or never installed?): {0}".format(path))
@@ -347,6 +370,9 @@ def _remove_tool_files():
 
 
 def _run():
+    # install.py と同じ方式: 実行のたびに必ずバージョンをログへ出す。
+    print("[Live Sync Uninstaller] version: {0}".format(__version__))
+
     # 1. ウィンドウ/workspaceControlの破棄(ファイル削除より前に行う。
     #    削除対象のモジュールがまだメモリ上で動いているうちに片付ける)。
     _destroy_livesync_window()
@@ -363,9 +389,14 @@ def _run():
     # 4. ツール本体ファイルの削除(TOOL_FILE_NAMESにudim_setup.pyを追加済み)。
     removed_files = _remove_tool_files()
 
-    # 5. UDIM用シェルフアイコン画像の削除。
+    # 5. シェルフアイコン画像の削除。
     # 2026.07.20(見落とし修正): install.pyがコピーしたudim_setup_icon.png
     # がicons フォルダに残り続けていたため追加。
+    # 2026.07.24(見落とし修正): 上記対応がUDIM分のみで、maya_live_sync_icon.png
+    # / sp_to_aiStandardSurface_icon.png の2つがicons フォルダに残り続けて
+    # いた(install.pyは3つともコピーするが、こちらは1つしか削除していな
+    # かった非対称性)。LIVESYNC_ICON_NAME / AISS_ICON_NAME を追加し、
+    # _remove_icon_files() 側で3つとも削除するよう修正。
     removed_icons = _remove_icon_files()
 
     # sys.modules に残っているキャッシュも掃除しておく(ファイルは

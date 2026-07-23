@@ -53,7 +53,23 @@ import maya.cmds as cmds
 #   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
 #   MINOR: 後方互換のある機能追加
 #   PATCH: 後方互換のあるバグ修正
-__version__ = "1.0.0"
+#
+# 2026.07.24(緊急バグ修正):
+#   (1) TEXTURE_PATTERNS の baseColor が辞書の先頭にあり、その
+#       catch-all正規表現がemissive/specularより先に判定されるため、
+#       "..._EmissiveColor.png"/"..._SpecularColor.png" のような
+#       ファイルが誤ってbaseColorとして配線されていた。baseColorの
+#       catch-allパターンを辞書の最後へ移動し、正規表現自体にも
+#       specular/emissiveを除外する否定先読みを追加した。
+#   (2) _connect_displacement() がremapValue/displacementShaderを
+#       無条件で新規作成しており、同じマテリアルに対してassign_
+#       textures_for_prefix()を2回実行するとノードが二重生成され、
+#       古いものがシーンに孤児として残っていた。_get_or_create_
+#       material()と同じ「決定的な名前で既存ノードを再利用する」
+#       方式に揃えた。
+# いずれも既存の動作を壊さない不具合修正のため、SemVerのルールに従い
+# PATCHを上げる。
+__version__ = "1.0.1"
 
 # -------------------------------------------------------
 #  Displacement tuning defaults (旧v2.1)
@@ -66,14 +82,17 @@ DISPLACEMENT_SCALE_DEFAULT = 0.1
 # -------------------------------------------------------
 #  Naming patterns per texture type
 # -------------------------------------------------------
+# 2026.07.24(緊急バグ修正): 従来はbaseColorが辞書の先頭にあり、その
+# catch-all正規表現 r"color(?!.*normal)" が "emissivecolor"/
+# "specularcolor" のような他チャンネルの名前にもマッチしてしまうため、
+# _detect_texture_type()の走査順(Python 3.7+の辞書は挿入順で走査)で
+# emissive/specularより先にbaseColorが判定され、誤ってbaseColorとして
+# 配線されていた(本来のemissive/specular接続は行われないまま、
+# baseColorの接続だけが上書きされる)。baseColorのcatch-allパターンを
+# 辞書の最後(＝他の全ての具体的なチャンネル名を先に判定した後)に
+# 移動し、あわせてcatch-all正規表現自体にもspecular/emissiveを除外する
+# 否定先読みを追加した(辞書の順序変更だけに依存しない、二重の安全策)。
 TEXTURE_PATTERNS = {
-    "baseColor": {
-        "patterns": [r"basecolor", r"base_color", r"albedo", r"diffuse",
-                     r"color(?!.*normal)"],
-        "attr": "baseColor",
-        "colorSpace": "sRGB",
-        "nodeType": "file",
-    },
     "metalness": {
         "patterns": [r"metallic", r"metalness", r"metal(?!.*normal)"],
         "attr": "metalness",
@@ -118,9 +137,16 @@ TEXTURE_PATTERNS = {
         "nodeType": "file",
     },
     "specular": {
-        "patterns": [r"specular(?!.*roughness)(?!.*color)", r"spec(?!.*roughness)"],
+        "patterns": [r"specularcolor", r"specular(?!.*roughness)(?!.*color)", r"spec(?!.*roughness)"],
         "attr": "specular",
         "colorSpace": "Raw",
+        "nodeType": "file",
+    },
+    "baseColor": {
+        "patterns": [r"basecolor", r"base_color", r"albedo", r"diffuse",
+                     r"color(?!.*normal)(?!.*specular)(?!.*emissive)"],
+        "attr": "baseColor",
+        "colorSpace": "sRGB",
         "nodeType": "file",
     },
 }
@@ -279,16 +305,28 @@ def _connect_displacement(mat, fn):
     (本関数は意図的にメッシュシェイプには触れない)。
 
     生成したdisplacementShaderノードを返す。
+
+    2026.07.24(緊急バグ修正・冪等性): 従来はremapValue/displacement
+    Shaderを無条件で新規作成しており、同じマテリアルに対してassign_
+    textures_for_prefix()(本関数の呼び出し元)を2回実行するとノードが
+    二重生成され、古いものがシーンに孤児として残っていた。
+    _get_or_create_material()と同じ「決定的な名前で既存ノードを
+    再利用する」方式に揃え、マテリアル名から導出した名前で既存の
+    remapValue/displacementShaderを再利用するようにした。
     """
     # 0-1 -> -0.5..0.5 への再センタリング。
-    remap = cmds.shadingNode("remapValue", asUtility=True)
+    remap_name = f"{mat}_dispRemap"
+    remap = (remap_name if cmds.objExists(remap_name)
+             else cmds.shadingNode("remapValue", asUtility=True, name=remap_name))
     cmds.setAttr(f"{remap}.inputMin", 0.0)
     cmds.setAttr(f"{remap}.inputMax", 1.0)
     cmds.setAttr(f"{remap}.outputMin", -0.5)
     cmds.setAttr(f"{remap}.outputMax", 0.5)
     cmds.connectAttr(f"{fn}.outColorR", f"{remap}.inputValue", force=True)
 
-    disp = cmds.shadingNode("displacementShader", asShader=True)
+    disp_name = f"{mat}_dispShader"
+    disp = (disp_name if cmds.objExists(disp_name)
+            else cmds.shadingNode("displacementShader", asShader=True, name=disp_name))
     cmds.connectAttr(f"{remap}.outValue", f"{disp}.displacement", force=True)
 
     # 控えめな初期scale(Mayaの既定値1.0は強すぎることが多い)。
