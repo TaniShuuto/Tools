@@ -87,7 +87,15 @@ except ImportError:
 #   MAJOR: 設定ファイル形式の変更など、既存環境で互換性が崩れる変更
 #   MINOR: 後方互換のある機能追加
 #   PATCH: 後方互換のあるバグ修正
-__version__ = "1.0.0"
+#
+# 2026.07.24(緊急バグ修正): _connect_displacement() が remapValue/
+# displacementShader を無条件で新規作成しており、同じオブジェクトに
+# 対して setup_udim_material() を2回実行するとノードが二重生成され、
+# 古いものがシーンに孤児として残っていた。呼び出し元が渡すnode_idを
+# 使い、他のノード種別(file/aiNormalMap/reverse等)と同じ命名規則で
+# 既存ノードを再利用するよう修正した。既存の動作を壊さない不具合
+# 修正のため、SemVerのルールに従いPATCHを上げる。
+__version__ = "1.0.1"
 
 # ===========================================================================
 # チャンネルマップ
@@ -465,7 +473,7 @@ def _connect_place2d(file_node: str, p2d: str):
 DISPLACEMENT_SCALE_DEFAULT = 0.1
 
 
-def _connect_displacement(shader: str, file_node: str):
+def _connect_displacement(shader: str, file_node: str, node_id: str = None):
     """
     Height/Displacement 用 File ノードを remapValue 経由で
     displacementShader に接続する。
@@ -477,15 +485,34 @@ def _connect_displacement(shader: str, file_node: str):
     Bounds Padding は本関数では触らないため別途手動設定が必要。
 
     (sp_to_aiStandardSurface.py v2.1 の _connect_displacement() を移植)
+
+    2026.07.24(緊急バグ修正・冪等性): 従来はremapValue/displacement
+    Shaderを無条件で新規作成しており、同じオブジェクトに対して
+    setup_udim_material()を2回実行するとノードが二重生成され、古い
+    ものがシーンに孤児として残っていた。呼び出し元(setup_udim_
+    material())が他のノード種別(file/aiNormalMap/reverse等)と同じ
+    命名規則("<種別>_<node_id>")で渡すnode_idを使い、既存ノードが
+    あれば再利用するようにした。node_idを渡さない呼び出し元
+    (後方互換)では、従来通り無条件で新規作成する。
     """
-    remap = cmds.shadingNode("remapValue", asUtility=True)
+    if node_id:
+        remap_name = "remapValue_{0}".format(node_id)
+        remap = (remap_name if cmds.objExists(remap_name)
+                 else cmds.shadingNode("remapValue", asUtility=True, name=remap_name))
+    else:
+        remap = cmds.shadingNode("remapValue", asUtility=True)
     cmds.setAttr(f"{remap}.inputMin", 0.0)
     cmds.setAttr(f"{remap}.inputMax", 1.0)
     cmds.setAttr(f"{remap}.outputMin", -0.5)
     cmds.setAttr(f"{remap}.outputMax", 0.5)
     cmds.connectAttr(f"{file_node}.outColorR", f"{remap}.inputValue", force=True)
 
-    disp = cmds.shadingNode("displacementShader", asShader=True)
+    if node_id:
+        disp_name = "displacementShader_{0}".format(node_id)
+        disp = (disp_name if cmds.objExists(disp_name)
+                else cmds.shadingNode("displacementShader", asShader=True, name=disp_name))
+    else:
+        disp = cmds.shadingNode("displacementShader", asShader=True)
     cmds.connectAttr(f"{remap}.outValue", f"{disp}.displacement", force=True)
 
     if (DISPLACEMENT_SCALE_DEFAULT is not None
@@ -656,7 +683,7 @@ def setup_udim_material(
 
                 if target_attr == "__displacement__":
                     # Fix(v5): remapValue 経由で displacementShader へ自動接続
-                    _connect_displacement(shader, file_node)
+                    _connect_displacement(shader, file_node, node_id=node_id)
                     print(f"[UDIM Setup] {ch_key}: → remapValue → displacementShader")
                 elif info.get("useNormal"):
                     nmap_name = f"aiNormalMap_{node_id}"
