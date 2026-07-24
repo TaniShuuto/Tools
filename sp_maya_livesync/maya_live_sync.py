@@ -719,7 +719,32 @@ def diag_c1_check_qobject_validity(window):
 #     ロックの固着は発生しない設計であることを実機テストで確認済み)。
 # いずれも既存の動作を壊さない不具合修正のため、SemVerのルールに従い
 # PATCHを上げる。
-__version__ = "1.4.5"
+#
+# 2026.07.24-02(緊急バグ修正: 初回同期の取りこぼし、5並列の不具合監査で
+# 特定): ユーザーから「一発で同期されない(SP側で保存/エクスポートした
+# 直後は反映されず、もう一度操作すると反映される)」という報告があり、
+# 4並列(観点: Maya側監視ロジック/SP側エクスポートトリガー/SP⇔Maya
+# ハンドシェイク/ファイルI/O原子性)+2並列(ダブルチェック)の計6回の
+# コード監査で原因を特定した。
+# 根本原因: _ensure_active_watch_watched()/_ensure_active_final_watched()
+# (新規プロジェクトのサブフォルダをproject_poll_timer経由で発見した際)
+# および start()(監視ON時)は、新規フォルダを self.fs_watcher.addPath()
+# で登録するだけで、登録時点で既に存在するファイル・_sync_complete.flag
+# を一切スキャンしていなかった。QFileSystemWatcherのdirectoryChanged
+# シグナルはaddPath()「後」に発生した変更にしか反応しない仕様のため、
+# SP側の書き出し(flag書き込みまで完了)がMaya側のフォルダ登録より先に
+# 完了していた場合、その回の同期は検知されず、次にSP側が同じフォルダへ
+# 書き込んで初めてdirectoryChangedが発火するまで永久に取りこぼされて
+# いた。
+# 対策として、_ensure_active_dirs_watched()の末尾と start()の
+# addPath()完了直後に、それぞれ self._process_pending_changes() を
+# 明示的に1回呼ぶようにした。この関数は呼ばれるたびに監視中の全
+# アクティブフォルダのflag(_sync_complete.flag)のmtimeを再走査して
+# 判定する設計のため、directoryChanged以外から呼んでも安全(冪等)で
+# あり、新規addPath直後の「登録前に既に起きていた変更」を即座に
+# キャッチアップできる。既存の動作を壊さない不具合修正のため、SemVer
+# のルールに従いPATCHを上げる。
+__version__ = "1.4.6"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -2548,6 +2573,19 @@ class LiveSyncWatcher(QtCore.QObject):
         self._ensure_active_watch_watched()
         self._ensure_active_final_watched()
 
+        # 2026.07.24-02(緊急バグ修正): 上記2つが新規フォルダを
+        # addPath()で登録した回であっても、Qtの仕様上、登録時点で
+        # 既に存在するファイル・flagについてはdirectoryChangedが
+        # 発火せず、次にSP側が書き込むまで永久に取りこぼされる
+        # (初回同期が反映されない不具合の直接原因)。
+        # _process_pending_changes()は監視中の全アクティブフォルダの
+        # flagを毎回re-scanして判定する設計のため、ここで明示的に
+        # 1回呼ぶことで新規登録直後の取りこぼしを解消する。
+        # enabled=False中はreload_textures()等を誤って呼ばないよう
+        # ガードする。
+        if self.enabled:
+            self._process_pending_changes()
+
     def start(self):
         other = _check_other_session()
         self.other_session_info = other
@@ -2617,6 +2655,13 @@ class LiveSyncWatcher(QtCore.QObject):
         # ここでの明示的な start() 呼び出しは撤去した(常時起動している
         # タイマーに対して start() を呼んでも実害はないが、
         # 「監視ONで開始する」という誤った意図をコードに残さないため)。
+
+        # 2026.07.24-02(緊急バグ修正): 上記のaddPath()ループは、監視
+        # 開始時点で既に存在するファイル・_sync_complete.flagについては
+        # directoryChangedが発火しないため取りこぼす
+        # (_ensure_active_dirs_watched()と同じ理由)。監視開始直後に
+        # 1回だけ既存状態をキャッチアップする。
+        self._process_pending_changes()
         self._emit_status("監視を開始しました: {0}".format(", ".join(sorted(watch_targets)) or watch_dir))
 
 
