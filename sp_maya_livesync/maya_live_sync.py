@@ -125,6 +125,7 @@ import json
 import time
 import glob
 import uuid
+import shutil
 import base64
 import datetime
 import subprocess
@@ -788,7 +789,65 @@ def diag_c1_check_qobject_validity(window):
 # それ以外は既存の動作を壊さない修正のため、MINORを上げる
 # (シーンfileInfoの保存形式が原文ケースへ変わるが、読み出し側は新旧
 # 双方の形式を吸収するため後方互換)。
-__version__ = "1.5.0"
+#
+# 2026.07.26追加(ユーザー相談、新機能): 自宅・学校等の複数環境で作業する
+# ユーザーから、C:/SPMayaLiveSync自体をクラウド同期しているとの相談が
+# あった。しかし共有設定ファイルは2プロセス専用のadvisory lock/atomic
+# replaceの前提で保護されており、クラウド同期クライアントが割り込むと
+# この前提が崩れる(2026.07.25の_detect_cloud_sync_risk()参照)。
+# 代替として、ライブ同期の作業フォルダではなく「完成したFinal
+# テクスチャの一方向コピー」だけをMayaプロジェクトのsourceimages配下へ
+# 置く仕組み(backup_final_textures_to_sourceimages())を追加した。
+# 単純なファイルコピーには複数プロセスの競合が無いため、コピー先を
+# クラウド同期しても安全。シーン保存(kAfterSave)のたびに、設定
+# sourceimages_backup_enabled(既定OFF)がONの場合のみ実行される。
+# シーンのfileノードの参照先自体は変更しない(あくまでバックアップ)。
+# 新設定を追加し既定を無効化した後方互換な新機能のため、MINORを上げる。
+#
+# 2026.07.26(検証用バージョン、v1.6.0.1): install.py再インストール後、
+# Maya再起動無しではウィンドウのバージョン表示・挙動が更新されない
+# という不具合報告の切り分けのため、コード内容を変更せずバージョン
+# 表記のみ一時的に4桁(SemVer外)へ更新した。
+#
+# 2026.07.26(表示不具合の修正、上記切り分けの結果判明): ユーザーとの
+# 協力調査の結果、_window_instance/モジュールのreload自体は正しく
+# 行われており(Script Editorでの直接確認により、windowTitle()が
+# 実際に "v1.6.0.1" を返すことを確認済み)、Live Sync自体の再起動不要な
+# ホットリロードは想定通り機能していることが判明した。ズレていたのは
+# MayaのworkspaceControlが持つ「タブに表示されるラベル」プロパティ
+# だけで、これはQWidget.windowTitle()とは別にMaya側が保持しており、
+# self.setWindowTitle()を呼ぶだけでは自動的に追従しない(実害の無い
+# 表示のみの問題)。show_ui()でworkspaceControlのlabelを明示的に
+# windowTitle()と同期させるよう修正した。SemVer表記を3桁に戻し、
+# 後方互換なバグ修正のためPATCHを上げる。
+#
+# 2026.07.26(診断性の改善): backup_final_textures_to_sourceimages()が
+# 「シーン保存しても何も起きない」というユーザー報告に対し、原因を
+# 一切特定できない設計だった(sourceimages_backup_enabled=False・
+# シーンにSPプロジェクトの紐付けが無い・sourceimagesフォルダが
+# 特定できない・対象プロジェクトがまだFinal未書き出し、のいずれの
+# 早期returnも無言だった)。呼び出し確認用のprint()、および各早期return
+# 箇所での状態バー通知を追加し、どの段階でスキップされているかを
+# ユーザー自身が切り分けられるようにした。既存の動作(コピー自体の
+# ロジック)は変更していないため、PATCHを上げる。
+#
+# 2026.07.26(緊急バグ修正、ユーザー報告「再インストール後にSPプロジェクト
+# 連携が切れる」): install.py の再インストール時、旧Watcherの差し替え
+# 直前に呼ばれる stop() が reason="manual" 扱いだったため、
+# watch_enabled=False をディスクへ永続化していた。直後に作られる新しい
+# LiveSyncWindowの「前回終了時に監視がONだった場合は自動的に再開する」
+# (Phase 5、__init__内)が、たった今自分自身が書いたFalseを読んでしまい、
+# 再インストールのたびに監視の自動再開が働かなくなっていた(Maya単純
+# 再起動時はstop()自体を経由しないため発生しない、「再インストール後
+# だけ」という非対称な症状として報告された)。実際にはシーン⇔SP
+# プロジェクトの紐付け自体はfileInfo/共有設定のどちらも変更していない
+# ため消えていなかったが、監視が自動で再開されなくなる分、ユーザーには
+# 「連携が切れた」ように見えていたと考えられる。stop()に
+# reason="reinstall"を新設し、ファイルシステム監視の解除は行いつつ
+# watch_enabledの値は変更しないようにした(install.py側の呼び出しも
+# あわせて変更、詳細は install.py 1.0.4 参照)。既存の動作を壊さない
+# 修正のため、PATCHを上げる。
+__version__ = "1.6.3"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -924,6 +983,17 @@ DEFAULT_CONFIG = {
     # Phase 5: 前回終了時の監視ON/OFF状態を覚えておき、次回起動時に
     # 自動的に復元する(毎回手動でONを押す手間を無くすため)。
     "watch_enabled": False,
+    # 2026.07.26追加(ユーザー相談): 自宅・学校等の複数環境で作業する
+    # ユーザー向けに、C:/SPMayaLiveSync自体をクラウド同期する代わりの
+    # 選択肢として追加した。ONの場合、シーン保存のたびに現在のシーンに
+    # 紐付いた各SPプロジェクトのFinalテクスチャを、Mayaプロジェクトの
+    # sourceimagesフォルダ配下へ一方向でバックアップコピーする
+    # (LiveSyncWatcher.backup_final_textures_to_sourceimages()参照)。
+    # 単純なファイルコピーには複数プロセスの競合という問題が無いため、
+    # クラウド同期対象にしても_detect_cloud_sync_risk()が警告する類の
+    # 実害が起こらない。既定はOFF(明示的にONにしたユーザーのみの挙動
+    # 変更に留めるため)。
+    "sourceimages_backup_enabled": False,
     # 2026.07.15-01: このMayaシーンファイルが、どのSPプロジェクトに
     # 対応するかは本来シーンファイル自体(fileInfo)に保存するが、
     # 未保存シーンではfileInfoを永続化できないため、直近のセッション
@@ -1865,6 +1935,85 @@ def _find_stray_root_texture_files(directory):
         e for e in entries
         if e.lower().endswith(_STRAY_ROOT_IMAGE_EXTS) and os.path.isfile(os.path.join(directory, e))
     ]
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.26追加(ユーザー相談): sourceimagesへのFinalテクスチャバックアップ
+# ---------------------------------------------------------------------------
+#
+# 背景: 自宅・学校等の複数環境で作業するユーザーから、C:/SPMayaLiveSync
+# 自体をクラウド同期しているとの相談があった。しかし共有設定ファイル
+# (live_sync_config.json)はMaya側・SP側の2プロセスだけが触る前提で
+# advisory lock(msvcrt.locking)とos.replace()によるアトミックな置き換え
+# で保護されており、クラウド同期クライアントという3人目の書き込み者が
+# 割り込むとこの前提が崩れる(詳細は_detect_cloud_sync_risk()上の
+# コメント、および実機調査で確認した設定ファイルの巻き戻り事例を参照)。
+#
+# 代替案として、ライブ同期の作業フォルダそのものではなく、「完成した
+# Finalテクスチャの一方向コピー」だけをMayaプロジェクトのsourceimages
+# 配下に置き、そちらをクラウド同期してもらう設計にした。単純な
+# ファイルコピーには複数プロセスの競合という問題がそもそも存在しない
+# ため、advisory lockの前提を必要とせず安全にクラウド同期できる。
+#
+# 設計判断(ユーザーとの相談で確定):
+#   - コピー後もシーンのfileノードの参照先はC:/SPMayaLiveSyncのままとし、
+#     sourceimages配下はあくまでバックアップ(他環境で開いた際に実際に
+#     使うには、ユーザーが手動でテクスチャを再接続する必要がある)。
+#     ライブ同期のセマンティクス自体は変更しない。
+#   - トリガーはシーン保存(kAfterSave)。Mayaのクラッシュ・強制終了時に
+#     発火しない可能性があるが、保存のたびに実行されるため、次の保存で
+#     自然に追いつく(セッションロックがkMayaExitingのみに依存せず
+#     経過時間フォールバックも持つのと同じ考え方)。
+# ---------------------------------------------------------------------------
+
+def _maya_project_sourceimages_dir():
+    """現在のMayaプロジェクトのsourceimagesフォルダの絶対パスを返す。
+    プロジェクトルール自体が取得できない場合は既定の"sourceimages"を
+    使う。取得に失敗した場合はNoneを返す。
+    """
+    try:
+        rule = cmds.workspace(fileRuleEntry="sourceImages") or "sourceimages"
+    except Exception:
+        rule = "sourceimages"
+    try:
+        expanded = cmds.workspace(expandName=rule)
+    except Exception:
+        expanded = None
+    if not expanded:
+        return None
+    return os.path.normpath(expanded)
+
+
+def _copy_dir_contents_atomic(src_dir, dest_dir):
+    """src_dir直下のファイルをdest_dirへコピーする。
+
+    コピー先(sourceimages配下)自体もユーザーがクラウド同期する想定の
+    ため、他プロセス(同期クライアント)が同時にdest_dir配下を読む
+    可能性を考慮し、一時ファイル名でコピーしてからos.replace()で
+    置き換える(CLAUDE.md記載の「他プロセスが同時に読む可能性のある
+    ファイルシステムへの書き込みは、すべて一時ファイル+os.replace()で
+    行う」という既存の規約に合わせる)。
+
+    戻り値: 実際にコピーしたファイル数。
+    """
+    copied = 0
+    for name in os.listdir(src_dir):
+        src_path = os.path.join(src_dir, name)
+        if not os.path.isfile(src_path):
+            continue
+        dest_path = os.path.join(dest_dir, name)
+        tmp_path = "{0}.tmp{1}".format(dest_path, os.getpid())
+        try:
+            shutil.copyfile(src_path, tmp_path)
+            os.replace(tmp_path, dest_path)
+            copied += 1
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    return copied
 
 
 def _generate_link_id():
@@ -3051,6 +3200,28 @@ class LiveSyncWatcher(QtCore.QObject):
                               (Mayaプロセス自体は生きており、別の
                               シーンで改めて監視を始める可能性が
                               あるため)。
+            "reinstall"    - 2026.07.26追加(ユーザー報告の不具合修正)。
+                              install.py の再インストール時、旧Watcherを
+                              新しいものに差し替える直前にだけ呼ばれる
+                              (_destroy_stale_livesync_window()参照)。
+                              背景: 従来はここでも reason="manual" を
+                              使っており、watch_enabled=Falseがディスクへ
+                              永続化されていた。ところが直後に作られる
+                              新しいLiveSyncWindowは「前回終了時に監視が
+                              ONだった場合は自動的に再開する」(Phase 5、
+                              __init__参照)仕組みを持っており、そこが
+                              load_config()経由でたった今自分自身が
+                              書いたFalseを読んでしまい、再インストールの
+                              たびに監視が自動再開されなくなっていた
+                              (Mayaを素の再起動した場合はstop()自体を
+                              経由しないため発生せず、「再インストール後
+                              だけ監視だけがOFFに戻る(SPプロジェクトとの
+                              紐付け自体は消えていない)」という非対称な
+                              挙動として報告された)。ファイルシステム
+                              監視自体は(旧オブジェクトが破棄される前に
+                              走り続けるのを防ぐため)確実に止める必要が
+                              あるが、ユーザーが最後に選んだwatch_enabled
+                              の値は変更しない。
         """
         for d in list(self.fs_watcher.directories()):
             self.fs_watcher.removePath(d)
@@ -3067,14 +3238,21 @@ class LiveSyncWatcher(QtCore.QObject):
         if reason == "manual":
             _clear_session_lock_if_own()
             self._emit_status("監視を停止しました。")
+            save_config({"watch_enabled": False})
+            self.config["watch_enabled"] = False
+        elif reason == "reinstall":
+            # 状態バーへの通知は行わない(この直後にウィンドウごと破棄
+            # されるため、誰にも見られず意味が無い)。watch_enabledの
+            # 永続化もしない(上記docstring参照)。
+            pass
         else:
             self._auto_stopped_by_scene_change = True
             self._emit_status(
                 "Mayaのシーンが切り替わったため、監視を自動的に停止しました。"
                 "このシーンに対応するSPプロジェクトを設定すると、再開できます。"
             )
-        save_config({"watch_enabled": False})
-        self.config["watch_enabled"] = False
+            save_config({"watch_enabled": False})
+            self.config["watch_enabled"] = False
 
     # -- イベントハンドラ ---------------------------------------------------
 
@@ -4039,6 +4217,95 @@ class LiveSyncWatcher(QtCore.QObject):
         normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
         subfolder = self._final_subfolder_by_project_normalized().get(normalized_key) if normalized_key else None
         return os.path.normpath(os.path.join(final_dir, subfolder)) if subfolder else None
+
+    def backup_final_textures_to_sourceimages(self):
+        """2026.07.26追加(ユーザー相談): 現在のシーンに紐付いた各SP
+        プロジェクトのFinalテクスチャを、Mayaプロジェクトの
+        sourceimagesフォルダ配下へ一方向でバックアップコピーする。
+
+        設計意図・背景はモジュール冒頭の「sourceimagesへのFinal
+        テクスチャバックアップ」セクションのコメント参照。シーンの
+        fileノードの参照先は変更しない(あくまでバックアップ)。
+
+        コピー先のサブフォルダ名は、Finalフォルダ側のサブフォルダ名
+        (final_subfolder_by_project、例: "Bar_Table2_445ba2")をそのまま
+        再利用する。両者で名前を揃えることで、どのSPプロジェクト由来の
+        バックアップかが分かりやすくなる。
+
+        設定 sourceimages_backup_enabled が False(既定)の間は何もしない。
+        シーンにSPプロジェクトの紐付けが無い、またはまだ一度もFinal
+        書き出しが行われていないプロジェクトはスキップするが、原因の
+        切り分けができるよう状態バーへ理由を出す(2026.07.26追加:
+        当初は全て無言でスキップしており、「保存しても何も起きない」
+        場合にユーザー側では原因を特定できなかったため)。
+
+        print()による呼び出し確認ログは、有効/無効・スキップの別に
+        関わらず常に出す(kAfterSaveコールバック自体が発火しているか
+        どうかを、この関数の中身に関係なく確認できるようにするため)。
+        """
+        print("[maya_live_sync] backup_final_textures_to_sourceimages() called "
+              "(sourceimages_backup_enabled={0})".format(self.config.get("sourceimages_backup_enabled")))
+        if not self.config.get("sourceimages_backup_enabled"):
+            return
+
+        linked_keys = self._linked_sp_project_keys()
+        if not linked_keys:
+            self._emit_status(
+                "sourceimagesバックアップ: このシーンにSPプロジェクトの紐付けが"
+                "無いため、スキップしました。"
+            )
+            return
+
+        try:
+            sourceimages_root = _maya_project_sourceimages_dir()
+        except Exception as e:
+            self._emit_status("警告: sourceimagesフォルダの取得に失敗しました: {0}".format(e))
+            return
+        if not sourceimages_root:
+            self._emit_status(
+                "警告: Mayaプロジェクト(ワークスペース)のsourceimagesフォルダを"
+                "特定できなかったため、バックアップコピーをスキップしました。"
+                "File > Set Project でMayaプロジェクトを設定してから、"
+                "もう一度お試しください。"
+            )
+            return
+
+        final_by_project_normalized = self._final_subfolder_by_project_normalized()
+        copied_total = 0
+        failed_projects = []
+        skipped_projects = []
+        for key in linked_keys:
+            subfolder = final_by_project_normalized.get(key)
+            if not subfolder:
+                # このプロジェクトはまだFinal書き出しの実績が無い。次に
+                # Final書き出しされた後の保存で自然にバックアップされる。
+                skipped_projects.append(_project_display_name(key))
+                continue
+            final_dir = self._final_dir_for_project(key)
+            if not final_dir or not os.path.isdir(final_dir):
+                skipped_projects.append(_project_display_name(key))
+                continue
+            dest_dir = os.path.join(sourceimages_root, subfolder)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                copied_total += _copy_dir_contents_atomic(final_dir, dest_dir)
+            except Exception as e:
+                failed_projects.append((_project_display_name(key), e))
+
+        if copied_total:
+            self._emit_status(
+                "{0} 件のFinalテクスチャをMayaプロジェクトのsourceimages配下へ"
+                "バックアップコピーしました({1})。".format(copied_total, sourceimages_root)
+            )
+        elif not failed_projects and skipped_projects:
+            self._emit_status(
+                "sourceimagesバックアップ: {0} はまだFinal書き出しが行われていない"
+                "ため、コピーする内容がありませんでした。".format(", ".join(skipped_projects))
+            )
+        for name, e in failed_projects:
+            self._emit_status(
+                "警告: sourceimagesへのバックアップコピーに失敗しました({0}): {1}".format(name, e)
+            )
 
     def quality_for_project(self, project_key):
         """指定したSPプロジェクトの現在の表示品質を返す
@@ -5242,6 +5509,23 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.renderer_combo.addItems(RENDERER_CHOICES)
         self.renderer_combo.setToolTip("マテリアルを作るときに使うレンダラーです（通常はArnold）。")
         form.addRow("レンダラー", self.renderer_combo)
+
+        # 2026.07.26追加(ユーザー相談): C:/SPMayaLiveSync自体をクラウド
+        # 同期する代わりの選択肢。既定OFF(明示的にONにしたユーザーのみ
+        # 挙動が変わるようにするため)。
+        self.sourceimages_backup_checkbox = QtWidgets.QCheckBox(
+            "シーン保存時にFinalテクスチャをsourceimagesへバックアップコピー"
+        )
+        self.sourceimages_backup_checkbox.setToolTip(
+            "ONにすると、シーンを保存するたびに現在のFinalテクスチャを\n"
+            "Mayaプロジェクトのsourceimagesフォルダ配下へコピーします。\n"
+            "自宅・学校等の複数環境で作業する場合、C:/SPMayaLiveSync自体を\n"
+            "クラウド同期する代わりに、こちらのバックアップ先だけを\n"
+            "同期する運用にすると安全です(共有設定ファイルの巻き戻り事故を\n"
+            "避けられます)。コピー後もfileノードの参照先はそのままのため、\n"
+            "他の環境で開いた際にテクスチャを使うには手動での再接続が必要です。"
+        )
+        form.addRow("", self.sourceimages_backup_checkbox)
         layout.addWidget(self.folder_group)
 
         # --- 層2: 日常的に使う操作 / 層3: 導入時に一度だけの操作 ----------
@@ -5486,6 +5770,19 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             except Exception as e:
                 print("[maya_live_sync] {0}コールバックの登録に失敗しました: {1}".format(const_name, e))
 
+        # 2026.07.26追加(ユーザー相談): シーン保存のたびに、設定でONに
+        # している場合のみsourceimagesへのFinalテクスチャバックアップを
+        # 試みる(既定OFFのため何もしないユーザーが大多数)。詳細は
+        # LiveSyncWatcher.backup_final_textures_to_sourceimages()参照。
+        try:
+            self._scene_callback_ids.append(
+                om.MSceneMessage.addCallback(
+                    om.MSceneMessage.kAfterSave,
+                    lambda *_a: self.watcher.backup_final_textures_to_sourceimages())
+            )
+        except Exception as e:
+            print("[maya_live_sync] シーン保存コールバックの登録に失敗しました: {0}".format(e))
+
         # Phase 5: 前回終了時に監視がONだった場合は自動的に再開する
         # (毎回手動でONを押す手間を無くすため)。setChecked(True)が
         # _on_toggle経由でwatcher.start()を呼ぶ。
@@ -5501,6 +5798,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         renderer = cfg.get("renderer", "arnold")
         if renderer in RENDERER_CHOICES:
             self.renderer_combo.setCurrentIndex(RENDERER_CHOICES.index(renderer))
+        self.sourceimages_backup_checkbox.setChecked(bool(cfg.get("sourceimages_backup_enabled", False)))
 
     def _on_folder_group_toggled(self, checked):
         # UI導線改善(フェーズ1): チェックを外すと中身を折りたたんで
@@ -6194,6 +6492,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         new_values = {
             "watch_dir": self.watch_edit.text().strip(),
             "renderer": self.renderer_combo.currentText(),
+            "sourceimages_backup_enabled": self.sourceimages_backup_checkbox.isChecked(),
         }
         if not new_values["watch_dir"]:
             QtWidgets.QMessageBox.warning(self, "Live Sync", "監視フォルダが未指定です。")
@@ -6385,6 +6684,15 @@ def show_ui():
                 print("[maya_live_sync] workspaceControl was hidden; forced visible=True.")
             # 最前面に持ってくる(タブの奥に隠れているだけのケースにも対応)。
             cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, restore=True)
+            # 2026.07.26(見た目の不具合修正、ユーザー報告): workspaceControl
+            # の「タブに表示されるラベル」は、QWidget.windowTitle()とは
+            # 別にMaya側が保持しているプロパティであり、self.setWindowTitle()
+            # を呼ぶだけでは自動的に追従しない。install.py再インストール
+            # 直後にウィンドウを開き直しても、Qtの実体(windowTitle())は
+            # 正しく新バージョンになっているのに、ドックタブの見た目だけ
+            # 旧バージョン表記のまま残ることが実機で確認された(実害は無く、
+            # 表示のみの問題)。タブラベルも明示的に同期させる。
+            cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, label=_window_instance.windowTitle())
         # ウィジェット自身も前面化しておく(他タブの裏に隠れているケースの保険)。
         _window_instance.raise_()
     except Exception as e:

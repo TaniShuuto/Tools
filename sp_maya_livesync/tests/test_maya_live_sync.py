@@ -311,5 +311,121 @@ class SwitchTextureQualityCaseInsensitiveTests(_IsolatedConfigTestCase):
         self.assertEqual(switched, 0)
 
 
+# ---------------------------------------------------------------------------
+# 2026.07.26: sourceimagesへのFinalテクスチャバックアップ(ユーザー相談で追加)
+# ---------------------------------------------------------------------------
+
+class CopyDirContentsAtomicTests(_IsolatedConfigTestCase):
+    def test_copies_files_and_returns_count(self):
+        src_dir = os.path.join(self._tmpdir, "src")
+        dest_dir = os.path.join(self._tmpdir, "dest")
+        os.makedirs(src_dir, exist_ok=True)
+        os.makedirs(dest_dir, exist_ok=True)
+        with open(os.path.join(src_dir, "a.png"), "wb") as f:
+            f.write(b"fake-image-a")
+        with open(os.path.join(src_dir, "b.png"), "wb") as f:
+            f.write(b"fake-image-b")
+        # サブフォルダはコピー対象外(直下のファイルのみ)であることも確認する。
+        os.makedirs(os.path.join(src_dir, "nested"), exist_ok=True)
+
+        copied = mls._copy_dir_contents_atomic(src_dir, dest_dir)
+
+        self.assertEqual(copied, 2)
+        with open(os.path.join(dest_dir, "a.png"), "rb") as f:
+            self.assertEqual(f.read(), b"fake-image-a")
+        with open(os.path.join(dest_dir, "b.png"), "rb") as f:
+            self.assertEqual(f.read(), b"fake-image-b")
+        self.assertFalse(os.path.isdir(os.path.join(dest_dir, "nested")))
+        # 一時ファイル(*.tmpNNN)が残っていないこと。
+        leftovers = [n for n in os.listdir(dest_dir) if ".tmp" in n]
+        self.assertEqual(leftovers, [])
+
+
+class BackupFinalTexturesToSourceimagesTests(_IsolatedConfigTestCase):
+    def _prepare_workspace(self):
+        project_dir = os.path.join(self._tmpdir, "maya_project")
+        os.makedirs(project_dir, exist_ok=True)
+        cmds.workspace(project_dir, openWorkspace=True)
+        return project_dir
+
+    def test_disabled_by_default_does_nothing(self):
+        self._prepare_workspace()
+        final_dir = os.path.join(self._tmpdir, "final", "Proj_abc123")
+        os.makedirs(final_dir, exist_ok=True)
+        open(os.path.join(final_dir, "tex.png"), "wb").close()
+
+        w = mls.LiveSyncWatcher()
+        w.config["final_export_dir"] = os.path.join(self._tmpdir, "final")
+        w.config["final_subfolder_by_project"] = {"C:/MayaPrefs/SP/Proj.spp": "Proj_abc123"}
+        # sourceimages_backup_enabled は既定でFalseのまま。
+        mls._add_scene_project_link("C:/MayaPrefs/SP/Proj.spp")
+
+        w.backup_final_textures_to_sourceimages()
+
+        sourceimages_dir = mls._maya_project_sourceimages_dir()
+        self.assertFalse(os.path.isdir(os.path.join(sourceimages_dir, "Proj_abc123")))
+
+    def test_enabled_copies_final_textures_into_sourceimages_subfolder(self):
+        self._prepare_workspace()
+        final_dir = os.path.join(self._tmpdir, "final", "Proj_abc123")
+        os.makedirs(final_dir, exist_ok=True)
+        with open(os.path.join(final_dir, "M_Test_BaseColor.png"), "wb") as f:
+            f.write(b"fake-final-texture")
+
+        w = mls.LiveSyncWatcher()
+        w.config["final_export_dir"] = os.path.join(self._tmpdir, "final")
+        w.config["final_subfolder_by_project"] = {"C:/MayaPrefs/SP/Proj.spp": "Proj_abc123"}
+        w.config["sourceimages_backup_enabled"] = True
+        mls._add_scene_project_link("C:/MayaPrefs/SP/Proj.spp")
+
+        w.backup_final_textures_to_sourceimages()
+
+        sourceimages_dir = mls._maya_project_sourceimages_dir()
+        copied_path = os.path.join(sourceimages_dir, "Proj_abc123", "M_Test_BaseColor.png")
+        self.assertTrue(os.path.isfile(copied_path))
+        with open(copied_path, "rb") as f:
+            self.assertEqual(f.read(), b"fake-final-texture")
+
+    def test_skips_project_without_final_export_yet(self):
+        self._prepare_workspace()
+        w = mls.LiveSyncWatcher()
+        w.config["final_export_dir"] = os.path.join(self._tmpdir, "final")
+        w.config["final_subfolder_by_project"] = {}
+        w.config["sourceimages_backup_enabled"] = True
+        mls._add_scene_project_link("C:/MayaPrefs/SP/NeverExported.spp")
+
+        # 例外を出さずに何もしない(コピー実績0)ことだけを確認する。
+        w.backup_final_textures_to_sourceimages()
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.26: stop(reason="reinstall") がwatch_enabledを永続化しないこと
+# (ユーザー報告「再インストール後にSPプロジェクト連携が切れる」の回帰テスト)
+# ---------------------------------------------------------------------------
+
+class StopReasonTests(_IsolatedConfigTestCase):
+    def test_reinstall_reason_preserves_watch_enabled_on_disk(self):
+        mls.save_config({"watch_enabled": True})
+        w = mls.LiveSyncWatcher()
+        w.enabled = True
+
+        w.stop(reason="reinstall")
+
+        self.assertFalse(w.enabled)
+        self.assertTrue(mls.load_config().get("watch_enabled"))
+
+    def test_manual_reason_still_persists_watch_enabled_false(self):
+        # reason="reinstall"を新設した際に、既存のreason="manual"(ユーザーが
+        # 明示的にOFFボタンを押した場合)の挙動まで壊していないことを確認する。
+        mls.save_config({"watch_enabled": True})
+        w = mls.LiveSyncWatcher()
+        w.enabled = True
+
+        w.stop(reason="manual")
+
+        self.assertFalse(w.enabled)
+        self.assertFalse(mls.load_config().get("watch_enabled"))
+
+
 if __name__ == "__main__":
     unittest.main()
