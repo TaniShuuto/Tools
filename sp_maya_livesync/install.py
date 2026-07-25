@@ -41,6 +41,20 @@ NOTE:
     ASCII(英語)に統一しています(コメントは UTF-8 のまま影響ありません)。
 
 変更履歴:
+    1.0.4 (2026.07.26):
+        - _destroy_stale_livesync_window() が旧Watcherを止める際に
+          watcher.stop(reason="manual") を使っていたため、
+          watch_enabled=False がディスクへ永続化され、直後に作られる
+          新しいLiveSyncWindowの「前回終了時に監視がONだった場合は
+          自動的に再開する」機能が、たった今自分自身が書いたFalseを
+          読んでしまい、再インストールのたびに監視だけがOFFに戻る
+          不具合を修正(ユーザー報告: 「再インストール後にSPプロジェクト
+          連携が切れる」)。SPプロジェクトとの紐付け自体は元々消えて
+          いなかったが、監視の自動再開が働かなくなっていた。
+          watcher.stop(reason="reinstall") へ変更し、監視フォルダの
+          解除は行いつつwatch_enabledの値は変更しないようにした
+          (maya_live_sync.py側 LiveSyncWatcher.stop() の対応する
+          変更もあわせて必要、詳細はそちらのdocstring参照)。
     1.0.3 (2026.07.24):
         - AISS_COMMAND(シェルフボタンの起動コマンド文字列、シェルフの
           .melファイルへそのまま永続化される)に日本語コメント行が直接
@@ -74,7 +88,7 @@ NOTE:
         - 初版(SemVer導入)。
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 import os
 import sys
@@ -486,8 +500,19 @@ def _destroy_stale_livesync_window():
                             maya_live_sync.diag_c1_check_qobject_validity(window)
                     except Exception as _diag_e:
                         print("[DIAG-C1] stop()直前チェック失敗: {0}".format(_diag_e))
-                    watcher.stop(reason="manual")
-                    print("[Live Sync Installer] Stopped stale watcher before teardown.")
+                    # 2026.07.26(緊急バグ修正、ユーザー報告): reason="manual"
+                    # のままだと stop() が watch_enabled=False をディスクへ
+                    # 永続化してしまい、直後に作られる新しいLiveSyncWindowの
+                    # 「前回終了時に監視がONだった場合は自動的に再開する」
+                    # (Phase 5)がたった今自分自身が書いたFalseを読んでしまう
+                    # ため、再インストールのたびに監視だけがOFFに戻る不具合
+                    # があった(SPプロジェクトとの紐付け自体は消えていない)。
+                    # reason="reinstall"はファイルシステム監視の停止のみ行い、
+                    # watch_enabledの値は変更しない(詳細はLiveSyncWatcher.
+                    # stop()のdocstring参照)。
+                    watcher.stop(reason="reinstall")
+                    print("[Live Sync Installer] Stopped stale watcher before teardown "
+                          "(watch_enabled preserved).")
             except Exception as e:
                 _diag["watcher_stop_error"] = str(e)
                 print("[Live Sync Installer] Could not stop stale watcher: {0}".format(e))
@@ -640,6 +665,24 @@ def _run():
         new_version = getattr(maya_live_sync, "__version__", None)
     except Exception:
         pass
+
+    # 2026.07.26(挙動改善、ユーザー報告): 再インストールのたびに
+    # 「_destroy_stale_livesync_window()でウィンドウが自動的に閉じるので、
+    # シェルフボタンから手動で開き直す必要がある」という手間が発生して
+    # いた。_destroy_stale_livesync_window()は「破棄する直前にウィンドウが
+    # 実際に開いていたか」を_destroy_diagとして保持しているため、それが
+    # Trueの場合(=このインストール実行の直前までウィンドウを開いて
+    # 使っていたユーザー)に限り、ここで自動的に開き直す。ウィンドウを
+    # 開いていなかったユーザーに対して、再インストールのたびに勝手に
+    # ウィンドウを表示してしまう副作用は避けるため、条件を絞っている。
+    reopened = False
+    if _destroy_diag.get("window_instance_existed"):
+        try:
+            maya_live_sync.show_ui()
+            reopened = True
+            print("[Live Sync Installer] Reopened LiveSync window automatically.")
+        except Exception as e:
+            print("[Live Sync Installer] Could not reopen LiveSync window automatically: {0}".format(e))
 
     # 2026.07.20(フェーズ2・バージョン整合性): 上記は maya_live_sync.py
     # 単体の新旧差分表示だが、実際にコピーされる全ツールファイルの

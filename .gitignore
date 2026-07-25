@@ -33,3 +33,10 @@ config.local.json
 *.bak
 *.tmp
 *.orig
+
+# ===== AIアシスタント(Claude Code)のローカル専用ファイル =====
+CLAUDE.md
+.claude/
+
+# ===== その他、誤って生成された一時ファイル =====
+how 7d739fc --stat

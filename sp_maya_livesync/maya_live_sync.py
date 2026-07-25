@@ -120,10 +120,12 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 
 import os
 import re
+import stat
 import json
 import time
 import glob
 import uuid
+import shutil
 import base64
 import datetime
 import subprocess
@@ -744,7 +746,108 @@ def diag_c1_check_qobject_validity(window):
 # あり、新規addPath直後の「登録前に既に起きていた変更」を即座に
 # キャッチアップできる。既存の動作を壊さない不具合修正のため、SemVer
 # のルールに従いPATCHを上げる。
-__version__ = "1.4.6"
+#
+# 2026.07.25(緊急バグ修正一式): 実機で「手順通りセットアップしても
+# fileノードが見つからない」「Finalは存在するのにLiveが見つからない
+# (逆も)」「Bar_Table2とbar_table2が別プロジェクト扱いされる」の
+# 3症状が報告され、複数の観点から調査した結果、独立した3つの原因を
+# 特定して修正した。
+#   - _normalize_project_key_for_compare(): 2026.07.24にcasefold()を
+#     追加した際、この関数が _set_scene_project_links() の「保存用」
+#     正規化としても使われていたことを見落としており、シーンのfileInfo
+#     へ小文字化されたキーが焼き付いていた(状態バーの二重表示
+#     「Bar_Table2.spp（bar_table2.spp）」、監視の誤自動停止、同一
+#     プロジェクトのlink二重登録の直接原因)。保存専用の
+#     _normalize_project_key_for_storage()(大文字小文字を保持)を新設
+#     して保存経路を差し替え、比較箇所は明示的に_for_compare()を通す
+#     よう約15箇所を修正した。_linked_sp_project_keys()も、docstringの
+#     宣言通り「正規化済みを返す」よう実装を合わせた(実体が伴っておらず
+#     監視対象フォルダの解決が丸ごと崩れていた)。
+#   - _canonical_path()/_canonical_dir_map(): ファイルシステムパスの
+#     比較にケース非依存化が一切入っておらず、watch_dir等の設定の
+#     ドライブレターの大文字小文字がfileノードの実パスと食い違うだけで
+#     「fileノードが見つからない」判定になっていた約10箇所を修正した。
+#   - _watch_dir_for_project()/_final_dir_for_project(): サブフォルダ
+#     未登録時にwatch_dir/final_export_dir直下へ黙ってフォールバック
+#     していたが、実機の直下には旧運用時代の別プロジェクトの残骸
+#     テクスチャが残っており、誤って古いテクスチャを掴む温床になって
+#     いた。フォールバックを廃止してNoneを返すようにし、
+#     switch_texture_quality()側で「切り替え先未確定」を明示的に案内
+#     するようにした。あわせて起動時に直下の残骸ファイルを検出して
+#     警告する仕組みも追加した。
+#   - load_config(): known_texture_sets_by_project等の*_by_project辞書に
+#     紛れ込んだSPテンプレート(.spt)由来のキーを除去する移行処理
+#     (_purge_spt_template_keys())を追加した(SP側の対応する修正は
+#     sp_live_sync_plugin.py 1.2.0参照)。
+#   - 共有フォルダ(C:/SPMayaLiveSync)がGoogle Drive等のクラウド同期
+#     対象に入っていると、advisory lockとos.replace()の原子性の前提が
+#     崩れることが実機調査で判明した(設定ファイルの内容が数分内に
+#     巻き戻る現象を確認)。Watcher起動時に検出して警告する仕組みを
+#     追加した(強制はしない)。
+# 保存済みシーンの一部link表示は、既にcasefold済みで保存されてしまった
+# 大文字小文字の情報までは復元できない(該当シーンは再リンクが必要)。
+# それ以外は既存の動作を壊さない修正のため、MINORを上げる
+# (シーンfileInfoの保存形式が原文ケースへ変わるが、読み出し側は新旧
+# 双方の形式を吸収するため後方互換)。
+#
+# 2026.07.26追加(ユーザー相談、新機能): 自宅・学校等の複数環境で作業する
+# ユーザーから、C:/SPMayaLiveSync自体をクラウド同期しているとの相談が
+# あった。しかし共有設定ファイルは2プロセス専用のadvisory lock/atomic
+# replaceの前提で保護されており、クラウド同期クライアントが割り込むと
+# この前提が崩れる(2026.07.25の_detect_cloud_sync_risk()参照)。
+# 代替として、ライブ同期の作業フォルダではなく「完成したFinal
+# テクスチャの一方向コピー」だけをMayaプロジェクトのsourceimages配下へ
+# 置く仕組み(backup_final_textures_to_sourceimages())を追加した。
+# 単純なファイルコピーには複数プロセスの競合が無いため、コピー先を
+# クラウド同期しても安全。シーン保存(kAfterSave)のたびに、設定
+# sourceimages_backup_enabled(既定OFF)がONの場合のみ実行される。
+# シーンのfileノードの参照先自体は変更しない(あくまでバックアップ)。
+# 新設定を追加し既定を無効化した後方互換な新機能のため、MINORを上げる。
+#
+# 2026.07.26(検証用バージョン、v1.6.0.1): install.py再インストール後、
+# Maya再起動無しではウィンドウのバージョン表示・挙動が更新されない
+# という不具合報告の切り分けのため、コード内容を変更せずバージョン
+# 表記のみ一時的に4桁(SemVer外)へ更新した。
+#
+# 2026.07.26(表示不具合の修正、上記切り分けの結果判明): ユーザーとの
+# 協力調査の結果、_window_instance/モジュールのreload自体は正しく
+# 行われており(Script Editorでの直接確認により、windowTitle()が
+# 実際に "v1.6.0.1" を返すことを確認済み)、Live Sync自体の再起動不要な
+# ホットリロードは想定通り機能していることが判明した。ズレていたのは
+# MayaのworkspaceControlが持つ「タブに表示されるラベル」プロパティ
+# だけで、これはQWidget.windowTitle()とは別にMaya側が保持しており、
+# self.setWindowTitle()を呼ぶだけでは自動的に追従しない(実害の無い
+# 表示のみの問題)。show_ui()でworkspaceControlのlabelを明示的に
+# windowTitle()と同期させるよう修正した。SemVer表記を3桁に戻し、
+# 後方互換なバグ修正のためPATCHを上げる。
+#
+# 2026.07.26(診断性の改善): backup_final_textures_to_sourceimages()が
+# 「シーン保存しても何も起きない」というユーザー報告に対し、原因を
+# 一切特定できない設計だった(sourceimages_backup_enabled=False・
+# シーンにSPプロジェクトの紐付けが無い・sourceimagesフォルダが
+# 特定できない・対象プロジェクトがまだFinal未書き出し、のいずれの
+# 早期returnも無言だった)。呼び出し確認用のprint()、および各早期return
+# 箇所での状態バー通知を追加し、どの段階でスキップされているかを
+# ユーザー自身が切り分けられるようにした。既存の動作(コピー自体の
+# ロジック)は変更していないため、PATCHを上げる。
+#
+# 2026.07.26(緊急バグ修正、ユーザー報告「再インストール後にSPプロジェクト
+# 連携が切れる」): install.py の再インストール時、旧Watcherの差し替え
+# 直前に呼ばれる stop() が reason="manual" 扱いだったため、
+# watch_enabled=False をディスクへ永続化していた。直後に作られる新しい
+# LiveSyncWindowの「前回終了時に監視がONだった場合は自動的に再開する」
+# (Phase 5、__init__内)が、たった今自分自身が書いたFalseを読んでしまい、
+# 再インストールのたびに監視の自動再開が働かなくなっていた(Maya単純
+# 再起動時はstop()自体を経由しないため発生しない、「再インストール後
+# だけ」という非対称な症状として報告された)。実際にはシーン⇔SP
+# プロジェクトの紐付け自体はfileInfo/共有設定のどちらも変更していない
+# ため消えていなかったが、監視が自動で再開されなくなる分、ユーザーには
+# 「連携が切れた」ように見えていたと考えられる。stop()に
+# reason="reinstall"を新設し、ファイルシステム監視の解除は行いつつ
+# watch_enabledの値は変更しないようにした(install.py側の呼び出しも
+# あわせて変更、詳細は install.py 1.0.4 参照)。既存の動作を壊さない
+# 修正のため、PATCHを上げる。
+__version__ = "1.6.3"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -758,6 +861,66 @@ print("[maya_live_sync] loaded version: {0}  (file: {1})".format(
 
 CONFIG_DIR = "C:/SPMayaLiveSync"
 CONFIG_PATH = os.path.join(CONFIG_DIR, "live_sync_config.json")
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.25(緊急バグ修正): 共有フォルダのクラウド同期検出
+# ---------------------------------------------------------------------------
+#
+# sp_live_sync_plugin.py 側の同名関数と同じロジック(共有モジュールが無い
+# ため独立実装)。背景・判定方針はそちら側のコメントを参照。
+# ---------------------------------------------------------------------------
+
+_CLOUD_SYNC_TEMP_MARKERS = (
+    ".tmp.driveupload",   # Google Drive for desktop(能動的にアップロード中)
+    ".dropbox.cache",     # Dropbox
+    "#recycle",           # Dropbox
+    ".365_shell",         # OneDriveの一部バージョン
+)
+_CLOUD_SYNC_PATH_MARKERS = (
+    "google drive", "googledrive", "onedrive", "dropbox",
+    "icloud drive", "icloudドライブ",
+)
+
+
+def _detect_cloud_sync_risk(directory):
+    """directory(共有フォルダのルート)がクラウド同期クライアントの
+    管理下にあるらしいかどうかを推測し、該当すればその根拠を短い日本語
+    文字列で返す(該当しなければNone)。
+
+    判定材料(いずれか該当で警告):
+      1. 同期クライアントの一時フォルダの存在
+      2. パスが既知の同期フォルダ名を含む
+      3. ディレクトリ自体がreparse point(クラウドのプレースホルダ/
+         シンボリックリンク等)として認識されている
+
+    誤検知(false positive)の可能性は残るが、警告を出すだけで実害は
+    無いため、多少広めに倒して判定する。
+    """
+    if not directory:
+        return None
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        entries = []
+    for marker in _CLOUD_SYNC_TEMP_MARKERS:
+        if marker in entries:
+            return "同期クライアントの一時フォルダ({0})が見つかりました".format(marker)
+
+    normalized = directory.replace("\\", "/").lower()
+    for marker in _CLOUD_SYNC_PATH_MARKERS:
+        if marker in normalized:
+            return "パスに既知のクラウド同期フォルダ名({0})が含まれています".format(marker)
+
+    try:
+        attrs = os.lstat(directory).st_file_attributes
+    except (OSError, AttributeError):
+        attrs = None
+    if attrs is not None and (attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+        return "フォルダがreparse point(クラウドのプレースホルダ等)として認識されています"
+
+    return None
+
 
 DEFAULT_CONFIG = {
     "watch_dir": "C:/SPMayaLiveSync/live",
@@ -820,6 +983,17 @@ DEFAULT_CONFIG = {
     # Phase 5: 前回終了時の監視ON/OFF状態を覚えておき、次回起動時に
     # 自動的に復元する(毎回手動でONを押す手間を無くすため)。
     "watch_enabled": False,
+    # 2026.07.26追加(ユーザー相談): 自宅・学校等の複数環境で作業する
+    # ユーザー向けに、C:/SPMayaLiveSync自体をクラウド同期する代わりの
+    # 選択肢として追加した。ONの場合、シーン保存のたびに現在のシーンに
+    # 紐付いた各SPプロジェクトのFinalテクスチャを、Mayaプロジェクトの
+    # sourceimagesフォルダ配下へ一方向でバックアップコピーする
+    # (LiveSyncWatcher.backup_final_textures_to_sourceimages()参照)。
+    # 単純なファイルコピーには複数プロセスの競合という問題が無いため、
+    # クラウド同期対象にしても_detect_cloud_sync_risk()が警告する類の
+    # 実害が起こらない。既定はOFF(明示的にONにしたユーザーのみの挙動
+    # 変更に留めるため)。
+    "sourceimages_backup_enabled": False,
     # 2026.07.15-01: このMayaシーンファイルが、どのSPプロジェクトに
     # 対応するかは本来シーンファイル自体(fileInfo)に保存するが、
     # 未保存シーンではfileInfoを永続化できないため、直近のセッション
@@ -1316,6 +1490,55 @@ def _migrate_legacy_active_subfolder(cfg):
     return cfg
 
 
+_SPT_POLLUTED_BY_PROJECT_KEYS = (
+    "watch_subfolder_by_project",
+    "final_subfolder_by_project",
+    "known_texture_sets_by_project",
+    "texture_set_export_prefix_by_project",
+)
+
+
+def _purge_spt_template_keys(cfg):
+    """2026.07.25(緊急バグ修正): *_by_project 辞書に紛れ込んだ、SP側
+    テンプレートファイル(.spt)のパスをプロジェクトキーとするエントリを
+    取り除く。
+
+    背景: sp_live_sync_plugin.py の _current_project_key() は、テンプレート
+    から新規プロジェクトを作成した直後(未保存)に project.file_path() が
+    ドキュメントの契約に反してテンプレートの.sptパスを返すケースが
+    あり、これをそのままプロジェクトキーとして watch_subfolder_by_
+    project 等へ書き込んでしまうことがあった(実機のlive_sync_config.json
+    で ".../PBR - Metallic Roughness Alpha-blend.spt" というキーの残留を
+    確認)。SP側は2026.07.25の修正で.sptを"__unsaved__"として扱うように
+    なったため今後は新規汚染が発生しないが、既存の設定ファイルに残った
+    汚染エントリはこの移行処理で除去する。
+
+    対応するサブフォルダ自体(ディスク上のテクスチャファイル)は削除しない
+    (誤って実データを消さないため、辞書のキーだけを取り除く)。
+
+    この関数は破壊的にcfgを書き換えず、移行後のcfgを新たに返す。
+    除去が発生した場合は cfg["_purged_spt_keys"] = True を立てる
+    (呼び出し側が保存要否を判断できるようにするための内部マーカー、
+    他の_migrate_*関数と同じパターン)。
+    """
+    purged = False
+    for map_key in _SPT_POLLUTED_BY_PROJECT_KEYS:
+        by_project = cfg.get(map_key)
+        if not isinstance(by_project, dict):
+            continue
+        spt_keys = [k for k in by_project if isinstance(k, str) and k.lower().endswith(".spt")]
+        if not spt_keys:
+            continue
+        cleaned = dict(by_project)
+        for k in spt_keys:
+            del cleaned[k]
+        cfg[map_key] = cleaned
+        purged = True
+    if purged:
+        cfg["_purged_spt_keys"] = True
+    return cfg
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -1324,6 +1547,7 @@ def load_config():
         cfg.update(loaded)
         cfg = _migrate_legacy_flat_maps(cfg)
         cfg = _migrate_legacy_active_subfolder(cfg)
+        cfg = _purge_spt_template_keys(cfg)
         save_partial = {}
         if cfg.pop("_migrated_legacy_maps", False):
             save_partial["texture_set_export_prefix_by_project"] = cfg["texture_set_export_prefix_by_project"]
@@ -1333,6 +1557,9 @@ def load_config():
         if cfg.pop("_migrated_active_subfolder", False):
             save_partial["watch_subfolder_by_project"] = cfg["watch_subfolder_by_project"]
             save_partial["final_subfolder_by_project"] = cfg["final_subfolder_by_project"]
+        if cfg.pop("_purged_spt_keys", False):
+            for map_key in _SPT_POLLUTED_BY_PROJECT_KEYS:
+                save_partial[map_key] = cfg[map_key]
         if save_partial:
             # 移行結果をディスクへ書き戻す(次回以降は移行処理をスキップ
             # できるようにするため)。保存に失敗しても致命的ではないので
@@ -1579,12 +1806,214 @@ def _normalize_project_key_for_compare(key):
     ものではないため、Unicode正規化(NFC)と大文字小文字の統一
     (casefold)をここに追加しても、呼び出し元が既に両辺をこの関数
     経由で比較している限り安全(ディスク上のキー形式には影響しない)。
+
+    2026.07.25(緊急バグ修正): 上記の「ディスク上のキー形式には影響
+    しない」という前提が誤りだった。_set_scene_project_links() が
+    この関数を「保存直前の正規化」としても呼んでおり、casefold済みの
+    値がそのままシーンのfileInfoへ書き込まれていた。保存用の正規化を
+    _normalize_project_key_for_storage()(大文字小文字を保持)へ分離し、
+    この関数(casefold込み)は名実ともに比較専用に限定した。詳細は
+    _normalize_project_key_for_storage() のdocstring参照。
+    """
+    if not key:
+        return key
+    return _normalize_project_key_for_storage(key).casefold()
+
+
+def _normalize_project_key_for_storage(key):
+    """2026.07.25(緊急バグ修正): ディスクへ「保存する」ための正規化。
+
+    _normalize_project_key_for_compare() から、情報を失わない部分だけを
+    切り出したもの。区切り文字のスラッシュ統一とUnicode正規化(NFC)は
+    行うが、大文字小文字は原文のまま保持する。
+
+    分離した理由(今回の障害の直接原因): 2026.07.24に
+    _normalize_project_key_for_compare() へ casefold() を追加した際、
+    この関数が _set_scene_project_links() の「保存形式」としても
+    使われていることを見落としていた。結果、シーンのfileInfoへ小文字化
+    されたキーが焼き付き、
+      - 状態バーが「Bar_Table2.spp（bar_table2.spp）」のように原文と
+        小文字を並べて表示する
+      - 旧バージョンが原文ケースで保存した既存シーンのlinkと、SP側由来の
+        casefold済みキーが == で一致しなくなり、
+        _ensure_active_dirs_watched() の「不一致なら監視を自動停止」が
+        誤発火して同期が止まる
+      - _add_scene_project_link() の重複判定が外れ、同じプロジェクトの
+        linkが二重登録される
+    という広範囲の不具合が実機で発生した(livesync_history.logにて
+    「作業対象を『Bar_Table2.spp（bar_table2.spp）』へ自動的に切り替え
+    ました」「監視を停止しました」として再現を確認)。
+
+    以後の使い分け:
+      - ディスク(fileInfo/設定ファイル)へ書く値 -> この関数
+      - 比較・辞書のキーとして使う値 -> _normalize_project_key_for_compare()
+    2026.07.16の「バックスラッシュのままfileInfoへ渡すと制御文字へ化ける」
+    という修正の意図は、この関数がそのまま引き継いでいる(区切り文字の
+    スラッシュ統一を外してはならない)。
+
+    注意: 既にcasefold()済みで保存されてしまった過去のlink(このバグの
+    被害を受けた既存シーン)は、この関数を通しても大文字小文字までは
+    復元できない(失われた情報は戻せないため)。該当シーンは、リンクを
+    削除してSP側の現在の表記で再登録することでのみ表示が正常化する。
     """
     if not key:
         return key
     normalized = key.replace("\\", "/")
-    normalized = unicodedata.normalize("NFC", normalized)
-    return normalized.casefold()
+    return unicodedata.normalize("NFC", normalized)
+
+
+def _canonical_path(path):
+    """2026.07.25(緊急バグ修正): ファイルシステムパスの「比較専用」正規化。
+
+    _normalize_project_key_for_compare()/_normalize_project_key_for_storage()
+    とは目的が異なる別物(あちらはSPプロジェクトキー用)。こちらは
+    os.path.normpath() に加えて casefold() を行い、Windowsのパスが本来
+    大文字小文字を区別しないという事実に判定を合わせる。
+
+    背景(今回の障害の一因): 2026.07.24にプロジェクトキー側だけへ
+    casefold() を入れた一方、fileノードのパスと監視フォルダの突き合わせは
+    os.path.normpath() の完全一致のままだった。normpath() は区切り文字を
+    揃えるだけでケースを変えないため、設定に "C:/..." と入れたか
+    "c:/..." と入れたかの違いだけで
+      「切り替え対象の file ノードが見つかりませんでした」
+      「監視フォルダを参照する file ノードが見つかりませんでした」
+    が発生する。
+
+    重要: 戻り値は判定専用であり、cmds.setAttr() でfileノードへ書き戻す
+    パスには絶対に使わないこと(小文字化されたパスがシーンへ焼き付き、
+    見た目が崩れる)。実パスが必要な場面では、_canonical_dir_map() が
+    返す「正準キー -> 原文パス」の対応から原文側を取り出して使う。
+    """
+    if not path:
+        return path
+    return os.path.normpath(path).casefold()
+
+
+def _canonical_dir_map(paths):
+    """パスの集合を {_canonical_path(p): 元のパス} の辞書にして返す。
+
+    所属判定(`_canonical_path(x) in dirs`)をケース非依存にしつつ、実際に
+    ファイルパスを組み立てる際は原文側(`dirs[...]`)を取り出せるように
+    するためのヘルパー。_canonical_path() の注意書きを参照。
+
+    同じフォルダを指す表記ゆれ(大文字小文字違い)が複数含まれていた場合は
+    後勝ちで1件に畳まれるが、どちらも同じ実フォルダを指すため実害は無い。
+    """
+    result = {}
+    for path in paths:
+        if not path:
+            continue
+        result[_canonical_path(path)] = path
+    return result
+
+
+_STRAY_ROOT_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr")
+
+
+def _find_stray_root_texture_files(directory):
+    """2026.07.25(緊急バグ修正): watch_dir/final_export_dir「直下」に、
+    プロジェクト別サブフォルダ方式(2026.07.14-02)より前の運用の名残
+    である画像ファイルが残っていないかを調べる。
+
+    背景: _watch_dir_for_project()/_final_dir_for_project() は以前、
+    サブフォルダ未登録のプロジェクトに対して直下フォルダへ黙って
+    フォールバックしていた(2026.07.25に廃止、詳細はそれぞれの
+    docstring参照)。実機の watch_dir 直下には旧バージョン時代の
+    別プロジェクトのテクスチャが残っており、この副作用で無関係な
+    古いテクスチャを誤って掴む温床になっていた。フォールバック自体は
+    廃止したが、既存の残骸ファイルはユーザーのデータであり自動削除は
+    行わないため、代わりに気づけるよう警告するための検出関数。
+
+    戻り値: 直下(サブフォルダは含まない)で見つかった画像ファイル名の
+    リスト(無ければ空リスト)。
+    """
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return []
+    return [
+        e for e in entries
+        if e.lower().endswith(_STRAY_ROOT_IMAGE_EXTS) and os.path.isfile(os.path.join(directory, e))
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 2026.07.26追加(ユーザー相談): sourceimagesへのFinalテクスチャバックアップ
+# ---------------------------------------------------------------------------
+#
+# 背景: 自宅・学校等の複数環境で作業するユーザーから、C:/SPMayaLiveSync
+# 自体をクラウド同期しているとの相談があった。しかし共有設定ファイル
+# (live_sync_config.json)はMaya側・SP側の2プロセスだけが触る前提で
+# advisory lock(msvcrt.locking)とos.replace()によるアトミックな置き換え
+# で保護されており、クラウド同期クライアントという3人目の書き込み者が
+# 割り込むとこの前提が崩れる(詳細は_detect_cloud_sync_risk()上の
+# コメント、および実機調査で確認した設定ファイルの巻き戻り事例を参照)。
+#
+# 代替案として、ライブ同期の作業フォルダそのものではなく、「完成した
+# Finalテクスチャの一方向コピー」だけをMayaプロジェクトのsourceimages
+# 配下に置き、そちらをクラウド同期してもらう設計にした。単純な
+# ファイルコピーには複数プロセスの競合という問題がそもそも存在しない
+# ため、advisory lockの前提を必要とせず安全にクラウド同期できる。
+#
+# 設計判断(ユーザーとの相談で確定):
+#   - コピー後もシーンのfileノードの参照先はC:/SPMayaLiveSyncのままとし、
+#     sourceimages配下はあくまでバックアップ(他環境で開いた際に実際に
+#     使うには、ユーザーが手動でテクスチャを再接続する必要がある)。
+#     ライブ同期のセマンティクス自体は変更しない。
+#   - トリガーはシーン保存(kAfterSave)。Mayaのクラッシュ・強制終了時に
+#     発火しない可能性があるが、保存のたびに実行されるため、次の保存で
+#     自然に追いつく(セッションロックがkMayaExitingのみに依存せず
+#     経過時間フォールバックも持つのと同じ考え方)。
+# ---------------------------------------------------------------------------
+
+def _maya_project_sourceimages_dir():
+    """現在のMayaプロジェクトのsourceimagesフォルダの絶対パスを返す。
+    プロジェクトルール自体が取得できない場合は既定の"sourceimages"を
+    使う。取得に失敗した場合はNoneを返す。
+    """
+    try:
+        rule = cmds.workspace(fileRuleEntry="sourceImages") or "sourceimages"
+    except Exception:
+        rule = "sourceimages"
+    try:
+        expanded = cmds.workspace(expandName=rule)
+    except Exception:
+        expanded = None
+    if not expanded:
+        return None
+    return os.path.normpath(expanded)
+
+
+def _copy_dir_contents_atomic(src_dir, dest_dir):
+    """src_dir直下のファイルをdest_dirへコピーする。
+
+    コピー先(sourceimages配下)自体もユーザーがクラウド同期する想定の
+    ため、他プロセス(同期クライアント)が同時にdest_dir配下を読む
+    可能性を考慮し、一時ファイル名でコピーしてからos.replace()で
+    置き換える(CLAUDE.md記載の「他プロセスが同時に読む可能性のある
+    ファイルシステムへの書き込みは、すべて一時ファイル+os.replace()で
+    行う」という既存の規約に合わせる)。
+
+    戻り値: 実際にコピーしたファイル数。
+    """
+    copied = 0
+    for name in os.listdir(src_dir):
+        src_path = os.path.join(src_dir, name)
+        if not os.path.isfile(src_path):
+            continue
+        dest_path = os.path.join(dest_dir, name)
+        tmp_path = "{0}.tmp{1}".format(dest_path, os.getpid())
+        try:
+            shutil.copyfile(src_path, tmp_path)
+            os.replace(tmp_path, dest_path)
+            copied += 1
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    return copied
 
 
 def _generate_link_id():
@@ -1612,8 +2041,13 @@ def _migrate_legacy_scene_link(legacy_key):
     時の最低限の動作を維持するため)。
 
     legacy_key が空/Noneの場合は空のペイロードを返す。
+
+    2026.07.25(緊急バグ修正): 保存する値は _normalize_project_key_for_
+    compare()(casefold込み)ではなく _normalize_project_key_for_storage()
+    (大文字小文字を保持)を使う。理由は _normalize_project_key_for_
+    storage() のdocstring参照。
     """
-    normalized = _normalize_project_key_for_compare(legacy_key)
+    normalized = _normalize_project_key_for_storage(legacy_key)
     if not normalized:
         return _empty_scene_links_payload()
 
@@ -1732,6 +2166,17 @@ def _validate_scene_links_payload(payload):
 
     トップレベルの形自体が不正(dictでない、"links"が無い等)な場合は
     Noneを返す。
+
+    2026.07.25(緊急バグ修正): このメソッドは _get_scene_project_links()
+    の全ての読み出し経路(fileInfo/未保存シーン用フォールバックの両方)
+    が最終的に通る唯一の合流点。ここで各linkのsp_project_keyを
+    _normalize_project_key_for_storage() に通し、区切り文字・Unicode
+    正規化形式を揃える。旧バージョン(casefold導入前)が原文ケースで
+    保存した値、および導入直後にcasefold済みで保存されてしまった値の
+    両方がここを通るため、以降は _normalize_project_key_for_compare()
+    を通した比較に一本化できる。ただしcasefold済みで既に保存された
+    値の大文字小文字は失われた情報であり、この関数では復元できない
+    (該当linkはユーザーが削除して再登録するまで小文字表示のまま)。
     """
     if not isinstance(payload, dict) or "links" not in payload:
         return None
@@ -1748,7 +2193,7 @@ def _validate_scene_links_payload(payload):
             continue
         valid_links.append({
             "id": link.get("id"),
-            "sp_project_key": link.get("sp_project_key"),
+            "sp_project_key": _normalize_project_key_for_storage(link.get("sp_project_key")),
             "label": link.get("label") or "",
             "bound_nodes": link.get("bound_nodes") if isinstance(link.get("bound_nodes"), list) else [],
         })
@@ -1795,12 +2240,19 @@ def _set_scene_project_links(payload):
     2026.07.19-04(緊急修正): fileInfoへの書き込みはJSON文字列を直接
     渡さず、Base64エンコードしたASCII文字列を渡す
     (_get_scene_project_links の同日コメント参照)。
+
+    2026.07.25(緊急バグ修正): 正規化に _normalize_project_key_for_
+    compare()(casefold込み)を使っていたため、シーンのfileInfoへ
+    小文字化されたキーがそのまま焼き付いていた(状態バーの二重表示
+    「Bar_Table2.spp（bar_table2.spp）」、監視の誤自動停止の直接原因)。
+    保存用の _normalize_project_key_for_storage()(大文字小文字を保持)
+    へ差し替える。
     """
     normalized_links = []
     for link in payload.get("links", []):
         normalized_links.append({
             "id": link.get("id") or _generate_link_id(),
-            "sp_project_key": _normalize_project_key_for_compare(link.get("sp_project_key")),
+            "sp_project_key": _normalize_project_key_for_storage(link.get("sp_project_key")),
             "label": link.get("label") or "",
             "bound_nodes": list(link.get("bound_nodes", [])),
         })
@@ -1878,13 +2330,23 @@ def _add_scene_project_link(sp_project_key, label=None):
 
     戻り値: 追加(または既存採用)されたlinkのdict。上限超過で追加でき
     なかった場合は None。
+
+    2026.07.25(緊急バグ修正): 保存する値と比較に使う値を分離した。
+    ディスクへ書く sp_project_key は _normalize_project_key_for_
+    storage()(大文字小文字を保持)、既存linkとの重複判定は
+    _normalize_project_key_for_compare()(casefold込み)を両辺に通して
+    行う。以前は既存linkの sp_project_key(保存時にcasefold済み)と、
+    今回比較用に作った値(同じくcasefold済み)を比較しており偶然一致して
+    いたが、保存側をstorage正規化へ変えたことで既存link側は原文ケース
+    になるため、比較のたびに明示的にcompare正規化を通す必要がある。
     """
-    normalized_key = _normalize_project_key_for_compare(sp_project_key)
+    storage_key = _normalize_project_key_for_storage(sp_project_key)
+    compare_key = _normalize_project_key_for_compare(sp_project_key)
     payload = _get_scene_project_links()
 
     existing = None
     for link in payload.get("links", []):
-        if link.get("sp_project_key") == normalized_key:
+        if _normalize_project_key_for_compare(link.get("sp_project_key")) == compare_key:
             existing = link
             break
 
@@ -1899,8 +2361,8 @@ def _add_scene_project_link(sp_project_key, label=None):
 
     new_link = {
         "id": _generate_link_id(),
-        "sp_project_key": normalized_key,
-        "label": label or _project_display_name(normalized_key) or "",
+        "sp_project_key": storage_key,
+        "label": label or _project_display_name(storage_key) or "",
         "bound_nodes": [],
     }
     payload = dict(payload)
@@ -1941,7 +2403,8 @@ def _set_active_link(link_id):
 
 
 def _get_current_scene_project_link():
-    """[互換ラッパー] 現在アクティブなlinkのsp_project_keyだけを返す。
+    """[互換ラッパー] 現在アクティブなlinkのsp_project_keyを、比較用に
+    正規化して返す。
 
     2026.07.19-03より前は「シーンにつき1つの紐付け」という設計だった
     ため、多数の呼び出し元がこの関数の戻り値(文字列またはNone)を
@@ -1949,12 +2412,20 @@ def _get_current_scene_project_link():
     全置換すると変更範囲が広がり過ぎるため、当面は「現在アクティブな
     linkのキーを返す」薄いラッパーとして残す。新規コードは
     _get_scene_project_links() を直接使うこと。
+
+    2026.07.25(緊急バグ修正): 戻り値を _normalize_project_key_for_
+    compare() 通過後の値に変更した。既存の呼び出し元
+    (get_active_project_label() 等)は、SP側由来の active_project_key を
+    _normalize_project_key_for_compare() で正規化した値と直接 == 比較
+    する設計になっており、ここが正規化前の値(2026.07.25時点では
+    _normalize_project_key_for_storage() 通過後、大文字小文字は保持)を
+    返すと表記ゆれだけで不一致判定になってしまう。
     """
     payload = _get_scene_project_links()
     active_link = _find_link(payload, payload.get("active_link_id"))
     if active_link is None:
         return None
-    return active_link.get("sp_project_key") or None
+    return _normalize_project_key_for_compare(active_link.get("sp_project_key")) or None
 
 
 def _set_current_scene_project_link(sp_project_key):
@@ -2034,6 +2505,15 @@ def _link_display_name(link):
     ように同じ名前が二重表示される不具合があった(実機ログで確認)。
     label と basename が実質同一(拡張子の有無だけの違いを含む)の
     場合は、basename側のみを表示する。
+
+    2026.07.25(緊急バグ修正): 重複判定を大文字小文字を区別しない比較
+    (casefold)に変更した。過去に _normalize_project_key_for_compare()
+    がcasefold込みで保存へ使われていた期間に登録されたlink(既に
+    大文字小文字の情報が失われている)では、label側は入力ダイアログの
+    原文("Bar_Table2.spp")のまま、basename側だけがcasefold後の
+    "bar_table2.spp"になっており、大文字小文字だけが違う実質重複が
+    従来の完全一致比較ではすり抜けて「Bar_Table2.spp（bar_table2.spp）」
+    のように二重表示されていた。
     """
     if not link:
         return None
@@ -2043,7 +2523,7 @@ def _link_display_name(link):
     if label and basename:
         label_stem, _ = os.path.splitext(label)
         basename_stem, _ = os.path.splitext(basename)
-        if label == basename or label_stem == basename_stem:
+        if label.casefold() == basename.casefold() or label_stem.casefold() == basename_stem.casefold():
             return basename
         return "{0}（{1}）".format(label, basename)
     return label or basename
@@ -2207,6 +2687,23 @@ class LiveSyncWatcher(QtCore.QObject):
         self.project_poll_timer.timeout.connect(self._ensure_active_dirs_watched)
         self.project_poll_timer.start()
 
+        # 2026.07.25(緊急バグ修正): 共有フォルダがクラウド同期対象に
+        # 入っていると、設定ファイルの原子的な置き換え・アドバイザリ
+        # ロックの前提が崩れる(詳細は _detect_cloud_sync_risk() 上の
+        # コメント参照)。強制はせず、Watcher生成のたびに検出して知らせる。
+        try:
+            cloud_sync_reason = _detect_cloud_sync_risk(CONFIG_DIR)
+            if cloud_sync_reason:
+                self._emit_status(
+                    "警告: 共有フォルダ({0})がクラウド同期(Google Drive/OneDrive/"
+                    "Dropbox等)の対象になっている可能性があります({1})。"
+                    "同期クライアントがファイルを横から書き換えることで、"
+                    "設定ファイルの巻き戻りや同期の無言失敗につながる恐れが"
+                    "あります。可能であればこのフォルダを同期対象から"
+                    "除外してください。".format(CONFIG_DIR, cloud_sync_reason)
+                )
+        except Exception:
+            pass
 
     def _emit_status(self, text):
         line = "[{0}] {1}".format(_now(), text)
@@ -2334,6 +2831,14 @@ class LiveSyncWatcher(QtCore.QObject):
         のにシーンが常に未保存扱いになり続けてしまう。そのため、
         「切り替え先が現在のactive_link_idと異なる場合のみ」呼び出す
         ガードを設けている。
+
+        2026.07.25(緊急バグ修正): link.get("sp_project_key") との比較を
+        _normalize_project_key_for_compare() 通しに変更した。以前は
+        シーン側のlinkキー・active_keyの双方が
+        _normalize_project_key_for_compare()(casefold込み)で保存されて
+        いたため == の直接比較で偶然成立していたが、保存経路を
+        _normalize_project_key_for_storage()(大文字小文字を保持)へ
+        戻したことで、比較のたびに明示的な正規化が必要になった。
         """
         active_key = _normalize_project_key_for_compare(self.config.get("active_project_key"))
         if not active_key or active_key == "__unsaved__":
@@ -2349,7 +2854,7 @@ class LiveSyncWatcher(QtCore.QObject):
 
         matched = None
         for link in links:
-            if link.get("sp_project_key") == active_key:
+            if _normalize_project_key_for_compare(link.get("sp_project_key")) == active_key:
                 matched = link
                 break
         if matched is None:
@@ -2604,6 +3109,25 @@ class LiveSyncWatcher(QtCore.QObject):
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         os.makedirs(watch_dir, exist_ok=True)
         os.makedirs(final_dir, exist_ok=True)
+
+        # 2026.07.25(緊急バグ修正): watch_dir/final_dir直下に残る旧運用の
+        # 残骸テクスチャは自動削除しない(ユーザーのデータのため)。ただし
+        # _watch_dir_for_project()等のルートフォールバックを廃止した今、
+        # 残骸ファイルの存在に気づけないと原因不明のまま放置されやすい
+        # ため、監視開始のたびに検出して知らせる。詳細は
+        # _find_stray_root_texture_files() のdocstring参照。
+        for label, root_dir in (("監視", watch_dir), ("Final", final_dir)):
+            stray = _find_stray_root_texture_files(root_dir)
+            if stray:
+                self._emit_status(
+                    "警告: {0}フォルダ直下に旧バージョン運用時代の残骸と見られる"
+                    "画像ファイルが{1}件あります({2})。プロジェクト別サブフォルダの"
+                    "外にあるため同期対象にはなりませんが、誤って古いテクスチャを"
+                    "参照しないよう内容をご確認のうえ、不要であれば手動で削除・"
+                    "退避してください: {3}".format(
+                        label, len(stray), ", ".join(stray[:5]) + ("..." if len(stray) > 5 else ""), root_dir
+                    )
+                )
         # Finalフォルダも監視対象に加える(表示品質をFinalにしたまま
         # SP側で保存しても自動反映されない不具合の修正。プレビュー
         # フォルダと同様、更新を検知したら再読込のトリガーにする)。
@@ -2676,6 +3200,28 @@ class LiveSyncWatcher(QtCore.QObject):
                               (Mayaプロセス自体は生きており、別の
                               シーンで改めて監視を始める可能性が
                               あるため)。
+            "reinstall"    - 2026.07.26追加(ユーザー報告の不具合修正)。
+                              install.py の再インストール時、旧Watcherを
+                              新しいものに差し替える直前にだけ呼ばれる
+                              (_destroy_stale_livesync_window()参照)。
+                              背景: 従来はここでも reason="manual" を
+                              使っており、watch_enabled=Falseがディスクへ
+                              永続化されていた。ところが直後に作られる
+                              新しいLiveSyncWindowは「前回終了時に監視が
+                              ONだった場合は自動的に再開する」(Phase 5、
+                              __init__参照)仕組みを持っており、そこが
+                              load_config()経由でたった今自分自身が
+                              書いたFalseを読んでしまい、再インストールの
+                              たびに監視が自動再開されなくなっていた
+                              (Mayaを素の再起動した場合はstop()自体を
+                              経由しないため発生せず、「再インストール後
+                              だけ監視だけがOFFに戻る(SPプロジェクトとの
+                              紐付け自体は消えていない)」という非対称な
+                              挙動として報告された)。ファイルシステム
+                              監視自体は(旧オブジェクトが破棄される前に
+                              走り続けるのを防ぐため)確実に止める必要が
+                              あるが、ユーザーが最後に選んだwatch_enabled
+                              の値は変更しない。
         """
         for d in list(self.fs_watcher.directories()):
             self.fs_watcher.removePath(d)
@@ -2692,14 +3238,21 @@ class LiveSyncWatcher(QtCore.QObject):
         if reason == "manual":
             _clear_session_lock_if_own()
             self._emit_status("監視を停止しました。")
+            save_config({"watch_enabled": False})
+            self.config["watch_enabled"] = False
+        elif reason == "reinstall":
+            # 状態バーへの通知は行わない(この直後にウィンドウごと破棄
+            # されるため、誰にも見られず意味が無い)。watch_enabledの
+            # 永続化もしない(上記docstring参照)。
+            pass
         else:
             self._auto_stopped_by_scene_change = True
             self._emit_status(
                 "Mayaのシーンが切り替わったため、監視を自動的に停止しました。"
                 "このシーンに対応するSPプロジェクトを設定すると、再開できます。"
             )
-        save_config({"watch_enabled": False})
-        self.config["watch_enabled"] = False
+            save_config({"watch_enabled": False})
+            self.config["watch_enabled"] = False
 
     # -- イベントハンドラ ---------------------------------------------------
 
@@ -2840,9 +3393,15 @@ class LiveSyncWatcher(QtCore.QObject):
         # すべてreload対象に含める。
         watch_root = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
         active_watch_dirs = self._active_watch_dirs()
-        watch_dirs = {os.path.normpath(d) for d in active_watch_dirs}
+        # 2026.07.25(緊急バグ修正): 所属判定をケース非依存(_canonical_
+        # path())にする。以前は os.path.normpath() の完全一致だけで判定
+        # しており、watch_dir設定のドライブレターの大文字小文字が
+        # 実際のfileノードのパスと食い違うだけで「fileノードが見つから
+        # ない」扱いになっていた。詳細は _canonical_path() のdocstring
+        # 参照。
+        watch_dirs = _canonical_dir_map(active_watch_dirs)
         if not watch_dirs:
-            watch_dirs = {watch_root}
+            watch_dirs = _canonical_dir_map([watch_root])
 
         # 2026.07.15-03(緊急修正): 以前は「fileノードが今まさに現在の
         # watch_dir を参照しているか」の完全一致でしか対象を拾えず、
@@ -2899,8 +3458,8 @@ class LiveSyncWatcher(QtCore.QObject):
             if os.path.isdir(watch_root):
                 for entry in os.listdir(watch_root):
                     candidate = os.path.normpath(os.path.join(watch_root, entry))
-                    if os.path.isdir(candidate) and candidate not in watch_dirs:
-                        stale_subfolder_dirs.add(candidate)
+                    if os.path.isdir(candidate) and _canonical_path(candidate) not in watch_dirs:
+                        stale_subfolder_dirs.add(_canonical_path(candidate))
         except OSError:
             pass
 
@@ -2932,9 +3491,10 @@ class LiveSyncWatcher(QtCore.QObject):
                 if not tex_path:
                     continue
                 tex_dir = os.path.normpath(os.path.dirname(tex_path))
-                if tex_dir in watch_dirs:
+                tex_dir_canonical = _canonical_path(tex_dir)
+                if tex_dir_canonical in watch_dirs:
                     pass  # 既にいずれかの監視対象サブフォルダを参照している通常ケース
-                elif tex_dir in stale_subfolder_dirs:
+                elif tex_dir_canonical in stale_subfolder_dirs:
                     # 古いプロジェクト用サブフォルダを参照したまま取り残
                     # されたノード。ファイル名がどのプロジェクトの既知
                     # テクスチャセットのprefixと一致するかを特定し
@@ -3059,9 +3619,11 @@ class LiveSyncWatcher(QtCore.QObject):
         """
         final_root = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         active_final_dirs = self._active_final_dirs()
-        all_final_dirs = {os.path.normpath(d) for d in active_final_dirs}
+        # 2026.07.25(緊急バグ修正): reload_textures() と同じ理由で、
+        # 所属判定をケース非依存(_canonical_path())にする。
+        all_final_dirs = _canonical_dir_map(active_final_dirs)
         if not all_final_dirs:
-            all_final_dirs = {final_root}
+            all_final_dirs = _canonical_dir_map([final_root])
 
         # 2026.07.22: 古いサブフォルダの検出("stale"判定)は、必ず
         # all_final_dirs(このシーンに紐付いた全プロジェクト分)を基準に
@@ -3070,7 +3632,8 @@ class LiveSyncWatcher(QtCore.QObject):
         # 正当なフォルダまで「古い」と誤判定し、無関係な補正が走ってしまう。
         final_dirs = all_final_dirs
         if only_dirs is not None:
-            final_dirs = all_final_dirs & {os.path.normpath(d) for d in only_dirs}
+            only_dirs_canonical = _canonical_dir_map(only_dirs)
+            final_dirs = {c: p for c, p in all_final_dirs.items() if c in only_dirs_canonical}
             if not final_dirs:
                 return
 
@@ -3079,8 +3642,8 @@ class LiveSyncWatcher(QtCore.QObject):
             if os.path.isdir(final_root):
                 for entry in os.listdir(final_root):
                     candidate = os.path.normpath(os.path.join(final_root, entry))
-                    if os.path.isdir(candidate) and candidate not in all_final_dirs:
-                        stale_subfolder_dirs.add(candidate)
+                    if os.path.isdir(candidate) and _canonical_path(candidate) not in all_final_dirs:
+                        stale_subfolder_dirs.add(_canonical_path(candidate))
         except OSError:
             pass
 
@@ -3105,9 +3668,10 @@ class LiveSyncWatcher(QtCore.QObject):
                 if not tex_path:
                     continue
                 tex_dir = os.path.normpath(os.path.dirname(tex_path))
-                if tex_dir in final_dirs:
+                tex_dir_canonical = _canonical_path(tex_dir)
+                if tex_dir_canonical in final_dirs:
                     pass
-                elif tex_dir in stale_subfolder_dirs:
+                elif tex_dir_canonical in stale_subfolder_dirs:
                     # 2026.07.15-05・2026.07.21: ファイル名がどのプロジェ
                     # クトの既知テクスチャセットのprefixと一致するかを
                     # 特定し(無関係な他プロジェクトを誤補正しないための
@@ -3356,11 +3920,18 @@ class LiveSyncWatcher(QtCore.QObject):
         }
         payload = _get_scene_project_links()
         # プロジェクトキー -> このシーンでの表示名(labelがあればそちら優先)
+        # 2026.07.25(緊急バグ修正): キーをcompare正規化(casefold込み)して
+        # linked_keys(_linked_sp_project_keys()、同じくcompare正規化済み)
+        # と突き合わせられるようにする。以前は保存形式そのまま(当時は
+        # casefold込み)で偶然一致していたが、保存経路を大文字小文字保持
+        # へ戻したことで明示的な正規化が必要になった。
         display_name_by_key = {}
         for link in payload.get("links", []):
-            key = link.get("sp_project_key")
-            if key:
-                display_name_by_key[key] = _link_display_name(link) or _project_display_name(key)
+            raw_key = link.get("sp_project_key")
+            if raw_key:
+                display_name_by_key[_normalize_project_key_for_compare(raw_key)] = (
+                    _link_display_name(link) or _project_display_name(raw_key)
+                )
 
         rows = []
         for key in linked_keys:
@@ -3540,16 +4111,24 @@ class LiveSyncWatcher(QtCore.QObject):
         「今SP側でアクティブなプロジェクト以外」のfileノードも正しく
         管理対象と認識できるようになる(症状: 「Fileノードが存在するのに
         一度再起動しなければマテリアルを認識しない」の根治)。
+
+        2026.07.25(緊急バグ修正): 戻り値をケース非依存の正準パス集合
+        (_canonical_path() 通過後)へ変更した。呼び出し元(is_texture_
+        set_mapped()/find_orphan_file_nodes()/switch_texture_quality())は
+        いずれも「fileノードのディレクトリがこの集合に含まれるか」の
+        判定にしか使っておらず、元の大文字小文字を必要とする箇所が無い
+        ため、判定側だけを正準化する形で対応できる。詳細は
+        _canonical_path() のdocstring参照。
         """
         dirs = set()
         watch_dir = self.config.get("watch_dir")
         if watch_dir:
-            dirs.add(os.path.normpath(watch_dir))
-        dirs |= self._active_watch_dirs()
+            dirs.add(_canonical_path(watch_dir))
+        dirs |= {_canonical_path(d) for d in self._active_watch_dirs()}
         final_dir = self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"]
         if final_dir:
-            dirs.add(os.path.normpath(final_dir))
-        dirs |= self._active_final_dirs()
+            dirs.add(_canonical_path(final_dir))
+        dirs |= {_canonical_path(d) for d in self._active_final_dirs()}
         return dirs
 
     def _active_watch_dir(self):
@@ -3613,24 +4192,120 @@ class LiveSyncWatcher(QtCore.QObject):
         2026.07.22(表示品質のプロジェクト別管理化)で新設。
         _active_watch_dir()(単数形、「今SP側が開いているプロジェクト」
         固定)と異なり、任意のプロジェクトを明示的に指定できる。
-        create_shader_network() と同じ方針で、そのプロジェクトがまだ
-        プレビュー書き出しの実績が無い(サブフォルダ未登録)場合は
-        watch_dir 直下へフォールバックする(_active_watch_dirs()複数形の
-        ように「未登録なら追跡対象から外す」設計とは意図的に違う。
-        単一プロジェクトを明示的に対象にするこの関数では、フォールバック
-        先が無いよりは watch_dir 直下を暫定候補として返す方が親切なため)。
+
+        2026.07.25(緊急バグ修正): 以前はそのプロジェクトがまだプレビュー
+        書き出しの実績が無い(サブフォルダ未登録)場合に watch_dir 直下へ
+        フォールバックしていたが、実機の watch_dir 直下には旧バージョン
+        運用時代の別プロジェクトの残骸ファイルが残っており、無関係な
+        古いテクスチャを誤って掴む危険があった。加えて、複数形の
+        _active_watch_dirs() は同じ状況で「追跡対象から外す(スキップ)」
+        という逆の挙動をしており、単数形と複数形で未登録時の方針が
+        矛盾していた。呼び出し元(switch_texture_quality()/
+        detect_quality_by_project())が「まだ確定していない」ことを
+        明示的に扱えるよう、フォールバックせず None を返すよう変更した。
         """
         watch_dir = os.path.normpath(self.config.get("watch_dir") or DEFAULT_CONFIG["watch_dir"])
         normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
         subfolder = self._watch_subfolder_by_project_normalized().get(normalized_key) if normalized_key else None
-        return os.path.normpath(os.path.join(watch_dir, subfolder)) if subfolder else watch_dir
+        return os.path.normpath(os.path.join(watch_dir, subfolder)) if subfolder else None
 
     def _final_dir_for_project(self, project_key):
-        """_watch_dir_for_project() のFinal版。"""
+        """_watch_dir_for_project() のFinal版。フォールバックを行わない
+        理由も同一(2026.07.25、_watch_dir_for_project() のdocstring参照)。
+        """
         final_dir = os.path.normpath(self.config.get("final_export_dir") or DEFAULT_CONFIG["final_export_dir"])
         normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
         subfolder = self._final_subfolder_by_project_normalized().get(normalized_key) if normalized_key else None
-        return os.path.normpath(os.path.join(final_dir, subfolder)) if subfolder else final_dir
+        return os.path.normpath(os.path.join(final_dir, subfolder)) if subfolder else None
+
+    def backup_final_textures_to_sourceimages(self):
+        """2026.07.26追加(ユーザー相談): 現在のシーンに紐付いた各SP
+        プロジェクトのFinalテクスチャを、Mayaプロジェクトの
+        sourceimagesフォルダ配下へ一方向でバックアップコピーする。
+
+        設計意図・背景はモジュール冒頭の「sourceimagesへのFinal
+        テクスチャバックアップ」セクションのコメント参照。シーンの
+        fileノードの参照先は変更しない(あくまでバックアップ)。
+
+        コピー先のサブフォルダ名は、Finalフォルダ側のサブフォルダ名
+        (final_subfolder_by_project、例: "Bar_Table2_445ba2")をそのまま
+        再利用する。両者で名前を揃えることで、どのSPプロジェクト由来の
+        バックアップかが分かりやすくなる。
+
+        設定 sourceimages_backup_enabled が False(既定)の間は何もしない。
+        シーンにSPプロジェクトの紐付けが無い、またはまだ一度もFinal
+        書き出しが行われていないプロジェクトはスキップするが、原因の
+        切り分けができるよう状態バーへ理由を出す(2026.07.26追加:
+        当初は全て無言でスキップしており、「保存しても何も起きない」
+        場合にユーザー側では原因を特定できなかったため)。
+
+        print()による呼び出し確認ログは、有効/無効・スキップの別に
+        関わらず常に出す(kAfterSaveコールバック自体が発火しているか
+        どうかを、この関数の中身に関係なく確認できるようにするため)。
+        """
+        print("[maya_live_sync] backup_final_textures_to_sourceimages() called "
+              "(sourceimages_backup_enabled={0})".format(self.config.get("sourceimages_backup_enabled")))
+        if not self.config.get("sourceimages_backup_enabled"):
+            return
+
+        linked_keys = self._linked_sp_project_keys()
+        if not linked_keys:
+            self._emit_status(
+                "sourceimagesバックアップ: このシーンにSPプロジェクトの紐付けが"
+                "無いため、スキップしました。"
+            )
+            return
+
+        try:
+            sourceimages_root = _maya_project_sourceimages_dir()
+        except Exception as e:
+            self._emit_status("警告: sourceimagesフォルダの取得に失敗しました: {0}".format(e))
+            return
+        if not sourceimages_root:
+            self._emit_status(
+                "警告: Mayaプロジェクト(ワークスペース)のsourceimagesフォルダを"
+                "特定できなかったため、バックアップコピーをスキップしました。"
+                "File > Set Project でMayaプロジェクトを設定してから、"
+                "もう一度お試しください。"
+            )
+            return
+
+        final_by_project_normalized = self._final_subfolder_by_project_normalized()
+        copied_total = 0
+        failed_projects = []
+        skipped_projects = []
+        for key in linked_keys:
+            subfolder = final_by_project_normalized.get(key)
+            if not subfolder:
+                # このプロジェクトはまだFinal書き出しの実績が無い。次に
+                # Final書き出しされた後の保存で自然にバックアップされる。
+                skipped_projects.append(_project_display_name(key))
+                continue
+            final_dir = self._final_dir_for_project(key)
+            if not final_dir or not os.path.isdir(final_dir):
+                skipped_projects.append(_project_display_name(key))
+                continue
+            dest_dir = os.path.join(sourceimages_root, subfolder)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                copied_total += _copy_dir_contents_atomic(final_dir, dest_dir)
+            except Exception as e:
+                failed_projects.append((_project_display_name(key), e))
+
+        if copied_total:
+            self._emit_status(
+                "{0} 件のFinalテクスチャをMayaプロジェクトのsourceimages配下へ"
+                "バックアップコピーしました({1})。".format(copied_total, sourceimages_root)
+            )
+        elif not failed_projects and skipped_projects:
+            self._emit_status(
+                "sourceimagesバックアップ: {0} はまだFinal書き出しが行われていない"
+                "ため、コピーする内容がありませんでした。".format(", ".join(skipped_projects))
+            )
+        for name, e in failed_projects:
+            self._emit_status(
+                "警告: sourceimagesへのバックアップコピーに失敗しました({0}): {1}".format(name, e)
+            )
 
     def quality_for_project(self, project_key):
         """指定したSPプロジェクトの現在の表示品質を返す
@@ -3656,6 +4331,17 @@ class LiveSyncWatcher(QtCore.QObject):
         監視が抜け落ちる。ここでは _get_scene_project_links() の
         全linkを起点にすることで、シーンに紐付いた全プロジェクトを
         等しく対象にする(SP側の現在の開閉状態には依存しない)。
+
+        2026.07.25(緊急バグ修正): docstringは以前から「正規化済み」と
+        宣言していたが、実装は link.get("sp_project_key") の生値
+        (2026.07.25時点では _normalize_project_key_for_storage() 通過後、
+        大文字小文字は保持)をそのまま返すだけだった。この関数の戻り値は
+        _active_watch_dirs()/_active_final_dirs()/_managed_dirs()、および
+        監視の自動停止判定(_ensure_active_dirs_watched())の起点であり、
+        いずれも「compare正規化済み」を前提に実装されているため、実体が
+        伴っていないと大文字小文字の表記ゆれだけで監視対象フォルダの
+        解決が丸ごと崩れる(実機で「fileノードが見つからない」「監視が
+        勝手に停止する」として確認)。docstringの宣言通りに実装を合わせる。
         """
         try:
             payload = _get_scene_project_links()
@@ -3664,7 +4350,7 @@ class LiveSyncWatcher(QtCore.QObject):
         keys = []
         seen = set()
         for link in payload.get("links", []):
-            key = link.get("sp_project_key")
+            key = _normalize_project_key_for_compare(link.get("sp_project_key"))
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -3804,7 +4490,10 @@ class LiveSyncWatcher(QtCore.QObject):
                 continue
             if not tex_path:
                 continue
-            if os.path.normpath(os.path.dirname(tex_path)) not in managed_dirs:
+            if _canonical_path(os.path.dirname(tex_path)) not in managed_dirs:
+                # 2026.07.25(緊急バグ修正): managed_dirs は _managed_dirs()
+                # により既にケース非依存の正準パス集合になっているため、
+                # 判定側も _canonical_path() で揃える。
                 continue
             if os.path.basename(tex_path).startswith(prefix):
                 sgs = cmds.listConnections(node, type="shadingEngine") or []
@@ -3838,7 +4527,10 @@ class LiveSyncWatcher(QtCore.QObject):
                 continue
             if not tex_path:
                 continue
-            if os.path.normpath(os.path.dirname(tex_path)) not in managed_dirs:
+            if _canonical_path(os.path.dirname(tex_path)) not in managed_dirs:
+                # 2026.07.25(緊急バグ修正): managed_dirs は _managed_dirs()
+                # により既にケース非依存の正準パス集合になっているため、
+                # 判定側も _canonical_path() で揃える。
                 continue
             base = os.path.basename(tex_path)
             if self._match_known_texture_set_project(base) is None:
@@ -3883,8 +4575,13 @@ class LiveSyncWatcher(QtCore.QObject):
         for key in keys_to_check:
             final_dir = self._final_dir_for_project(key)
             watch_dir = self._watch_dir_for_project(key)
-            found_final = any(d == final_dir for d in node_dirs)
-            found_watch = any(d == watch_dir for d in node_dirs)
+            # 2026.07.25(緊急バグ修正): 判定をケース非依存(_canonical_
+            # path())にする。_canonical_path(None) は None を返すため、
+            # まだサブフォルダ未登録(_watch_dir_for_project()等がNoneを
+            # 返す)のプロジェクトは自然に「一致なし」として扱われ、
+            # 追加のNoneガードは不要。
+            found_final = any(_canonical_path(d) == _canonical_path(final_dir) for d in node_dirs)
+            found_watch = any(_canonical_path(d) == _canonical_path(watch_dir) for d in node_dirs)
             if found_final and not found_watch:
                 result[key] = True
             elif found_watch and not found_final:
@@ -3941,7 +4638,13 @@ class LiveSyncWatcher(QtCore.QObject):
             active_final_dir = self._active_final_dir()
             active_final_dir = os.path.normpath(active_final_dir) if active_final_dir else final_dir
             dest_dir = active_final_dir if use_final else active_watch_dir
-            managed_dirs = {watch_dir, active_watch_dir, final_dir, active_final_dir}
+            # 2026.07.25(緊急バグ修正): 判定をケース非依存(_canonical_
+            # dir_map())にする。以前は os.path.normpath() の完全一致
+            # だけで判定しており、設定のドライブレターの大文字小文字が
+            # 実際のfileノードのパスと食い違うだけで「切り替え対象の
+            # file ノードが見つかりませんでした」になっていた。詳細は
+            # _canonical_path() のdocstring参照。
+            managed_dirs = _canonical_dir_map([watch_dir, active_watch_dir, final_dir, active_final_dir])
         else:
             # 複数プロジェクト運用: 指定された1プロジェクトのフォルダ
             # だけをmanaged_dirsに含める。他プロジェクトのフォルダを
@@ -3950,7 +4653,24 @@ class LiveSyncWatcher(QtCore.QObject):
             watch_dir_for_this = self._watch_dir_for_project(project_key)
             final_dir_for_this = self._final_dir_for_project(project_key)
             dest_dir = final_dir_for_this if use_final else watch_dir_for_this
-            managed_dirs = {watch_dir_for_this, final_dir_for_this}
+            managed_dirs = _canonical_dir_map([watch_dir_for_this, final_dir_for_this])
+
+        # 2026.07.25(緊急バグ修正): _watch_dir_for_project()/_final_dir_
+        # for_project() は、そのプロジェクトがまだ該当品質(Preview/Final)
+        # で一度も書き出されていない場合、以前は watch_dir/final_export_dir
+        # 直下へ黙ってフォールバックしていた。実機の直下には旧バージョン
+        # 運用時代の別プロジェクトの残骸ファイルが残っており、無関係な
+        # 古いテクスチャへ誤って切り替わる危険があった。フォールバック先を
+        # 掴む代わりに、切り替え先が未確定であることを明示的に伝えて中断
+        # する。
+        if dest_dir is None:
+            label = "高画質版(Final)" if use_final else "リアルタイムプレビュー"
+            self._emit_status(
+                "このSPプロジェクトはまだ{0}用の書き出しが行われていないため、"
+                "切り替え先フォルダが未確定です。SP側で一度同期してから、"
+                "もう一度お試しください。".format(label)
+            )
+            return 0
 
         nodes = []
         for node in cmds.ls(type="file") or []:
@@ -3958,7 +4678,7 @@ class LiveSyncWatcher(QtCore.QObject):
                 tex_path = cmds.getAttr(node + ".fileTextureName")
             except Exception:
                 continue
-            if tex_path and os.path.normpath(os.path.dirname(tex_path)) in managed_dirs:
+            if tex_path and _canonical_path(os.path.dirname(tex_path)) in managed_dirs:
                 nodes.append(node)
 
         # 2026.07.23(緊急バグ修正): watch_subfolder_by_project/
@@ -3983,7 +4703,7 @@ class LiveSyncWatcher(QtCore.QObject):
                     continue
                 if not tex_path:
                     continue
-                if os.path.normpath(os.path.dirname(tex_path)) not in managed_dirs_all:
+                if _canonical_path(os.path.dirname(tex_path)) not in managed_dirs_all:
                     continue
                 if self._match_known_texture_set_project(os.path.basename(tex_path)) == normalized_target:
                     nodes.append(node)
@@ -4009,7 +4729,11 @@ class LiveSyncWatcher(QtCore.QObject):
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
                     continue
-                if os.path.normpath(os.path.dirname(tex_path)) == dest_dir:
+                # 2026.07.25(緊急バグ修正): 判定を _canonical_path() で
+                # 行う(理由は managed_dirs 側と同様)。実際にsetAttrへ
+                # 渡すパスは正準化前のdest_dirをそのまま使う(原文の
+                # 大文字小文字を保つため)。
+                if _canonical_path(os.path.dirname(tex_path)) == _canonical_path(dest_dir):
                     already += 1
                     continue
                 base = os.path.basename(tex_path)
@@ -4785,6 +5509,23 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.renderer_combo.addItems(RENDERER_CHOICES)
         self.renderer_combo.setToolTip("マテリアルを作るときに使うレンダラーです（通常はArnold）。")
         form.addRow("レンダラー", self.renderer_combo)
+
+        # 2026.07.26追加(ユーザー相談): C:/SPMayaLiveSync自体をクラウド
+        # 同期する代わりの選択肢。既定OFF(明示的にONにしたユーザーのみ
+        # 挙動が変わるようにするため)。
+        self.sourceimages_backup_checkbox = QtWidgets.QCheckBox(
+            "シーン保存時にFinalテクスチャをsourceimagesへバックアップコピー"
+        )
+        self.sourceimages_backup_checkbox.setToolTip(
+            "ONにすると、シーンを保存するたびに現在のFinalテクスチャを\n"
+            "Mayaプロジェクトのsourceimagesフォルダ配下へコピーします。\n"
+            "自宅・学校等の複数環境で作業する場合、C:/SPMayaLiveSync自体を\n"
+            "クラウド同期する代わりに、こちらのバックアップ先だけを\n"
+            "同期する運用にすると安全です(共有設定ファイルの巻き戻り事故を\n"
+            "避けられます)。コピー後もfileノードの参照先はそのままのため、\n"
+            "他の環境で開いた際にテクスチャを使うには手動での再接続が必要です。"
+        )
+        form.addRow("", self.sourceimages_backup_checkbox)
         layout.addWidget(self.folder_group)
 
         # --- 層2: 日常的に使う操作 / 層3: 導入時に一度だけの操作 ----------
@@ -5029,6 +5770,19 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             except Exception as e:
                 print("[maya_live_sync] {0}コールバックの登録に失敗しました: {1}".format(const_name, e))
 
+        # 2026.07.26追加(ユーザー相談): シーン保存のたびに、設定でONに
+        # している場合のみsourceimagesへのFinalテクスチャバックアップを
+        # 試みる(既定OFFのため何もしないユーザーが大多数)。詳細は
+        # LiveSyncWatcher.backup_final_textures_to_sourceimages()参照。
+        try:
+            self._scene_callback_ids.append(
+                om.MSceneMessage.addCallback(
+                    om.MSceneMessage.kAfterSave,
+                    lambda *_a: self.watcher.backup_final_textures_to_sourceimages())
+            )
+        except Exception as e:
+            print("[maya_live_sync] シーン保存コールバックの登録に失敗しました: {0}".format(e))
+
         # Phase 5: 前回終了時に監視がONだった場合は自動的に再開する
         # (毎回手動でONを押す手間を無くすため)。setChecked(True)が
         # _on_toggle経由でwatcher.start()を呼ぶ。
@@ -5044,6 +5798,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         renderer = cfg.get("renderer", "arnold")
         if renderer in RENDERER_CHOICES:
             self.renderer_combo.setCurrentIndex(RENDERER_CHOICES.index(renderer))
+        self.sourceimages_backup_checkbox.setChecked(bool(cfg.get("sourceimages_backup_enabled", False)))
 
     def _on_folder_group_toggled(self, checked):
         # UI導線改善(フェーズ1): チェックを外すと中身を折りたたんで
@@ -5135,6 +5890,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         単一プロジェクト運用)場合はNoneを返す
         (watcher.switch_texture_quality()側でNoneを後方互換のレガシー
         フォールバックとして扱う)。
+
+        2026.07.25(緊急バグ修正): 戻り値を _normalize_project_key_for_
+        compare() 通過後の値に変更した。呼び出し元(switch_texture_
+        quality() 等)は内部で辞書のキーとして使うため、compare正規化
+        済みの値で統一しておく(他の同種ゲッターと契約を揃える)。
         """
         payload = _get_scene_project_links()
         links = payload.get("links", [])
@@ -5142,7 +5902,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             return None
         active_link_id = payload.get("active_link_id")
         selected_link = _find_link(payload, active_link_id) or links[0]
-        return selected_link.get("sp_project_key")
+        return _normalize_project_key_for_compare(selected_link.get("sp_project_key"))
 
     def _refresh_quality_display(self, project_key):
         """選択中の作業対象(project_key)の表示品質を、表示品質ボタンと
@@ -5231,7 +5991,12 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             )
         links = payload.get("links", [])
         active_link_id = payload.get("active_link_id")
-        active_key = _normalize_project_key_for_compare(self.watcher.config.get("active_project_key"))
+        # 2026.07.25(緊急バグ修正): active_key(compare正規化済み、casefold
+        # 込み)は一致判定専用。表示にそのまま使うと大文字小文字が失われ
+        # 「Bar_Table2.spp（bar_table2.spp）」のような表示崩れの原因に
+        # なるため、表示専用に生の値(active_key_raw)を別途保持する。
+        active_key_raw = self.watcher.config.get("active_project_key")
+        active_key = _normalize_project_key_for_compare(active_key_raw)
 
         self._rebuild_scene_link_combo(links, active_link_id)
 
@@ -5260,7 +6025,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         self.scene_link_remove_btn.setEnabled(True)
         selected_link = _find_link(payload, active_link_id) or links[0]
+        # linked_key は表示用に原文ケースのまま保持し、一致判定にだけ
+        # linked_key_compare(compare正規化済み)を使う(2026.07.25緊急
+        # バグ修正、active_key_raw と同じ理由)。
         linked_key = selected_link.get("sp_project_key")
+        linked_key_compare = _normalize_project_key_for_compare(linked_key)
 
         if linked_key == "__unsaved__":
             # 2026.07.16(緊急修正): SP側が未保存の段階で紐付けボタンを
@@ -5297,13 +6066,13 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self._update_link_summary("neutral", "{0} (SP未起動)".format(linked_name))
             return
 
-        if active_key != linked_key:
+        if active_key != linked_key_compare:
             # SP側は今、選択中の作業対象とは別のプロジェクトを開いている。
             # 2026.07.19-03: 複数link対応後は、これは必ずしも「上書き
             # 忘れ」ではなく「単にドロップダウンの選択がSP側と違う」
             # だけの場合もある(天板を選んだままSP側で脚を開いた等)。
             # そのため文言も「選択し直す」ニュアンスに寄せる。
-            active_name = _project_display_name(active_key)
+            active_name = _project_display_name(active_key_raw)
             self.scene_link_label.setText(
                 "選択中の作業対象「{0}」の対応先は {1} ですが、SP側は今 {2} を"
                 "開いています。ドロップダウンの選択もご確認ください。".format(
@@ -5723,6 +6492,7 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         new_values = {
             "watch_dir": self.watch_edit.text().strip(),
             "renderer": self.renderer_combo.currentText(),
+            "sourceimages_backup_enabled": self.sourceimages_backup_checkbox.isChecked(),
         }
         if not new_values["watch_dir"]:
             QtWidgets.QMessageBox.warning(self, "Live Sync", "監視フォルダが未指定です。")
@@ -5914,6 +6684,15 @@ def show_ui():
                 print("[maya_live_sync] workspaceControl was hidden; forced visible=True.")
             # 最前面に持ってくる(タブの奥に隠れているだけのケースにも対応)。
             cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, restore=True)
+            # 2026.07.26(見た目の不具合修正、ユーザー報告): workspaceControl
+            # の「タブに表示されるラベル」は、QWidget.windowTitle()とは
+            # 別にMaya側が保持しているプロパティであり、self.setWindowTitle()
+            # を呼ぶだけでは自動的に追従しない。install.py再インストール
+            # 直後にウィンドウを開き直しても、Qtの実体(windowTitle())は
+            # 正しく新バージョンになっているのに、ドックタブの見た目だけ
+            # 旧バージョン表記のまま残ることが実機で確認された(実害は無く、
+            # 表示のみの問題)。タブラベルも明示的に同期させる。
+            cmds.workspaceControl(WORKSPACE_CONTROL_NAME, edit=True, label=_window_instance.windowTitle())
         # ウィジェット自身も前面化しておく(他タブの裏に隠れているケースの保険)。
         _window_instance.raise_()
     except Exception as e:

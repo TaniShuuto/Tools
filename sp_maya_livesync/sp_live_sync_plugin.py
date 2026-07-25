@@ -371,12 +371,46 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
 # followup_pendingで二重スケジュールと無限ループを防止)。
 # 既存の動作を壊さない不具合修正のため、SemVerのルールに従いPATCHを
 # 上げる。
-__version__ = "1.1.3"
+#
+# 2026.07.25(緊急バグ修正一式、maya_live_sync.py 1.5.0と対応):
+# 「fileノードが見つからない」「Final/Liveの非対称な生成」「大文字
+# 小文字違いのプロジェクトキー誤判定」の実機報告を受けた調査・修正の
+# SP側分。
+#   - _current_project_key(): project.name()が真になった状態でも
+#     project.file_path()がテンプレート(.spt)のパスを返し続ける
+#     ケースがあり、既存のガードだけでは捕まえきれていなかった。
+#     file_path()の拡張子が.sptの場合も"__unsaved__"として扱う
+#     ガードを追加し、known_texture_sets_by_project等の*_by_project
+#     辞書へテンプレート名がプロジェクトキーとして紛れ込む不具合を
+#     防止した(Maya側 _purge_spt_template_keys() は既存の汚染
+#     エントリの掃除、こちらは新規汚染の発生源そのものを断つ)。
+#   - on_project_saved(): 「名前を付けて保存」でactive_project_keyが
+#     暫定キー("__unsaved__"、または上記の.spt漏れ)から実プロジェクトの
+#     .sppパスへ切り替わった際、*_by_project辞書に暫定キー配下で
+#     既に記録されていた実績(サブフォルダ・既知テクスチャセット等)が
+#     新キーの下へ引き継がれず、Maya側から見て「Finalは存在するのに
+#     Liveが見つからない(またはその逆)」という非対称な状態になって
+#     いた。_migrate_project_key_entries()を新設し、該当エントリを
+#     新キーへ付け替えた上でPreview/Final双方を強制全量再書き出しする
+#     ようにした(書き出し済みファイル自体は移動せず、再書き出しで
+#     実体を揃える設計。フォルダ間移動は途中失敗時の一貫性が担保
+#     できず、Maya側のポーリングとも競合するため意図的に避けた)。
+#   - _detect_cloud_sync_risk(): 共有フォルダ(C:/SPMayaLiveSync)が
+#     Google Drive等のクラウド同期対象に入っていると、advisory lockと
+#     os.replace()の原子性の前提が崩れることが実機調査で判明した
+#     (設定ファイルの内容が数分内に巻き戻る現象を確認)。
+#     start_plugin()で起動のたびに検出して警告する仕組みを追加した
+#     (強制はしない)。
+# 既存の動作を壊さない修正のため、MINORを上げる(*_by_project辞書への
+# 書き込み内容自体に変更は無いが、新規のキー移行・強制再書き出し
+# という新しい副作用のある挙動が加わるため)。
+__version__ = "1.2.0"
 
 import os
 import re
 import json
 import copy
+import stat
 import time
 import shutil
 import hashlib
@@ -601,6 +635,79 @@ def _cleanup_orphaned_staging_dirs(stage_root, max_age_hours=24):
 
 
 # ---------------------------------------------------------------------------
+# 2026.07.25(緊急バグ修正): 共有フォルダのクラウド同期検出
+# ---------------------------------------------------------------------------
+#
+# 背景: 実機調査で C:/SPMayaLiveSync 直下に ".tmp.driveupload"(Google
+# Drive デスクトップ版が能動的に同期している際に作る一時フォルダ)が
+# 見つかった。live_sync_config.json.lock による msvcrt.locking の
+# アドバイザリロックと、一時ファイル+os.replace()によるアトミックな
+# 置き換えは、いずれも「このフォルダをファイルシステム以外の何かが
+# 横から書き換えない」ことを前提にしている。クラウド同期クライアントは
+# 独自にファイルハンドルを保持し、同期のたびにファイルを差し替える/
+# 巻き戻すため、この前提が崩れる。実際に調査中、live_sync_config.json
+# を数分内に2回読んだだけで内容が別物(古い内容への巻き戻り)だった
+# ことを確認している。save_config()はロック取得タイムアウトを警告ログ
+# のみで飲み込んで続行する設計のため、この種の巻き戻りは検知されずに
+# 通ってしまう。
+#
+# 対策方針(相談の結果、以下に確定): コード側から同期を止めることは
+# できない(ユーザー側の設定変更が必要)ため、起動時に検出して状態バー・
+# 共有履歴ログへ警告するに留める。強制的な変更は行わない。
+# ---------------------------------------------------------------------------
+
+_CLOUD_SYNC_TEMP_MARKERS = (
+    ".tmp.driveupload",   # Google Drive for desktop(能動的にアップロード中)
+    ".dropbox.cache",     # Dropbox
+    "#recycle",           # Dropbox
+    ".365_shell",         # OneDriveの一部バージョン
+)
+_CLOUD_SYNC_PATH_MARKERS = (
+    "google drive", "googledrive", "onedrive", "dropbox",
+    "icloud drive", "icloudドライブ",
+)
+
+
+def _detect_cloud_sync_risk(directory):
+    """directory(共有フォルダのルート)がクラウド同期クライアントの
+    管理下にあるらしいかどうかを推測し、該当すればその根拠を短い日本語
+    文字列で返す(該当しなければNone)。
+
+    判定材料(いずれか該当で警告、詳細は上のコメント参照):
+      1. 同期クライアントの一時フォルダの存在
+      2. パスが既知の同期フォルダ名を含む
+      3. ディレクトリ自体がreparse point(クラウドのプレースホルダ/
+         シンボリックリンク等)として認識されている
+
+    誤検知(false positive)の可能性は残るが、警告を出すだけで実害は
+    無いため、多少広めに倒して判定する。
+    """
+    if not directory:
+        return None
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        entries = []
+    for marker in _CLOUD_SYNC_TEMP_MARKERS:
+        if marker in entries:
+            return "同期クライアントの一時フォルダ({0})が見つかりました".format(marker)
+
+    normalized = directory.replace("\\", "/").lower()
+    for marker in _CLOUD_SYNC_PATH_MARKERS:
+        if marker in normalized:
+            return "パスに既知のクラウド同期フォルダ名({0})が含まれています".format(marker)
+
+    try:
+        attrs = os.lstat(directory).st_file_attributes
+    except (OSError, AttributeError):
+        attrs = None
+    if attrs is not None and (attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+        return "フォルダがreparse point(クラウドのプレースホルダ等)として認識されています"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 設定の読み書き
 # ---------------------------------------------------------------------------
 
@@ -759,6 +866,19 @@ def _current_project_key():
     対策として、公式に「未保存なら確実にNoneを返す」と明記されている
     project.name() を先に確認し、これがNoneであれば file_path() の値を
     信頼せず "__unsaved__" にフォールバックするようにした。
+
+    2026.07.25(緊急バグ修正): 上記の project.name() ガードだけでは
+    このテンプレート漏れを捕まえきれないケースが実機で確認された
+    (project.name() が真になった状態でも file_path() がテンプレートの
+    .sptパスを返し続けることがある)。file_path() の拡張子が .spt
+    (大文字小文字を区別しない)の場合も "__unsaved__" として扱うガードを
+    追加した。これにより、テンプレート由来の未保存プロジェクトの
+    キーが watch_subfolder_by_project/known_texture_sets_by_project 等の
+    *_by_project 辞書へ本来のプロジェクト名の代わりに紛れ込む不具合
+    (実機のlive_sync_config.jsonで
+    ".../PBR - Metallic Roughness Alpha-blend.spt" というキーの残留を
+    確認)を防ぐ。この状態は既存の "__unsaved__" ガード(シーン紐付け・
+    create_shader_network()の拒否)が正しく機能する前提でもある。
     """
     try:
         name = project.name()
@@ -775,6 +895,12 @@ def _current_project_key():
         path = project.file_path()
     except Exception:
         path = None
+
+    if path and path.lower().endswith(".spt"):
+        # テンプレートファイル自体のパスが漏れてきたケース。実プロジェクト
+        # として保存されるまでは "__unsaved__" 扱いにする。
+        return "__unsaved__"
+
     return path or "__unsaved__"
 
 
@@ -1031,13 +1157,59 @@ class LiveSyncEngine(QtCore.QObject):
         # 実機で確認された。
         # 対策として、保存イベントのタイミングでも active_project_key を
         # 明示的に再計算・保存するようにした。
+        old_key = self.config.get("active_project_key")
         key = _current_project_key()
-        if self.config.get("active_project_key") != key:
+        key_migrated = False
+        if old_key != key:
             self.config["active_project_key"] = key
             save_config({"active_project_key": key})
+            # 2026.07.25(緊急バグ修正、D-2): 「名前を付けて保存」で
+            # project_keyが暫定キー("__unsaved__"、またはテンプレート
+            # 漏れの.sptパス)から実プロジェクトの.sppパスへ切り替わった
+            # 場合、*_by_project辞書に暫定キーの下で既に記録されていた
+            # 実績(サブフォルダ・既知テクスチャセット等)を新キーへ
+            # 引き継がないと、Maya側から見て「Finalは存在するのにLiveが
+            # 見つからない」ような非対称な状態になる(暫定キー配下の
+            # 実データが、誰からも参照されない新キーの下に取り残される
+            # ため)。詳細は _migrate_project_key_entries() 参照。
+            is_transitional_old = old_key == "__unsaved__" or (
+                isinstance(old_key, str) and old_key.lower().endswith(".spt")
+            )
+            if is_transitional_old and key and key != "__unsaved__":
+                key_migrated = self._migrate_project_key_entries(old_key, key)
 
         if not self.enabled:
             return
+
+        if key_migrated:
+            # 移行後はPreview/Finalとも「暫定キーの下で書き出した実績」を
+            # 引き継いだだけで、新キーのサブフォルダには実ファイルが
+            # 存在しない(ファイルの移動はせず、辞書のキー名だけを
+            # 差し替える設計のため、詳細は _migrate_project_key_entries()
+            # 参照)。両方を強制全量再書き出しして実体を追いつかせる。
+            self._emit_status(
+                "「名前を付けて保存」を検出しました。保存前の作業内容を"
+                "正しいプロジェクト名へ引き継ぐため、Preview/Finalの両方を"
+                "全量で再書き出しします。"
+            )
+            # 2026.07.25: Final側と同じ理由(on_project_saved()直後は
+            # Painter内部の保存ロックが残っている場合がある、上記
+            # 2026.07.19-01のコメント参照)で、Preview側もここで即座に
+            # 呼ばず _FINAL_EXPORT_INITIAL_DELAY_MS だけ遅延させる。
+            # Finalのような指数バックオフ再試行までは行わないが
+            # (Save-Asはまれなイベントであり、失敗時も_safe_export()の
+            # 既存の仕組みで「プロジェクトがロック中のため書き出せません
+            # でした」と状態バーに表示されるため、ユーザーは「今すぐ同期」
+            # で手動リトライできる)、shutdown()後に発火しても実処理へ
+            # 進まないようガードする。
+            def _fire_preview_migration_export():
+                if self._shutting_down:
+                    return
+                self._safe_export(preview=True, force_full=True)
+            QtCore.QTimer.singleShot(_FINAL_EXPORT_INITIAL_DELAY_MS, _fire_preview_migration_export)
+            self._request_final_export(0, bypass_cooldown=True, force_full=True)
+            return
+
         # 2026.07.19-01: 従来は固定500ms待機(QTimer.singleShot)で
         # Painter内部の保存ロック解除を待っていたが、(a) shutdown()側で
         # キャンセルできず終了処理と重なるリスクがあり、(b) 500msという
@@ -1047,6 +1219,41 @@ class LiveSyncEngine(QtCore.QObject):
         # 名前付きQTimerと指数バックオフ再試行(_request_final_export)に
         # 置き換える。
         self._request_final_export(_FINAL_EXPORT_INITIAL_DELAY_MS)
+
+    def _migrate_project_key_entries(self, old_key, new_key):
+        """2026.07.25(緊急バグ修正、D-2)で新設。
+
+        watch_subfolder_by_project/final_subfolder_by_project/
+        known_texture_sets_by_project/texture_set_export_prefix_by_project
+        の4辞書について、old_key(暫定キー)のエントリが存在すれば
+        new_key(実プロジェクトの.sppパス)へ付け替える(old_keyのエントリは
+        削除)。書き出し済みファイルそのものはフォルダ間で移動しない
+        (移動は途中失敗時の一貫性が担保できず、Maya側のポーリングとも
+        競合するため。呼び出し元がこの後に強制全量再書き出しを行うことで
+        実体を揃える設計)。
+
+        戻り値: 1件以上のエントリを移行した場合True、old_keyが
+        どの辞書にも存在しなかった(＝暫定キーの下でまだ何も書き出して
+        いなかった)場合はFalse。
+        """
+        by_project_keys = (
+            "watch_subfolder_by_project",
+            "final_subfolder_by_project",
+            "known_texture_sets_by_project",
+            "texture_set_export_prefix_by_project",
+        )
+        update = {}
+        migrated_any = False
+        for map_key in by_project_keys:
+            by_project = dict(self.config.get(map_key, {}) or {})
+            if old_key in by_project:
+                by_project[new_key] = by_project.pop(old_key)
+                update[map_key] = by_project
+                migrated_any = True
+        if update:
+            self.config.update(update)
+            save_config(update)
+        return migrated_any
 
     def on_project_closing(self, evt):
         self.debounce_timer.stop()
@@ -2398,6 +2605,23 @@ def start_plugin():
                 _engine.config.get("staging_dir", DEFAULT_CONFIG["staging_dir"]))
         except Exception as e:
             _log("warning", "ステージングフォルダの自動掃除に失敗しました: {0}".format(e))
+        # 2026.07.25(緊急バグ修正): 共有フォルダがクラウド同期対象に
+        # 入っていると、設定ファイルの原子的な置き換え・アドバイザリ
+        # ロックの前提が崩れる(詳細は _detect_cloud_sync_risk() 上の
+        # コメント参照)。強制はせず、起動のたびに検出して知らせる。
+        try:
+            cloud_sync_reason = _detect_cloud_sync_risk(CONFIG_DIR)
+            if cloud_sync_reason:
+                _engine._emit_status(
+                    "警告: 共有フォルダ({0})がクラウド同期(Google Drive/OneDrive/"
+                    "Dropbox等)の対象になっている可能性があります({1})。"
+                    "同期クライアントがファイルを横から書き換えることで、"
+                    "設定ファイルの巻き戻りや同期の無言失敗につながる恐れが"
+                    "あります。可能であればこのフォルダを同期対象から"
+                    "除外してください。".format(CONFIG_DIR, cloud_sync_reason)
+                )
+        except Exception as e:
+            _log("warning", "クラウド同期の検出に失敗しました: {0}".format(e))
         _panel = LiveSyncPanel(_engine)
         ui.add_dock_widget(_panel)
         if not _engine.config.get("setup_wizard_completed"):
