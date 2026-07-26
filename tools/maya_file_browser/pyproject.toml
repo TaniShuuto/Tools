@@ -1,0 +1,14 @@
+[project]
+name = "maya-file-browser"
+version = "1.0.0"
+description = "Maya内にドッキング可能なFBX/MA/MB/画像/テキスト用アセットブラウザパネル"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+# Maya本体に同梱される maya.cmds / PySide2 or PySide6 等に依存するため、
+# pip経由でインストール可能な実行時依存は無い（requirements.txt を参照）。
+dependencies = []
+
+[tool.setuptools]
+py-modules = ["fbx_browser", "install_fbx_browser_autostart"]

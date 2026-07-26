@@ -1,0 +1,11 @@
+# Maya File Browser の実行時依存関係。
+#
+# このツールは Autodesk Maya にドラッグ&ドロップ/コピー配置して使う
+# スタンドアロンスクリプトであり、Maya本体が起動するPython環境の中で実行される。
+# そのため下記はいずれもMaya同梱のモジュールであり、pip install は不要・非対応。
+#
+#   - maya.cmds / maya.mel / maya.OpenMayaUI / maya.app.general.mayaMixin (Maya本体同梱)
+#   - PySide2 + shiboken2  (Maya 2024以前に同梱)
+#   - PySide6 + shiboken6  (Maya 2025以降に同梱)
+#
+# 開発・CI環境でのpipインストール対象は無い。

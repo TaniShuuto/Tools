@@ -1,0 +1,66 @@
+# Maya File Browser (Asset Browser)
+
+Maya内にドッキング可能な、FBX / MA / MB / 画像 / テキストファイル用のアセットブラウザパネルです。
+「毎回エクスプローラーを開いてアセットを探す」手間をなくすことを目的としています。
+
+## Features
+
+- フォルダ指定（テキスト入力 + Browseダイアログ、ドライブ跨ぎのお気に入り登録に対応）
+- 対象ファイル（.fbx / .ma / .mb / 画像 / テキスト）を操作可能な形で表示する単一階層リストビュー
+  - フォルダをダブルクリックで中に入り、一覧が切り替わる（通常のエクスプローラーに近い操作感）
+- 対象外の全ファイル（.psd, .zip 等）も名前・詳細情報のみグレーアウト表示（存在確認用途）
+- 戻る/進む/上へのナビゲーションとパンくずアドレスバー
+- ファイル名フィルタ（部分一致、入力の遅延適用）
+- ダブルクリック/右クリックでファイル種別に応じたアクションを実行
+  - FBX/MA/MB: Import / Reference
+  - 画像: OS標準ビューアで開く / Mayaでプレビュー / Fileノードとして読み込む
+  - テキスト: 外部エディタで開く / パネル内プレビュー
+- 複数選択してのImport/Referenceを1回のアンドゥにまとめて実行
+- 重複Reference・名前空間衝突の検出、FBXインポート設定の明示的リセット（スケール事故防止）
+- お気に入りフォルダ、フォルダ・オプション・列幅・パネル表示状態の永続化（QSettings）
+- Maya起動時の自動復元（到達不能なネットワークパス等でMaya本体がハングしないよう、
+  到達性チェック付きで遅延実行）
+
+対応環境: Maya 2025以降 (PySide6 / Qt6)、Maya 2024以前 (PySide2 / Qt5) の両対応。
+
+## Files
+
+| ファイル | 説明 |
+| --- | --- |
+| `fbx_browser.py` | ブラウザ本体（Mayaへ配置して `import fbx_browser` で使用する） |
+| `install_fbx_browser_autostart.py` | Mayaへのドラッグ&ドロップだけで導入できるインストーラー |
+
+## Installation
+
+1. `fbx_browser.py` と `install_fbx_browser_autostart.py` を**同じフォルダ**に置く
+   （インストーラーは自分自身と同じフォルダから `fbx_browser.py` を探すため）
+2. `install_fbx_browser_autostart.py` を Maya のビューポートへドラッグ&ドロップする
+3. 確認ダイアログの案内に従って進める
+4. 完了後、Maya を再起動すると次回以降は自動でアセットブラウザが開く
+
+再実行すると、既存の `fbx_browser.py` の更新（バックアップ付き）と `userSetup.py` への
+二重追記防止チェックが行われるため、アップデート手順も同じドラッグ&ドロップで完結する。
+
+## Usage
+
+Maya のスクリプトエディタ、または shelf ボタンから以下を実行:
+
+```python
+import fbx_browser
+fbx_browser.show_ui()
+```
+
+再実行しても既存ウィンドウ（workspaceControl）を検出して使い回すため、多重起動しない。
+
+## Requirements
+
+Maya本体が提供する環境（`maya.cmds` / `maya.mel` / `maya.OpenMayaUI` / PySide2 or PySide6 /
+shiboken2 or shiboken6）のみに依存しており、pip等での追加インストールは不要。
+詳細は [`requirements.txt`](./requirements.txt) を参照。
+
+## Known limitations
+
+- 到達性チェックやフォルダ空判定スキャンはネットワークパス・大規模フォルダに対する
+  安全弁を備えているが、対象ファイル数が非常に多いフォルダではスキャンコストが増える。
+- Maya内プレビューは `QPixmap` による簡易表示であり、フルスペックの画像ビューアではない。
+  Mayaがネイティブ対応しない画像形式は環境によって正しく表示できない場合がある。
