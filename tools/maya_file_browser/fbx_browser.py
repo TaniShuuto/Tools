@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-fbx_browser.py  (rev. 2026.07.26-02)
+fbx_browser.py  (rev. 2026.07.27-03)
 ------------------------------------
 Maya内にドッキング可能なアセットブラウザパネル。
+
+rev.03 での追加内容:
+    追加. 選択項目（対象外拡張子・フォルダ含む）をOSのごみ箱へ移動する削除機能
+          （右クリックメニュー / Deleteキー。完全削除ではなく復元可能な形を既定とする）
+    追加. エクスプローラー等の外部からのドラッグ&ドロップによるファイルコピー配置
+          （ドロップ元は変更しない。QFileSystemModel既定の「移動」処理は使わない）
 
 rev.02 での修正内容（実務投入時のリスク対応）:
     [高] 1. フォルダ空判定スキャンの打ち切り制限（UIスレッドの長時間ブロック回避）
@@ -29,6 +35,8 @@ rev.02 での修正内容（実務投入時のリスク対応）:
 import os
 import sys
 import json
+import ctypes
+import shutil
 import threading
 import traceback
 import contextlib
@@ -45,6 +53,9 @@ except ImportError:
     from PySide2 import QtWidgets, QtCore, QtGui
     from shiboken2 import wrapInstance
     _QT_BINDING = "PySide2"
+
+# [追加] QShortcut は Qt6(PySide6)ではQtGuiへ移動しているため、両対応で解決する。
+_QShortcutClass = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
 
 import maya.cmds as cmds
 import maya.mel as mel
@@ -201,6 +212,95 @@ def _guess_default_folder():
     return ""
 
 
+# ---------------------------------------------------------------------------
+# [追加] ごみ箱への移動（削除機能）
+# ---------------------------------------------------------------------------
+# pip install不可の環境（Maya同梱Pythonのみ）のため、send2trash等は使わず
+# 標準ライブラリ（ctypes / subprocess）のみでOSごとに実装する。
+# いずれの実装も失敗時は例外を送出するだけで、完全削除へのフォールバックは
+# 行わない（ごみ箱に移せないなら削除自体を中止するのが安全側の方針）。
+
+def _send_to_trash_windows(path):
+    """SHFileOperationW(FO_DELETE, FOF_ALLOWUNDO)でごみ箱へ移動する。"""
+
+    class _SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("wFunc", ctypes.c_uint),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_uint),
+            ("fAnyOperationsAborted", ctypes.c_int),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 0x0003
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_NOERRORUI = 0x0400
+    FOF_SILENT = 0x0004
+
+    op = _SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    # pFrom はダブルNUL終端のリスト形式。単一パスでも末尾にNULが1つ必要。
+    op.pFrom = path + "\0"
+    op.pTo = None
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    op.fAnyOperationsAborted = 0
+    op.hNameMappings = None
+    op.lpszProgressTitle = None
+
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if result != 0:
+        raise OSError("SHFileOperationW failed (code=0x{:x})".format(result))
+    if op.fAnyOperationsAborted:
+        raise OSError("ごみ箱への移動が中断されました")
+
+
+def _send_to_trash_mac(path):
+    """Finder経由でゴミ箱へ移動する。"""
+    script = 'tell application "Finder" to delete POSIX file "{}"'.format(
+        path.replace("\\", "\\\\").replace('"', '\\"')
+    )
+    proc = subprocess.Popen(
+        ["osascript", "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    _out, err = proc.communicate()
+    if proc.returncode != 0:
+        raise OSError((err or b"").decode("utf-8", "ignore").strip() or "osascript failed")
+
+
+def _send_to_trash_linux(path):
+    """gio trash経由でごみ箱へ移動する（コマンドが無い環境では失敗させる）。"""
+    try:
+        proc = subprocess.Popen(
+            ["gio", "trash", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except OSError:
+        raise OSError("gio コマンドが見つかりません（ごみ箱への移動に非対応の環境です）")
+    _out, err = proc.communicate()
+    if proc.returncode != 0:
+        raise OSError((err or b"").decode("utf-8", "ignore").strip() or "gio trash failed")
+
+
+def _send_to_trash(path):
+    """
+    OSのごみ箱へファイル/フォルダを移動する。
+
+    完全削除ではなくごみ箱への移動を既定とすることで、誤操作時にOS側から
+    復元できるようにする。プラットフォーム別の実装詳細は上記の
+    _send_to_trash_windows/_mac/_linux を参照。
+    """
+    if sys.platform.startswith("win"):
+        _send_to_trash_windows(path)
+    elif sys.platform == "darwin":
+        _send_to_trash_mac(path)
+    else:
+        _send_to_trash_linux(path)
+
+
 class AssetFileFilterProxyModel(QtCore.QSortFilterProxyModel):
     """
     表示制御を担当するプロキシモデル。
@@ -328,6 +428,57 @@ class AssetFileFilterProxyModel(QtCore.QSortFilterProxyModel):
 
 
 FBXFileFilterProxyModel = AssetFileFilterProxyModel  # 後方互換エイリアス
+
+
+class _DropEnabledTreeView(QtWidgets.QTreeView):
+    """
+    [追加] 外部(エクスプローラー等)からのファイルドロップのみを受け付けるツリービュー。
+
+    QFileSystemModelの既定のドロップ処理はモデル自身のdropMimeData()に
+    委譲され、内部的には「移動(QFile::rename)」になる。ドライブを跨ぐと
+    失敗するうえ、エクスプローラーからのドラッグでも元ファイルが移動して
+    しまい意図しないデータ消失につながるため、ここでは使わない。
+    ドロップイベント自体は横取りしてシグナルとして送出するだけにとどめ、
+    実際のコピー処理はFBXBrowserWidget側（_on_files_dropped）で行う。
+    """
+
+    filesDropped = QtCore.Signal(list)
+
+    def __init__(self, parent=None):
+        super(_DropEnabledTreeView, self).__init__(parent)
+        # Qt内部のアイテムドラッグ&ドロップ（並べ替え等）は使わない。
+        # [不具合対応] setDragDropMode()は内部でsetAcceptDrops()を呼び直すため、
+        # 先にNoDragDropへ設定してから最後にsetAcceptDrops(True)しないと、
+        # 外部からのドロップ受付自体が無効化されてしまう（イベントが一切来ない）。
+        self.setDragDropMode(QtWidgets.QAbstractItemView.NoDragDrop)
+        self.setDropIndicatorShown(False)
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def _local_file_paths(mime_data):
+        if not mime_data.hasUrls():
+            return []
+        return [url.toLocalFile() for url in mime_data.urls() if url.isLocalFile()]
+
+    def dragEnterEvent(self, event):
+        if self._local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._local_file_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.filesDropped.emit(paths)
 
 
 class FBXBrowserWidget(QtWidgets.QWidget):
@@ -502,7 +653,7 @@ class FBXBrowserWidget(QtWidgets.QWidget):
         # --- 中央: ツリービュー / ログパネル ---
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
-        self.tree_view = QtWidgets.QTreeView()
+        self.tree_view = _DropEnabledTreeView()
         self.tree_view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.tree_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree_view.setSortingEnabled(True)
@@ -533,6 +684,12 @@ class FBXBrowserWidget(QtWidgets.QWidget):
         self.folder_line_edit.editingFinished.connect(self._on_folder_line_edit_changed)
         self.tree_view.doubleClicked.connect(self._on_item_double_clicked)
         self.tree_view.customContextMenuRequested.connect(self._on_context_menu_requested)
+        self.tree_view.filesDropped.connect(self._on_files_dropped)
+
+        # [追加] Deleteキーでの削除
+        self._delete_shortcut = _QShortcutClass(QtGui.QKeySequence.Delete, self.tree_view)
+        self._delete_shortcut.setContext(QtCore.Qt.WidgetShortcut)
+        self._delete_shortcut.activated.connect(self._on_delete_shortcut)
 
         self.back_button.clicked.connect(self._on_back_clicked)
         self.forward_button.clicked.connect(self._on_forward_clicked)
@@ -976,6 +1133,198 @@ class FBXBrowserWidget(QtWidgets.QWidget):
                 paths.append(file_path)
         return paths
 
+    def _get_selected_all_paths(self):
+        """[追加] 拡張子を問わず、選択中の全項目のパスを返す（削除機能用）。"""
+        if self._proxy_model is None or self._fs_model is None:
+            return []
+        selection_model = self.tree_view.selectionModel()
+        if selection_model is None:
+            return []
+        paths = []
+        for index in selection_model.selectedRows():
+            source_index = self._proxy_model.mapToSource(index)
+            paths.append(self._fs_model.filePath(source_index))
+        return paths
+
+    def _on_delete_shortcut(self):
+        paths = self._get_selected_all_paths()
+        if paths:
+            self._delete_paths(paths)
+
+    def _delete_paths(self, paths):
+        """[追加] 選択項目をOSのごみ箱へ移動する（完全削除はしない）。"""
+        paths = [p for p in dict.fromkeys(paths) if p]
+        if not paths:
+            return
+
+        dirs = [p for p in paths if os.path.isdir(p)]
+
+        # 現在のシーン/参照中ファイルと一致するものが含まれていれば警告を出す
+        # （ブロックはしない。Mayaの参照はシーン保存/リロードまで維持されるため）。
+        referenced_norm = set()
+        try:
+            scene_path = cmds.file(q=True, sceneName=True) or ""
+            if scene_path:
+                referenced_norm.add(_normalize_for_compare(scene_path))
+            for ref_path in (cmds.file(q=True, reference=True) or []):
+                referenced_norm.add(_normalize_for_compare(ref_path))
+        except Exception:
+            pass
+        in_use = [
+            p for p in paths
+            if p not in dirs and _normalize_for_compare(p) in referenced_norm
+        ]
+
+        preview_names = [os.path.basename(p.rstrip("/\\")) for p in paths[:10]]
+        message = "以下をごみ箱へ移動します。よろしいですか？\n\n{}".format(
+            "\n".join(preview_names)
+        )
+        if len(paths) > 10:
+            message += "\n…他{}件".format(len(paths) - 10)
+        if dirs:
+            message += "\n\n※ フォルダは中身ごと移動されます。"
+        if in_use:
+            message += (
+                "\n\n⚠ 現在のシーンで使用中/参照中のファイルが含まれています。\n"
+                "移動しても開いているシーン自体はそのままですが、\n"
+                "参照リンクが無効になる可能性があります。"
+            )
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "削除の確認",
+            message,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            self._log("削除を中止しました。", level="info")
+            return
+
+        succeeded = []
+        failed = []
+        for p in paths:
+            try:
+                _send_to_trash(p)
+                succeeded.append(p)
+            except Exception as exc:
+                failed.append((p, exc))
+
+        if succeeded:
+            succeeded_norm = set(_normalize_for_compare(p) for p in succeeded)
+            favorites = self._get_favorites()
+            new_favorites = [
+                f for f in favorites if _normalize_for_compare(f) not in succeeded_norm
+            ]
+            if len(new_favorites) != len(favorites):
+                self._set_favorites(new_favorites)
+
+        if self._proxy_model is not None:
+            self._proxy_model.invalidate_cache()
+        self._refresh_current_view()
+
+        if succeeded:
+            self._log("{}件をごみ箱へ移動しました。".format(len(succeeded)), level="run")
+        for p, exc in failed:
+            self._log("削除に失敗しました: {} ({})".format(p, exc), level="error")
+
+    def _on_files_dropped(self, source_paths):
+        """[追加] 外部(エクスプローラー等)からドロップされたファイルを現在のフォルダへコピーする。"""
+        dest_folder = self.folder_line_edit.text().strip()
+        if not dest_folder or not os.path.isdir(dest_folder):
+            self._log(
+                "コピー先のフォルダが開かれていません。先にフォルダを開いてください。",
+                level="warn",
+            )
+            return
+
+        dest_norm = _normalize_for_compare(dest_folder)
+
+        plan = []
+        skipped_dirs = 0
+        skipped_same = 0
+        for src in dict.fromkeys(source_paths):
+            if os.path.isdir(src):
+                skipped_dirs += 1
+                continue
+            if not os.path.isfile(src):
+                continue
+            if _normalize_for_compare(os.path.dirname(src)) == dest_norm:
+                skipped_same += 1
+                continue
+            plan.append((src, os.path.join(dest_folder, os.path.basename(src))))
+
+        if skipped_dirs:
+            self._log(
+                "フォルダのドロップは未対応のため{}件スキップしました。".format(skipped_dirs),
+                level="warn",
+            )
+        if skipped_same:
+            self._log(
+                "既に表示中のフォルダにあるため{}件スキップしました。".format(skipped_same),
+                level="info",
+            )
+
+        if not plan:
+            return
+
+        overwrite_all = None  # None=毎回確認 / True/False=残り全件へ適用
+        succeeded = []
+        failed = []
+        for src, dst in plan:
+            if os.path.exists(dst):
+                do_overwrite = overwrite_all
+                if do_overwrite is None:
+                    box = QtWidgets.QMessageBox(self)
+                    box.setWindowTitle("ファイルの上書き確認")
+                    box.setText(
+                        "同名のファイルが既に存在します。上書きしますか？\n\n{}".format(
+                            os.path.basename(dst)
+                        )
+                    )
+                    yes_btn = box.addButton("上書き", QtWidgets.QMessageBox.YesRole)
+                    yes_all_btn = box.addButton("すべて上書き", QtWidgets.QMessageBox.YesRole)
+                    box.addButton("スキップ", QtWidgets.QMessageBox.NoRole)
+                    no_all_btn = box.addButton("すべてスキップ", QtWidgets.QMessageBox.NoRole)
+                    cancel_btn = box.addButton("中止", QtWidgets.QMessageBox.RejectRole)
+                    box.exec_()
+                    clicked = box.clickedButton()
+
+                    if clicked == cancel_btn:
+                        self._log("コピーを中止しました。", level="info")
+                        break
+                    if clicked == yes_all_btn:
+                        overwrite_all = True
+                        do_overwrite = True
+                    elif clicked == no_all_btn:
+                        overwrite_all = False
+                        do_overwrite = False
+                    elif clicked == yes_btn:
+                        do_overwrite = True
+                    else:
+                        do_overwrite = False
+
+                if not do_overwrite:
+                    continue
+
+            try:
+                shutil.copy2(src, dst)
+                succeeded.append(dst)
+            except Exception as exc:
+                failed.append((src, exc))
+
+        if self._proxy_model is not None:
+            self._proxy_model.invalidate_cache()
+        self._refresh_current_view()
+
+        if succeeded:
+            self._log("{}件のファイルをコピーしました。".format(len(succeeded)), level="run")
+        for src, exc in failed:
+            self._log(
+                "コピーに失敗しました: {} ({})".format(os.path.basename(src), exc),
+                level="error",
+            )
+
     def _on_item_double_clicked(self, index):
         source_index = self._proxy_model.mapToSource(index)
         if self._fs_model.isDir(source_index):
@@ -1023,6 +1372,8 @@ class FBXBrowserWidget(QtWidgets.QWidget):
             menu.addSeparator()
 
         actions["explorer"] = menu.addAction("エクスプローラーで開く")
+        menu.addSeparator()
+        actions["delete"] = menu.addAction("削除（ごみ箱へ）")
 
         chosen = menu.exec_(QtGui.QCursor.pos())
         if chosen is None:
@@ -1037,6 +1388,7 @@ class FBXBrowserWidget(QtWidgets.QWidget):
             "external_editor": self._open_with_os_default,
             "panel_preview": self._preview_text_in_panel,
             "explorer": self._reveal_in_explorer,
+            "delete": lambda p: self._delete_paths([p]),
         }
         for key, action in actions.items():
             if chosen == action:
@@ -1056,6 +1408,8 @@ class FBXBrowserWidget(QtWidgets.QWidget):
             fav_action = menu.addAction("お気に入りに追加")
             menu.addSeparator()
             explorer_action = menu.addAction("エクスプローラーで開く")
+            menu.addSeparator()
+            delete_action = menu.addAction("削除（ごみ箱へ）")
             chosen = menu.exec_(self.tree_view.viewport().mapToGlobal(pos))
             if chosen is None:
                 return
@@ -1070,6 +1424,8 @@ class FBXBrowserWidget(QtWidgets.QWidget):
                     self._log("お気に入りに追加しました: {}".format(fp), level="run")
             elif chosen == explorer_action:
                 self._reveal_in_explorer(fp)
+            elif chosen == delete_action:
+                self._delete_paths([fp])
             return
 
         clicked_path = self._fs_model.filePath(source_index)
@@ -1078,8 +1434,13 @@ class FBXBrowserWidget(QtWidgets.QWidget):
         if clicked_ext not in ALL_TARGET_EXTENSIONS:
             menu = QtWidgets.QMenu(self)
             explorer_only = menu.addAction("エクスプローラーで開く")
-            if menu.exec_(self.tree_view.viewport().mapToGlobal(pos)) == explorer_only:
+            menu.addSeparator()
+            delete_only = menu.addAction("削除（ごみ箱へ）")
+            chosen = menu.exec_(self.tree_view.viewport().mapToGlobal(pos))
+            if chosen == explorer_only:
                 self._reveal_in_explorer(clicked_path)
+            elif chosen == delete_only:
+                self._delete_paths([clicked_path])
             return
 
         selected_paths = self._get_selected_target_paths()
@@ -1095,6 +1456,8 @@ class FBXBrowserWidget(QtWidgets.QWidget):
         reference_action = menu.addAction("Reference (選択項目)")
         menu.addSeparator()
         explorer_action = menu.addAction("エクスプローラーで開く (先頭項目)")
+        menu.addSeparator()
+        delete_action = menu.addAction("削除（選択項目、ごみ箱へ）")
 
         chosen = menu.exec_(self.tree_view.viewport().mapToGlobal(pos))
         if chosen is None:
@@ -1113,6 +1476,9 @@ class FBXBrowserWidget(QtWidgets.QWidget):
                         self._reference_asset(p, manage_undo=False)
         elif chosen == explorer_action:
             self._reveal_in_explorer(selected_paths[0])
+        elif chosen == delete_action:
+            # 対象外拡張子(.psd等)も含め、選択されている全項目を削除対象にする
+            self._delete_paths(self._get_selected_all_paths())
 
     # ------------------------------------------------------------------
     # Import / Reference
