@@ -643,7 +643,12 @@ function openDetail(id){
     if(r.type==="image"&&imgURL(r.imageId)){
       gallery+=`<div class="ref-img"><img src="${imgURL(r.imageId)}" alt="">${r.caption?`<div class="ref-cap">${esc(r.caption)}</div>`:""}</div>`;
     }else if(r.type==="url"){
-      gallery+=`<div class="ref-url"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.caption||r.url)}</a></div>`;
+      // javascript:等の危険なスキームがhrefに渡ると、esc()はHTML特殊文字しか
+      // エスケープしないためクリック時にコードが実行されてしまう。
+      // mdToHtml()と同じhttp(s)/相対パスのみを許可するホワイトリスト方式で弾く。
+      const urlIsSafe=/^(https?:|\/|#|\.)/i.test((r.url||"").trim());
+      const label=esc(r.caption||r.url);
+      gallery+=`<div class="ref-url">${urlIsSafe?`<a href="${esc(r.url)}" target="_blank" rel="noopener">${label}</a>`:`<span>${label}</span>`}</div>`;
     }
   });
   const used=scenesUsing(id);

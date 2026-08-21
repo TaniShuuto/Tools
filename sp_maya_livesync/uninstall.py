@@ -107,6 +107,10 @@ LIVESYNC_ICON_NAME = "maya_live_sync_icon.png"
 AISS_ICON_NAME = "sp_to_aiStandardSurface_icon.png"
 UDIM_ICON_NAME = "udim_setup_icon.png"
 REGISTER_MARKER = "# === SP_LIVE_SYNC_AUTO_REGISTER ==="
+# maya_live_sync.py の REGISTER_END_MARKER と一致させる必要がある(同ファイル
+# 参照)。汎用的な"except Exception:\n    pass\n"パターンでの終端検出は、
+# ユーザーの手書きコードと衝突しうるため、専用マーカーに置き換えた。
+REGISTER_END_MARKER = "# === SP_LIVE_SYNC_AUTO_REGISTER_END ==="
 
 # maya_live_sync.py 側の定義と一致させる必要がある定数。ここでも
 # ハードコードせず、可能なら実モジュールから読むようにしている
@@ -319,14 +323,22 @@ def _remove_autostart_block():
     if start > 0 and content[start - 1] == "\n":
         start -= 1
 
-    # ブロックは "except Exception:\n    pass\n" で終わる形式に固定されて
-    # いる(register_user_setup() 参照)。マーカー以降で最初に現れるその
-    # パターンまでを削除範囲とする。
-    end_marker = "except Exception:\n    pass\n"
+    # ブロックは REGISTER_END_MARKER で終わる形式に固定されている
+    # (register_user_setup() 参照)。マーカー以降で最初に現れるその
+    # マーカーまでを削除範囲とする。
+    end_marker = REGISTER_END_MARKER + "\n"
     end_idx = content.find(end_marker, start)
-    if end_idx == -1:
-        return False, "登録ブロックの終端が見つからず、安全のため削除を中止しました。手動でご確認ください。"
-    end = end_idx + len(end_marker)
+    if end_idx != -1:
+        end = end_idx + len(end_marker)
+    else:
+        # 後方互換: REGISTER_END_MARKER 導入前に登録された旧形式のブロック
+        # には専用の終端マーカーが無いため、従来の終端パターンで
+        # フォールバック検出する。
+        legacy_end_marker = "except Exception:\n    pass\n"
+        end_idx = content.find(legacy_end_marker, start)
+        if end_idx == -1:
+            return False, "登録ブロックの終端が見つからず、安全のため削除を中止しました。手動でご確認ください。"
+        end = end_idx + len(legacy_end_marker)
 
     new_content = content[:start] + content[end:]
 
