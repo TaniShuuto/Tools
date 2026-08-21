@@ -95,7 +95,31 @@ except ImportError:
 # 使い、他のノード種別(file/aiNormalMap/reverse等)と同じ命名規則で
 # 既存ノードを再利用するよう修正した。既存の動作を壊さない不具合
 # 修正のため、SemVerのルールに従いPATCHを上げる。
-__version__ = "1.0.1"
+#
+# 2026.08.01(不具合修正): file ノードの colorSpace を setAttr で明示指定
+# しても、Maya の Color Management Preferences 内 Input Color Space
+# Rules がファイル名パターン一致時に colorSpace を再上書きし、結果的に
+# 全チャンネルが sRGB になってしまう環境依存の不具合を修正。
+# fileTextureName 設定前に ignoreColorSpaceFileRules を True にして
+# グローバルルールの適用を無効化し、CHANNEL_VARIANTS で指定した
+# colorSpace が確実に反映されるようにした。既存の動作を壊さない
+# 不具合修正のため、SemVerのルールに従いPATCHを上げる。
+#
+# 2026.08.02(重要・不具合修正): uvTilingMode / fileTextureName を setAttr
+# で直接設定した場合、Maya UI上での手動編集（ファイルダイアログでの選択、
+# 直接入力の確定）時に走る「実在するUDIMタイルをディスクスキャンして
+# 解決する」内部コールバックが発火しないことが判明した。この結果、
+# fileノードの属性値自体は正しくても、Mayaの内部ではタイル未解決状態の
+# ままになり、ビューポート表示（毎フレーム逐次読み直すため実害が
+# 出にくい）とArnoldレンダー（シーンエクスポート時に一度だけ内部状態を
+# 引き継ぐため未解決のまま反映される）とで挙動が食い違う原因になって
+# いた。運用上は「Hypershadeで対象fileノードのGenerate Previewボタンを
+# 押すと直る」という現象として観測されていたが、これは同ボタンの副作用
+# として上記のタイル解決処理が呼ばれていたためである。
+# 対策として、fileTextureName確定直後に generateUvTilePreview を明示的に
+# 呼び出し、その場でタイル解決を強制する _resolve_udim_tiles() を追加した。
+# 既存の動作を壊さない不具合修正のため、SemVerのルールに従いPATCHを上げる。
+__version__ = "1.0.3"
 
 # ===========================================================================
 # チャンネルマップ
@@ -446,6 +470,50 @@ def scan_textures(texture_dir: str, recursive: bool = False) -> dict:
 # Maya セットアップエンジン
 # ===========================================================================
 
+def _resolve_udim_tiles(file_node: str) -> bool:
+    """
+    UDIM fileノードに対して、Maya内部の「実在するタイルをディスク
+    スキャンして解決する」処理を強制的に発火させる。
+
+    背景 (2026.08.02 判明):
+      cmds.setAttr で file.uvTilingMode / file.fileTextureName を
+      直接設定しても、Attribute Editor上でユーザーが手動編集した
+      場合にのみ走る内部コールバック（ディスクをスキャンして
+      実在するUDIMタイル番号一覧を解決し、Mayaの内部状態として
+      キャッシュする処理）が発火しない。
+
+      この内部状態が未解決のままだと:
+        - Viewport 2.0 は表示のたびに逐次ディスクを見に行くため、
+          多くの場合は正常に見えてしまう
+        - Arnold はレンダー開始時にMayaの内部状態を一度だけ
+          丸ごとエクスポートするため、未解決のまま引き継がれ、
+          テクスチャが読み込めずグレー（アンロード状態）になる
+
+      Hypershade上で対象fileノードの「Generate Preview」ボタンを
+      手動で押すと直ることが確認されているが、これは同ボタンの
+      本来の目的（サムネイル生成）の副作用として、上記のタイル
+      解決処理が呼ばれているためである。この関数はその副作用を
+      明示的に呼び出し、UDIM_Setup実行時点で毎回自動的に
+      タイルを解決させることで、この現象自体が起きないようにする。
+
+    Returns
+    -------
+    bool: 解決処理が正常に呼べた場合 True。失敗しても例外は投げず、
+          呼び出し元の処理を止めない（ベストエフォート）。
+    """
+    import maya.mel as mel
+    try:
+        mel.eval('generateUvTilePreview("{0}")'.format(file_node))
+        return True
+    except Exception as e:
+        print(
+            f"[UDIM Setup] [WARN] {file_node}: タイル解決処理(generateUvTilePreview)に"
+            f" 失敗しました。Hypershadeで手動により「Generate Preview」を実行して"
+            f" ください: {e}"
+        )
+        return False
+
+
 def _connect_place2d(file_node: str, p2d: str):
     """place2dTexture → File ノードの標準接続を一括で行う"""
     pairs = [
@@ -654,13 +722,35 @@ def setup_udim_material(
                            else cmds.shadingNode("place2dTexture", asUtility=True, name=p2d_name))
                     _connect_place2d(file_node, p2d)
 
+                # Fix(v5.x): Maya の Input Color Space Rules（Color Management
+                # Preferences）が、fileTextureName 設定時にファイル名パターンを
+                # 見て colorSpace を自動で（多くの場合 sRGB に一律で）上書きして
+                # しまう既知の挙動がある。ignoreColorSpaceFileRules を先に True
+                # にしてグローバルルールの適用を無効化し、下の setAttr による
+                # チャンネル別の明示指定が確実に有効になるようにする。
+                if cmds.attributeQuery("ignoreColorSpaceFileRules", node=file_node, exists=True):
+                    cmds.setAttr(f"{file_node}.ignoreColorSpaceFileRules", True)
+
                 # UDIM 設定（相対パスオプションに応じてパスを切り替え）
                 cmds.setAttr(f"{file_node}.uvTilingMode", 3)   # 3 = UDIM (Mari)
                 path_to_use = (_to_project_relative(udim_path)
                                if use_relative_path else udim_path)
                 cmds.setAttr(f"{file_node}.fileTextureName", path_to_use, type="string")
 
+                # Fix(v1.0.3): setAttr による fileTextureName / uvTilingMode
+                # の設定だけでは、Maya内部の「実在するUDIMタイルをディスク
+                # スキャンして解決する」処理（UI手動編集時にのみ発火する
+                # コールバック）が走らない。この結果、fileノードの属性値
+                # 自体は正しいのに、Mayaの内部状態は未解決のままになり、
+                # ビューポートでは表示されるがArnoldレンダーではグレー
+                # (テクスチャ未読み込み)になる、という食い違いが起きる。
+                # generateUvTilePreview を明示的に呼び、その場でタイル解決を
+                # 強制することで、UI手動編集と同じ状態にする。
+                _resolve_udim_tiles(file_node)
+
                 # カラースペース
+                # (ignoreColorSpaceFileRules を先に立てているため、ここでの
+                #  明示指定が Maya 側のルールに上書きされずに確定する)
                 cs = info.get("colorSpace", "Raw") if info else "Raw"
                 cmds.setAttr(f"{file_node}.colorSpace", cs, type="string")
 

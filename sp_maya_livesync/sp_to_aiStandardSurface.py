@@ -69,7 +69,46 @@ import maya.cmds as cmds
 #       方式に揃えた。
 # いずれも既存の動作を壊さない不具合修正のため、SemVerのルールに従い
 # PATCHを上げる。
-__version__ = "1.0.1"
+#
+# 2026.07.30(機能追加・不具合対応): テクスチャフォルダ欄の自動入力が
+# 「install.pyのシェルフボタン(AISS_COMMAND)を押した瞬間の1回きり」
+# だったため、以下の症状が実機で報告されていた:
+#   - SP側で「プロジェクト保存 -> Final書き出し完了」が終わる前に
+#     ボタンを押すと、maya_live_sync.py側のactive_final_subfolderが
+#     まだ更新されておらず、古いプロジェクトのフォルダが入る。
+#   - ボタンを押した後にSP側でプロジェクトを切り替えても、ウィンドウを
+#     閉じて開き直すまで追従しない。
+# maya_live_sync.py側は「監視ON/OFFやreload処理のたびに共有設定を
+# 読み直して追従する」設計であるのに対し、本ファイルだけが「外部
+# (install.py)からの一度きりの注入」に依存しており非対称だった。
+# 対応として、本ファイル自体に以下を追加した:
+#   - show_ui() でウィンドウを開いた瞬間に maya_live_sync.load_config()
+#     を読み、Finalフォルダ(final_export_dir + active_final_subfolder)
+#     を自動入力する(_get_final_target_from_live_sync())。
+#   - ウィンドウを開いている間、idle scriptJob(parent=WIN_MAINで
+#     ウィンドウと連動して自動破棄)で定期的に共有設定を読み直し、
+#     フォルダ欄が自動入力由来のままなら追従させる
+#     (_idle_refresh_dir_field() / _refresh_dir_field_from_config())。
+#     これにより「ウィンドウを開けっぱなしにしていれば、SP側の同期
+#     スタートやプロジェクト保存に自動で追従する」を実現する
+#     (maya_live_sync.py側の変更は不要で、共有設定ファイルを読むだけ)。
+#   - ユーザーがフォルダ欄を手動編集(直接入力または「参照...」)したら
+#     自動追従を止め、ステータスラベルで「手動入力中」と明示する
+#     (_on_dir_field_manually_changed() / _mark_as_manual())。
+#     「自動入力に戻す」ボタン(_reset_to_auto_path())で解除できる。
+#   - 「フォルダをスキャン」実行時は、必ず一度 maya_live_sync の最新値で
+#     フォルダ欄を確定させてから、その確定後の値でスキャンする
+#     (読み込みとスキャンを1つの関数呼び出しの中で連続実行することで、
+#     「表示上は新しいパスだが実際にスキャンしたのは古いパス」という
+#     食い違いを防ぐ)。実際にスキャンしたパスは popup(inViewMessage)
+#     とログの両方に表示する。スキャンで使ったフォルダは scanned_dir
+#     として固定保持し、ウィンドウを開いたままの自動追従でフォルダ欄が
+#     後から変わっても、「マテリアルを作成」ボタンはスキャン時と同じ
+#     フォルダを対象にする(スキャン結果と作成対象の食い違いを防ぐ)。
+# GUIの追加(ステータスラベル・ボタン)のみで、assign_textures_for_prefix()
+# 等のマテリアル生成ロジック自体には手を入れていないため、SemVerの
+# ルールに従いMINORを上げる。
+__version__ = "1.1.0"
 
 # -------------------------------------------------------
 #  Displacement tuning defaults (旧v2.1)
@@ -514,6 +553,14 @@ _gui_state = {
     "ao_cb":        None,
     "sel_cb":       None,
     "scroll_col":   None,
+    # 2026.07.30(不具合修正・自動追従): 以下、フォルダ欄の自動入力/追従
+    # まわりの状態。詳細は _refresh_dir_field_from_config() のdocstring
+    # を参照。
+    "path_status_text":  None,  # 「このパスを自動追跡中/手動入力中」ラベル
+    "user_edited_dir":   False, # Trueなら手動編集済み、自動更新はしない
+    "idle_job":          None,  # scriptJobのID(ウィンドウと連動して破棄)
+    "last_auto_path":    None,  # 直近に自動入力した値(手動編集検知の基準)
+    "scanned_dir":       None,  # 直近のスキャンで実際に使ったフォルダ
 }
 
 WIN_MAIN = "spToAiSSWindow"
@@ -524,7 +571,7 @@ def show_ui():
         cmds.deleteUI(WIN_MAIN)
 
     cmds.window(WIN_MAIN, title="SP -> aiStandardSurface  v{0}".format(__version__),
-                widthHeight=(500, 420), sizeable=True)
+                widthHeight=(500, 460), sizeable=True)
     cmds.columnLayout("mainCol", adjustableColumn=True,
                       rowSpacing=6, columnOffset=["both", 10])
     cmds.separator(h=8, style="none")
@@ -534,15 +581,27 @@ def show_ui():
     cmds.rowLayout(numberOfColumns=2, columnWidth2=(370, 100),
                    adjustableColumn=1,
                    columnAttach=[(1,"both",0),(2,"both",4)])
-    dir_field = cmds.textField(placeholderText="パスを入力するか「参照...」をクリック")
+    dir_field = cmds.textField(placeholderText="パスを入力するか「参照...」をクリック",
+                               changeCommand=lambda _: _on_dir_field_manually_changed())
     cmds.button(label="参照...", command=lambda _: _browse_dir(dir_field))
     cmds.setParent("..")
 
+    # 2026.07.30: 現在フォルダ欄が「自動追跡中」か「手動入力中」かを
+    # 示す小さなステータス行 + 自動入力へ戻すボタン。
+    cmds.rowLayout(numberOfColumns=2, columnWidth2=(370, 100),
+                   adjustableColumn=1,
+                   columnAttach=[(1,"both",0),(2,"both",4)])
+    path_status_text = cmds.text(label="", align="left", font="smallObliqueLabelFont")
+    cmds.button(label="自動入力に戻す",
+                command=lambda _: _reset_to_auto_path())
+    cmds.setParent("..")
+
+    _gui_state["dir_field"]        = dir_field
+    _gui_state["path_status_text"] = path_status_text
+
     cmds.button(label="フォルダをスキャンしてテクスチャセットを検出",
                 height=32,
-                command=lambda _: _scan_and_build_checklist(dir_field))
-
-    _gui_state["dir_field"] = dir_field
+                command=lambda _: _scan_and_build_checklist())
 
     cmds.separator(h=4, style="in")
 
@@ -582,25 +641,197 @@ def show_ui():
 
     cmds.showWindow(WIN_MAIN)
 
+    # 2026.07.30(不具合修正・自動追従): ウィンドウを開いた瞬間に必ず
+    # 最新のFinalフォルダを取得する(install.pyのAISS_COMMANDが「ボタンを
+    # 押した瞬間の1回きり」でしか自動入力できなかった問題への対応。
+    # 詳細は _refresh_dir_field_from_config() のdocstring参照)。
+    _gui_state["user_edited_dir"] = False
+    _refresh_dir_field_from_config(show_status=False)
+
+    # ウィンドウを開いている間、maya_live_sync側の共有設定(SP側の同期
+    # スタート・プロジェクト保存によるFinal書き出し完了など)をidle時に
+    # 定期的に読み直し、フォルダ欄が自動入力由来のままなら追従させる。
+    # parent=WIN_MAIN を指定することで、ウィンドウが閉じられた際に
+    # Maya側がscriptJobを自動的に破棄してくれる(明示的なkillJobが
+    # 漏れてもリーク・多重登録しない)。
+    job_id = cmds.scriptJob(
+        event=["idle", _idle_refresh_dir_field],
+        parent=WIN_MAIN,
+        protected=True,
+    )
+    _gui_state["idle_job"] = job_id
+
 
 def _browse_dir(field):
     result = cmds.fileDialog2(fileMode=3, caption="テクスチャフォルダを選択")
     if result:
         cmds.textField(field, edit=True, text=result[0])
+        # ユーザーが明示的に選んだ値なので手動編集扱いにする。
+        _mark_as_manual(result[0])
 
 
-def _scan_and_build_checklist(dir_field):
-    """フォルダをスキャンし、検出したプレフィックスのチェックリストを再構築する。"""
-    tex_dir = cmds.textField(dir_field, query=True, text=True).strip()
+# ------------------------------------------------------------------
+#  maya_live_sync連携: フォルダ欄の自動入力・自動追従
+# ------------------------------------------------------------------
+# 2026.07.30(不具合修正): 従来、フォルダ欄の自動入力は本ファイルの外側
+# (install.pyのシェルフボタンAISS_COMMAND)が「ボタンを押した瞬間に
+# 一度だけ」担っていた。この方式には2つの制約があった:
+#   1. SP側の「プロジェクト保存 -> Final書き出し完了」を待たないと
+#      active_final_subfolder が最新化されないため、ボタンを押すタイミング
+#      によっては古いプロジェクトのフォルダのままになる。
+#   2. ボタンを押した後にSP側でプロジェクトを切り替えても、ウィンドウを
+#      閉じて開き直すまで一切追従しない。
+# 本体側(このファイル)にも自動入力・追従の仕組みを持たせ、
+#   - ウィンドウを開いた瞬間に必ず最新値を取得
+#   - 開いている間はidle scriptJobで定期的に追従
+#   - ユーザーが手動でパスを編集したら追従を止める(誤って上書きしない)
+#   - 「自動入力に戻す」ボタンで手動編集状態を解除できる
+# ようにする。install.py側のAISS_COMMANDは変更不要
+# (最初の自動入力がここでの処理と重複しても、同じ値を書き込むだけで
+# 副作用は無い)。
+def _get_final_target_from_live_sync():
+    """maya_live_syncの共有設定から、現在アクティブなFinalフォルダの
+    実パスを返す。取得できない場合はNoneを返す(例外は握りつぶす)。
+    """
+    try:
+        import maya_live_sync as _mls
+    except Exception:
+        return None
+    try:
+        cfg = _mls.load_config()
+        final_dir = cfg.get("final_export_dir") or ""
+        subfolder = cfg.get("active_final_subfolder")
+        if not final_dir:
+            return None
+        return os.path.join(final_dir, subfolder) if subfolder else final_dir
+    except Exception:
+        return None
+
+
+def _mark_as_manual(current_text):
+    """フォルダ欄がユーザーによって手動編集されたことを記録する。
+    以後、自動追従(idle scriptJob)はこのフォルダ欄を上書きしない。
+    """
+    _gui_state["user_edited_dir"] = True
+    _update_path_status_label(manual=True, path=current_text)
+
+
+def _on_dir_field_manually_changed():
+    """textFieldのchangeCommand。ユーザーがキーボードで直接編集した
+    場合にも手動編集扱いにする(_browse_dir()経由の「参照...」ボタンと
+    合わせて、フォルダ欄への変更経路を漏れなく捕捉する)。
+    """
+    dir_field = _gui_state.get("dir_field")
+    if not dir_field or not cmds.textField(dir_field, exists=True):
+        return
+    current = cmds.textField(dir_field, query=True, text=True).strip()
+    # 自動入力側が書き込んだ直後にもchangeCommandは発火するため、
+    # 直近の自動入力値と同じであれば手動編集とはみなさない。
+    if current == (_gui_state.get("last_auto_path") or ""):
+        return
+    _mark_as_manual(current)
+
+
+def _reset_to_auto_path():
+    """「自動入力に戻す」ボタン。手動編集フラグを解除し、即座に
+    maya_live_syncの最新値でフォルダ欄を上書きする。
+    """
+    _gui_state["user_edited_dir"] = False
+    _refresh_dir_field_from_config(show_status=True, force=True)
+
+
+def _update_path_status_label(manual, path):
+    label_ctrl = _gui_state.get("path_status_text")
+    if not label_ctrl or not cmds.text(label_ctrl, exists=True):
+        return
+    if manual:
+        text = "手動入力中(自動追従は停止しています)"
+    elif path:
+        text = "SP Live Syncの現在のFinalフォルダを自動追跡中"
+    else:
+        text = "自動取得できませんでした。パスを入力するか「参照...」を使用してください"
+    cmds.text(label_ctrl, edit=True, label=text)
+
+
+def _refresh_dir_field_from_config(show_status=False, force=False):
+    """maya_live_syncの共有設定から最新のFinalフォルダを取得し、
+    フォルダ欄がまだ自動入力由来(ユーザーが手動編集していない)であれば
+    書き込む。
+
+    show_status=Trueの場合、変化の有無をステータスラベルに反映する
+    (「自動入力に戻す」ボタン押下時や、後述のスキャン実行時に使う)。
+    force=Trueの場合、user_edited_dir を無視して強制的に上書きする
+    (「自動入力に戻す」ボタン用)。
+
+    戻り値: 反映後のフォルダ欄の文字列(取得できなければ現在の値)。
+    """
+    dir_field = _gui_state.get("dir_field")
+    if not dir_field or not cmds.textField(dir_field, exists=True):
+        return ""
+
+    if _gui_state.get("user_edited_dir") and not force:
+        # 手動編集中は上書きしない。ステータスラベルだけ最新化する。
+        if show_status:
+            current = cmds.textField(dir_field, query=True, text=True).strip()
+            _update_path_status_label(manual=True, path=current)
+        return cmds.textField(dir_field, query=True, text=True).strip()
+
+    target = _get_final_target_from_live_sync()
+    if target:
+        cmds.textField(dir_field, edit=True, text=target)
+        _gui_state["last_auto_path"] = target
+        _update_path_status_label(manual=False, path=target)
+    elif show_status:
+        _update_path_status_label(manual=False, path=None)
+
+    return cmds.textField(dir_field, query=True, text=True).strip()
+
+
+def _idle_refresh_dir_field(*_args):
+    """idle scriptJobから呼ばれる。例外はここで握りつぶし、Mayaの
+    アイドル処理自体を止めないようにする。
+    """
+    try:
+        _refresh_dir_field_from_config(show_status=False)
+    except Exception:
+        pass
+
+
+def _scan_and_build_checklist():
+    """フォルダをスキャンし、検出したプレフィックスのチェックリストを再構築する。
+
+    2026.07.30(不具合修正): スキャン実行時は必ず一度、maya_live_syncの
+    最新設定でフォルダ欄を確定させてから、その確定後の値でスキャンする
+    (読み込みとスキャンの間に他の処理を挟まない一連の呼び出しにする
+    ことで、「表示上は新しいパスなのに実際にスキャンしたのは古い
+    パス」という食い違いを構造的に防ぐ)。ユーザーが手動編集済みの
+    場合は _refresh_dir_field_from_config() 内で何もしないため、
+    その場合は手動入力された値がそのまま使われる。
+    """
+    tex_dir = _refresh_dir_field_from_config(show_status=True)
+
     if not tex_dir or not os.path.isdir(tex_dir):
         cmds.confirmDialog(title="エラー",
                            message="有効なテクスチャフォルダを指定してください。",
                            button=["OK"])
         return
 
+    # 2026.07.30: 実際にどのパスをスキャンしたかを、ポップアップと
+    # ウィンドウ内ステータス行の両方で明示する。自動追従によって
+    # ユーザーの想定と違うフォルダが使われていた、という事故を防ぐため。
+    print("[SP-to-aiSS] 次のフォルダをスキャンします: {0}".format(tex_dir))
+    cmds.inViewMessage(
+        amg="<hl>[SP-to-aiSS]</hl> このパスでスキャンしています:<br>{0}".format(tex_dir),
+        pos="topCenter", fade=True, fadeStayTime=2500)
+
     groups = scan_prefixes(tex_dir)
     _gui_state["prefix_files"] = groups
     _gui_state["prefix_cbs"]   = {}
+    # 2026.07.30: このスキャンで実際に使ったフォルダを固定で覚えておく。
+    # ウィンドウを開いたまま(idle scriptJobで)フォルダ欄が後から自動更新
+    # されても、_run_all() は「スキャン結果と同じフォルダ」から作成する
+    # ことを保証するため、フォルダ欄の現在値ではなくこちらを使う。
+    _gui_state["scanned_dir"] = tex_dir
 
     col = _gui_state["scroll_col"]
 
@@ -672,7 +903,13 @@ def _set_all_checks(value):
 def _run_all():
     ao_mult    = cmds.checkBox(_gui_state["ao_cb"],  query=True, value=True)
     assign_sel = cmds.checkBox(_gui_state["sel_cb"], query=True, value=True)
-    tex_dir    = cmds.textField(_gui_state["dir_field"], query=True, text=True).strip()
+    # 2026.07.30: フォルダ欄の「今の」値ではなく、直近のスキャンで実際に
+    # 使ったフォルダ(scanned_dir)を使う。ウィンドウを開いたままidle
+    # scriptJobがフォルダ欄を後から自動更新しても、スキャン結果
+    # (prefix_files)と作成対象フォルダが食い違わないようにするため。
+    tex_dir = _gui_state.get("scanned_dir")
+    if not tex_dir:
+        tex_dir = cmds.textField(_gui_state["dir_field"], query=True, text=True).strip()
 
     targets = [
         prefix for prefix, cb in _gui_state["prefix_cbs"].items()
