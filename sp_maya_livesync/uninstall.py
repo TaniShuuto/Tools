@@ -39,7 +39,7 @@ uninstall.py  -  SP -> Maya Live Sync : Maya drag-and-drop uninstaller
     別のMayaセッションで身に覚えのない警告が出続けるため)。
     他プロセスが作成したロックには一切触れない。
 
-対象: Maya 2022 以降(ドラッグ&ドロップ実行自体は 2017 Update 3 以降で対応)
+対象: Maya 2026 以降
 
 NOTE:
     UI文字列は、Windows + 日本語ロケール環境での文字化けを避けるため
