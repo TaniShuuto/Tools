@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-fbx_browser.py  (rev. 2026.07.27-03)
+fbx_browser.py  (rev. 2026.08.21-04)
 ------------------------------------
 Maya内にドッキング可能なアセットブラウザパネル。
+
+rev.04 での追加内容:
+    追加. 画像プレビュー（Mayaでプレビュー表示）に矢印キー（←→）での
+          前後移動を追加。フォルダ内の対象画像一覧を末尾/先頭で
+          循環するため、一度閉じて隣の画像を開き直す手間が無くなる。
 
 rev.03 での追加内容:
     追加. 選択項目（対象外拡張子・フォルダ含む）をOSのごみ箱へ移動する削除機能
@@ -479,6 +484,96 @@ class _DropEnabledTreeView(QtWidgets.QTreeView):
             return
         event.acceptProposedAction()
         self.filesDropped.emit(paths)
+
+
+class _ImagePreviewDialog(QtWidgets.QDialog):
+    """
+    [rev.04追加] 画像プレビュー用ダイアログ。
+
+    従来はプレビュー対象の1枚だけを表示し、隣のファイルを見るには
+    一度閉じてダブルクリックし直す必要があった。ここでは表示中の
+    ファイルと同じフォルダ内の画像一覧・現在位置を保持しておき、
+    左右矢印キーで前後の画像へ即座に切り替えられるようにする
+    （末尾/先頭では反対側へ循環する）。
+    """
+
+    MAX_PREVIEW_SIZE = QtCore.QSize(800, 600)
+
+    def __init__(self, image_paths, current_index, parent=None):
+        super(_ImagePreviewDialog, self).__init__(parent)
+        self._image_paths = image_paths
+        self._index = current_index
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self._image_label = QtWidgets.QLabel()
+        self._image_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self._image_label)
+
+        self._info_label = QtWidgets.QLabel()
+        self._info_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(self._info_label)
+
+        if len(self._image_paths) > 1:
+            hint_label = QtWidgets.QLabel("← → キーで隣の画像へ移動（循環）")
+            hint_label.setStyleSheet("color: gray; font-size: 10px;")
+            layout.addWidget(hint_label)
+
+        # キーイベントを受け取るためフォーカス可能にしておく。
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self._show_current_image()
+
+    def _show_current_image(self):
+        file_path = self._image_paths[self._index]
+        pixmap = QtGui.QPixmap(file_path)
+
+        if pixmap.isNull():
+            self._image_label.setPixmap(QtGui.QPixmap())
+            self._image_label.setText(
+                "この形式はMaya内プレビューに対応していない可能性があります。"
+            )
+            self._info_label.setText("")
+        else:
+            original_size = pixmap.size()
+            if (
+                original_size.width() > self.MAX_PREVIEW_SIZE.width()
+                or original_size.height() > self.MAX_PREVIEW_SIZE.height()
+            ):
+                pixmap = pixmap.scaled(
+                    self.MAX_PREVIEW_SIZE,
+                    QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation,
+                )
+            self._image_label.setPixmap(pixmap)
+            self._info_label.setText(
+                "{} x {}px".format(original_size.width(), original_size.height())
+            )
+
+        self.setWindowTitle(
+            "{}  ({}/{})".format(
+                os.path.basename(file_path), self._index + 1, len(self._image_paths)
+            )
+        )
+        # 画像サイズが変わっても毎回ウィンドウがフィットするようにする。
+        self.adjustSize()
+
+    def _navigate(self, step):
+        if len(self._image_paths) <= 1:
+            return
+        self._index = (self._index + step) % len(self._image_paths)
+        self._show_current_image()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == QtCore.Qt.Key_Right:
+            self._navigate(1)
+            event.accept()
+            return
+        if key == QtCore.Qt.Key_Left:
+            self._navigate(-1)
+            event.accept()
+            return
+        super(_ImagePreviewDialog, self).keyPressEvent(event)
 
 
 class FBXBrowserWidget(QtWidgets.QWidget):
@@ -1728,36 +1823,52 @@ class FBXBrowserWidget(QtWidgets.QWidget):
         dialog.destroyed.connect(_on_destroyed)
         dialog.show()
 
+    def _get_sibling_image_paths(self, file_path):
+        """
+        [rev.04追加] file_path と同じフォルダ内にある画像ファイルの一覧を、
+        表示名の昇順（大文字小文字を区別しない）で返す。矢印キー移動の
+        循環対象リストとして使う。取得に失敗した場合は file_path 自身のみの
+        1件リストにフォールバックする。
+        """
+        folder = os.path.dirname(file_path)
+        try:
+            entries = os.listdir(folder)
+        except OSError:
+            return [file_path]
+
+        image_paths = []
+        for name in entries:
+            ext = os.path.splitext(name)[1].lstrip(".").lower()
+            if ext not in IMAGE_EXTENSIONS:
+                continue
+            full_path = os.path.join(folder, name)
+            if os.path.isfile(full_path):
+                image_paths.append(full_path)
+
+        if not image_paths:
+            return [file_path]
+
+        image_paths.sort(key=lambda p: os.path.basename(p).lower())
+        return image_paths
+
     def _preview_image_in_maya(self, file_path):
         try:
-            pixmap = QtGui.QPixmap(file_path)
-            if pixmap.isNull():
-                self._log(
-                    "この形式はMaya内プレビューに対応していない可能性があります: {}".format(file_path),
-                    level="warn",
-                )
-                return
-
-            dialog = QtWidgets.QDialog(self)
-            dialog.setWindowTitle(os.path.basename(file_path))
-            layout = QtWidgets.QVBoxLayout(dialog)
-
-            label = QtWidgets.QLabel()
-            max_size = QtCore.QSize(800, 600)
-            if pixmap.width() > max_size.width() or pixmap.height() > max_size.height():
-                pixmap = pixmap.scaled(
-                    max_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-                )
-            label.setPixmap(pixmap)
-            layout.addWidget(label)
-
-            info_label = QtWidgets.QLabel("{} x {}px".format(pixmap.width(), pixmap.height()))
-            info_label.setStyleSheet("color: gray; font-size: 10px;")
-            layout.addWidget(info_label)
+            image_paths = self._get_sibling_image_paths(file_path)
+            target_norm = _normalize_for_compare(file_path)
+            current_index = 0
+            for i, p in enumerate(image_paths):
+                if _normalize_for_compare(p) == target_norm:
+                    current_index = i
+                    break
+            else:
+                image_paths = [file_path]
 
             # [修正5] exec_() ではなく show() でモードレス表示し、
             # Maya本体を操作しながら参照できるようにする
+            dialog = _ImagePreviewDialog(image_paths, current_index, parent=self)
             self._register_modeless_dialog(dialog)
+            dialog.activateWindow()
+            dialog.setFocus(QtCore.Qt.OtherFocusReason)
         except Exception as exc:
             self._log("プレビュー表示に失敗しました: {} ({})".format(file_path, exc), level="error")
             traceback.print_exc()
