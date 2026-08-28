@@ -31,7 +31,6 @@ CG制作を効率化するための **Autodesk Maya** と **Adobe Substance 3D P
 
 - Substance 3D PainterとMaya間のリアルタイムテクスチャ同期（Live Sync）
 - aiStandardSurfaceマテリアルの自動作成・自動接続
-- 制作時のリファレンス画像や進捗を管理できるScene Note
 
 ---
 
@@ -78,30 +77,15 @@ Substance 3D Painterから書き出したテクスチャを解析し、
 
 ---
 
-## Scene Note
-
-制作時の
-
-- リファレンス画像
-- メモ
-- TODO
-- 進捗
-
-などを1つの画面で管理できます。
-
----
-
 # Requirements
 
 現在動作確認済みの環境です。
 
 | Software | Version |
 |-----------|----------|
-| Autodesk Maya | 2025 / 2027 |
+| Autodesk Maya | 2026 以降 |
 | Adobe Substance 3D Painter | 10.1 |
 | Arnold Renderer (MtoA) | 対応 |
-
-※今後対応バージョンは増える予定です。
 
 ---
 
@@ -642,8 +626,6 @@ AOをBase Colorに含めたワークフローを利用している場合に有�
 | **sp_live_sync_plugin.py**     | Substance 3D Painter側でLive Syncを実行するプラグインです。      |
 | **sp_to_aiStandardSurface.py** | テクスチャを解析し、aiStandardSurfaceへ自動接続するツールです。          |
 | **udim_setup.py**              | UDIMテクスチャを検出し、Arnold用マテリアルへ自動セットアップするツールです。      |
-| **scenenote.html**             | 制作中のリファレンス画像やメモ、進捗を管理するツールです。                     |
-| **Setup**                      | 旧インストーラーです。今後のアップデートで削除予定です。                      |
 
 ---
 
@@ -749,4 +731,4 @@ AOをBase Colorに含めたワークフローを利用している場合に有�
 
 ライセンスの詳細については `LICENSE` ファイルを参照してください。
 
-その他不具合等がありましたら26au0119@jec.ac.jpまでにお願いします。
+不具合等の連絡先は現在検討中です。決まり次第この節に追記します。
