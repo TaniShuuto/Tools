@@ -1,7 +1,6 @@
 """
 anypath.bridge.diagnosis_controller  -  Bridge層: 自己診断画面のデータ収集・配線
 ================================================================================
-設計書: AnyPath_技術設計書_v2.1.md §6.9, §6.4
 再設計計画書: AnyPath_再設計計画書_v1.md §2 柱1・柱3、§4.3
 
 anypath.shell.diagnosis_panel.DiagnosisPanel はMaya APIに直接触れない
