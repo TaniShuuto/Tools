@@ -48,6 +48,12 @@ def _entry(state: str, generation=7, updated="2026-10-16T10:15:00", message=""):
     }
 
 
+# 既定 updated(10:15) の5分後。CONVERTING は停止扱いにならない。
+_NOW_FIVE_MIN_AFTER_UPDATED = datetime(2026, 10, 16, 10, 20, 0)
+# 既定 updated(10:15) の11分後。CONVERTING は停止扱いになる。
+_NOW_ELEVEN_MIN_AFTER_UPDATED = datetime(2026, 10, 16, 10, 26, 0)
+
+
 class TestStatusModel:
     def test_normal(self, tmp_path):
         status = _write_status(
@@ -153,8 +159,45 @@ class TestStatusModel:
                 tmp_path / "status.json",
                 {name: _entry(state) for name, state in states.items()},
             )
-            view = StatusModel(status).load()
+            view = StatusModel(status).load(now=_NOW_FIVE_MIN_AFTER_UPDATED)
             assert view.worst_state == expected, states
+
+    def test_converting_five_minutes_later_is_not_stalled_stale_wins(self, tmp_path):
+        updated = "2026-10-16T10:15:00"
+        status = _write_status(
+            tmp_path / "status.json",
+            {
+                "A": _entry("CONVERTING", 1, updated, ""),
+                "B": _entry("STALE", 2, updated, ""),
+            },
+        )
+        view = StatusModel(
+            status, now_fn=lambda: _NOW_FIVE_MIN_AFTER_UPDATED
+        ).load()
+        by_name = {row.ts_name: row for row in view.rows}
+        assert by_name["A"].stalled is False
+        assert by_name["A"].color == COLOR_ATTENTION
+        assert STALLED_MESSAGE not in by_name["A"].message
+        assert view.worst_state == "STALE"
+        assert view.worst_color == COLOR_ATTENTION
+
+    def test_converting_eleven_minutes_later_is_stalled_warn(self, tmp_path):
+        updated = "2026-10-16T10:15:00"
+        status = _write_status(
+            tmp_path / "status.json",
+            {"A": _entry("CONVERTING", 1, updated, "working")},
+        )
+        view = StatusModel(
+            status, now_fn=lambda: _NOW_ELEVEN_MIN_AFTER_UPDATED
+        ).load()
+        row = view.rows[0]
+        assert row.state == "CONVERTING"
+        assert row.stalled is True
+        assert row.color == COLOR_WARN
+        assert row.color == "#c94a2a"
+        assert STALLED_MESSAGE in row.message
+        assert view.worst_color == COLOR_WARN
+        assert view.worst_color == "#c94a2a"
 
     def test_none_path_is_no_info(self):
         view = StatusModel(None).load()
@@ -292,12 +335,8 @@ class TestUVRemapPanel:
             qapp,
             get_enabled=lambda: True,
             get_status_path=lambda: status,
+            now_fn=lambda: now_fixed,
         )
-        panel._converting_stale_s = 600
-        # 再描画時に固定時刻を使うため、StatusModel 側の now を直接当てる
-        view = StatusModel(status, converting_stale_s=600).load(now=now_fixed)
-        panel._render(view, True)
-        qapp.processEvents()
         try:
             converting = panel.findChild(type(panel._overall), "ts_state_A")
             stale = panel.findChild(type(panel._overall), "ts_state_B")
@@ -305,11 +344,57 @@ class TestUVRemapPanel:
             assert COLOR_ATTENTION in converting.styleSheet()
             assert stale.text() == "STALE"
             assert COLOR_ATTENTION in stale.styleSheet()
-            overall_text = panel.findChild(type(panel._overall), "overall_status").text()
-            assert "STALE" in overall_text
-            assert COLOR_ATTENTION in panel.findChild(
-                type(panel._overall), "overall_status"
-            ).styleSheet()
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert "STALE" in overall.text()
+            assert COLOR_ATTENTION in overall.styleSheet()
+
+            panel.refresh()
+            qapp.processEvents()
+            converting = panel.findChild(type(panel._overall), "ts_state_A")
+            stale = panel.findChild(type(panel._overall), "ts_state_B")
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert converting.text() == "CONVERTING"
+            assert COLOR_ATTENTION in converting.styleSheet()
+            assert stale.text() == "STALE"
+            assert COLOR_ATTENTION in stale.styleSheet()
+            assert "STALE" in overall.text()
+            assert COLOR_ATTENTION in overall.styleSheet()
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_converting_stalled_after_refresh_uses_warn_color(self, qapp, tmp_path):
+        updated = "2026-10-16T10:15:00"
+        status = _write_status(
+            tmp_path / "status.json",
+            {"Body": _entry("CONVERTING", 8, updated, "working")},
+        )
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: True,
+            get_status_path=lambda: status,
+            now_fn=lambda: _NOW_ELEVEN_MIN_AFTER_UPDATED,
+        )
+        try:
+            state = panel.findChild(type(panel._overall), "ts_state_Body")
+            message = panel.findChild(type(panel._overall), "ts_message_Body")
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert state.text() == "CONVERTING"
+            assert COLOR_WARN in state.styleSheet()
+            assert state.property("state_color") == "#c94a2a"
+            assert STALLED_MESSAGE in message.text()
+            assert COLOR_WARN in overall.styleSheet()
+
+            panel.refresh()
+            qapp.processEvents()
+            state = panel.findChild(type(panel._overall), "ts_state_Body")
+            message = panel.findChild(type(panel._overall), "ts_message_Body")
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert state.text() == "CONVERTING"
+            assert COLOR_WARN in state.styleSheet()
+            assert state.property("state_color") == "#c94a2a"
+            assert STALLED_MESSAGE in message.text()
+            assert COLOR_WARN in overall.styleSheet()
         finally:
             panel.hide()
             panel.close()

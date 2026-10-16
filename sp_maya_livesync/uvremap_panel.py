@@ -197,15 +197,20 @@ class StatusModel:
         *,
         converting_stale_s: float = CONVERTING_STALE_SECONDS,
         now: datetime | None = None,
+        now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.path = Path(path) if path else None
         self.converting_stale_s = float(converting_stale_s)
         self._now = now
+        self._now_fn = now_fn if now_fn is not None else datetime.now
 
     def load(self, *, now: datetime | None = None) -> StatusView:
-        clock = now if now is not None else self._now
-        if clock is None:
-            clock = datetime.now()
+        if now is not None:
+            clock = now
+        elif self._now is not None:
+            clock = self._now
+        else:
+            clock = self._now_fn()
         payload = self._read_payload()
         if payload is None:
             return StatusView(rows=(), worst_state="", available=False)
@@ -312,6 +317,7 @@ def _uvremap_panel_class():
             get_enabled: Callable[[], bool] | None = None,
             get_status_path: Callable[[], str | Path | None] | None = None,
             converting_stale_s: float = CONVERTING_STALE_SECONDS,
+            now_fn: Callable[[], datetime] | None = None,
         ) -> None:
             super().__init__(parent)
             self._on_toggle_enabled = on_toggle_enabled
@@ -320,6 +326,7 @@ def _uvremap_panel_class():
             self._get_enabled = get_enabled
             self._get_status_path = get_status_path
             self._converting_stale_s = converting_stale_s
+            self._now_fn = now_fn if now_fn is not None else datetime.now
 
             self.setObjectName("uvremap_panel")
             self.setWindowTitle("UV再マップ")
@@ -408,6 +415,7 @@ def _uvremap_panel_class():
             view = StatusModel(
                 self._read_status_path(),
                 converting_stale_s=self._converting_stale_s,
+                now_fn=self._now_fn,
             ).load()
             self._render(view, enabled)
 
