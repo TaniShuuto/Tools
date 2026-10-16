@@ -43,6 +43,7 @@ __all__ = [
     "ProbeReport", "probe_verify",
     "udim_tile", "udim_origin", "srgb_to_linear", "linear_to_srgb",
     "PROBE_TAU", "PROBE_NORMAL_DEG", "PROBE_MAX_BAD_FRACTION", "PROBE_MIN_VALID",
+    "PROBE_FOOTPRINT",
 ]
 
 SCHEMA = 1
@@ -53,6 +54,10 @@ PROBE_NORMAL_DEG = 8.0         # normal: 角度[deg]
 PROBE_MAX_BAD_FRACTION = 0.02  # n_bad / n_valid がこれを超えたら fail
 PROBE_MIN_VALID = 64           # n_valid がこれ未満なら inconclusive
 PROBE_BORDER_TEXELS = 2        # 島の境界から除外するテクセル数(縮小後の解像度)
+# 比較窓の方式。"centered" = プローブ点を中心とする s x s の箱型平均(新旧のテクセル密度比で窓を換算)、
+# "lattice" = 画像の格子に固定した箱型縮小(契約文言どおり)。"lattice" は格子の位相差だけで細部
+# テクスチャを誤検出するため既定は "centered"(docs/uvremap/PROBE_CALIBRATION.md、QUESTIONS.md Q1)。
+PROBE_FOOTPRINT = "centered"
 
 _UDIM_MAX_U = 9
 _UDIM_MAX_V = 99
@@ -1205,12 +1210,13 @@ class ProbeReport:
     bad_points: list = field(default_factory=list)
     excluded: dict = field(default_factory=dict)   # 除外理由 → 点数
     notes: list = field(default_factory=list)
+    params: dict = field(default_factory=dict)     # 判定に使った設定(しきい値、窓方式 等)
 
     def to_dict(self) -> dict:
         return {"status": self.status, "n_total": self.n_total, "n_valid": self.n_valid,
                 "n_bad": self.n_bad, "max_err": self.max_err, "mean_err": self.mean_err,
                 "bad_points": list(self.bad_points), "excluded": dict(self.excluded),
-                "notes": list(self.notes)}
+                "notes": list(self.notes), "params": dict(self.params)}
 
 
 def _ds_factor(h: int, w: int) -> int:
@@ -1254,6 +1260,32 @@ def _dilate_bool(mask: np.ndarray, k: int) -> np.ndarray:
     return m
 
 
+def _box_mean_at(img: np.ndarray, cx: np.ndarray, cy: np.ndarray,
+                 wx: np.ndarray, wy: np.ndarray, chunk: int = 256) -> np.ndarray:
+    """連続ピクセル座標 (cx, cy)(テクセルの縁が整数)を中心とする wx x wy の箱型平均。
+
+    窓は小数幅でよく、縁のテクセルは重なり面積で重み付けする(画像の外は端の値で延長)。
+    格子に固定した縮小画像と違い、窓が常にプローブ点を中心にするので、旧/新で格子の位相が
+    ずれても同じ領域を平均する。(N,C) を返す。
+    """
+    H, W, C = img.shape
+    out = np.empty((len(cx), C), dtype=np.float32)
+    for a in range(0, len(cx), chunk):
+        sl = slice(a, a + chunk)
+        x_lo, x_hi = cx[sl] - wx[sl] / 2, cx[sl] + wx[sl] / 2
+        y_lo, y_hi = cy[sl] - wy[sl] / 2, cy[sl] + wy[sl] / 2
+        mx = int(np.ceil((x_hi - x_lo).max())) + 1
+        my = int(np.ceil((y_hi - y_lo).max())) + 1
+        ix = np.floor(x_lo).astype(np.int64)[:, None] + np.arange(mx)[None, :]
+        iy = np.floor(y_lo).astype(np.int64)[:, None] + np.arange(my)[None, :]
+        wxs = np.clip(np.minimum(ix + 1, x_hi[:, None]) - np.maximum(ix, x_lo[:, None]), 0, None)
+        wys = np.clip(np.minimum(iy + 1, y_hi[:, None]) - np.maximum(iy, y_lo[:, None]), 0, None)
+        block = img[np.clip(iy, 0, H - 1)[:, :, None], np.clip(ix, 0, W - 1)[:, None, :]]
+        acc = np.einsum("nyxc,ny,nx->nc", block, wys.astype(np.float32), wxs.astype(np.float32))
+        out[sl] = acc / (wxs.sum(1) * wys.sum(1))[:, None].astype(np.float32)
+    return out
+
+
 class _ProbeSide:
     """プローブ側の1レイアウト(旧または新): 縮小画像と境界/重なりマスクをタイルごとに遅延生成する。"""
 
@@ -1266,8 +1298,14 @@ class _ProbeSide:
     def has(self, key: int) -> bool:
         return key in self.tiles
 
+    def dims(self, key: int):
+        """(s, W, H, 縮小後の幅, 縮小後の高さ)"""
+        H, W = self.tiles[key].shape[:2]
+        s = _ds_factor(H, W)
+        return s, W, H, max(1, W // s), max(1, H // s)
+
     def ds(self, key: int):
-        """(縮小画像, s, W, H)"""
+        """(縮小画像, s, W, H): 画像の格子に固定した s x s の箱型縮小(契約どおりの方式)。"""
         if key not in self._ds:
             img = self.tiles[key]
             H, W = img.shape[:2]
@@ -1278,8 +1316,7 @@ class _ProbeSide:
     def maps(self, key: int):
         """(境界から離れているか(縮小後解像度), 重なりの近傍か)"""
         if key not in self._maps:
-            small, s, W, H = self.ds(key)
-            hd, wd = small.shape[:2]
+            _, _, _, wd, hd = self.dims(key)
             tri_map, _, overlap_idx = self.layout.rasterize(key, wd, hd)
             cover = tri_map >= 0
             ov = np.zeros(hd * wd, dtype=bool)
@@ -1289,15 +1326,22 @@ class _ProbeSide:
         return self._maps[key]
 
     def sample(self, key: int, u_local: np.ndarray, v_local: np.ndarray) -> np.ndarray:
+        """格子固定の縮小画像をバイリニアで引く(footprint="lattice")。"""
         small, s, W, H = self.ds(key)
         x = u_local * W / s - 0.5
         y = (1.0 - v_local) * H / s - 0.5
         return _bilinear_xy(small, x, y)
 
+    def sample_centered(self, key: int, u_local: np.ndarray, v_local: np.ndarray,
+                        size: np.ndarray) -> np.ndarray:
+        """点を中心とする size テクセル四方の箱型平均(footprint="centered")。"""
+        img = self.tiles[key]
+        H, W = img.shape[:2]
+        return _box_mean_at(img, u_local * W, (1.0 - v_local) * H, size, size)
+
     def lookup(self, key: int, which: int, u_local: np.ndarray, v_local: np.ndarray) -> np.ndarray:
         """maps()[which] を点の位置で引く。"""
-        small, s, W, H = self.ds(key)
-        hd, wd = small.shape[:2]
+        _, _, _, wd, hd = self.dims(key)
         m = self.maps(key)[which]
         xi = np.clip(np.floor(u_local * wd).astype(np.int64), 0, wd - 1)
         yi = np.clip(np.floor((1.0 - v_local) * hd).astype(np.int64), 0, hd - 1)
@@ -1337,12 +1381,16 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
                  udim: bool | None = None, normal_mode: Literal["uv", "off"] = "uv",
                  tau: float | None = None, max_angle_deg: float | None = None,
                  max_bad_fraction: float | None = None,
-                 min_valid: int | None = None) -> ProbeReport:
+                 min_valid: int | None = None,
+                 footprint: Literal["lattice", "centered"] = PROBE_FOOTPRINT,
+                 match_density: bool = True) -> ProbeReport:
     """3Dプローブ検証: 変換結果が新UVの正しい位置に載っているかを、変換とは別経路で確認する。
 
     TSのフェース上から面積比例で n 点(固定シード)を選び、各点の旧UV位置と新UV位置を
     同じ三角形・同じ重心座標から求める。旧テクスチャを旧UVで、新テクスチャを新UVで読み、
-    縮小(箱型, s = max(1, min(W,H)//256))してから比較する。
+    縮小(箱型, s = max(1, min(W,H)//256))してから比較する。箱型の窓は既定ではプローブ点を
+    中心に置く(footprint="centered")。格子固定の縮小(footprint="lattice")は新旧の格子の位相差で
+    細部テクスチャを誤検出するため既定にしていない。
 
     除外: 島の境界から2テクセル(縮小後)以内、UDIM境界またぎ/範囲外の面、新UVの重なり、
     旧タイルが無い点。新タイルが無い点は不合格として数える。
@@ -1354,6 +1402,9 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
     max_angle = PROBE_NORMAL_DEG if max_angle_deg is None else max_angle_deg
     max_bad_frac = PROBE_MAX_BAD_FRACTION if max_bad_fraction is None else max_bad_fraction
     min_valid = PROBE_MIN_VALID if min_valid is None else min_valid
+    if footprint not in ("lattice", "centered"):
+        raise ValueError(f"footprint must be 'lattice' or 'centered': {footprint!r}")
+    centered = footprint == "centered"
     udim = _resolve_udim(udim, baseline)
     is_normal = spec.kind == "normal"
     ts = _collect_triangles(baseline, current, ts_name)
@@ -1442,13 +1493,29 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
     q_all = None
     if is_normal and normal_mode == "uv":
         q_all = _polar_Q(ts.old_uv[cand], ts.new_uv[cand])
+    area_old = _tri_area_uv(ts.old_uv[cand])
+    area_new = _tri_area_uv(ts.new_uv[cand])
     old_vals: dict[int, np.ndarray] = {}
     new_vals: dict[int, np.ndarray] = {}
     for k in np.unique(ko[check]):
         for kn_ in np.unique(kn[check & (ko == k)]):
             sel = np.flatnonzero(check & (ko == k) & (kn == kn_))
-            a = old_side.sample(int(k), uo[sel], vo[sel])
-            b = new_side.sample(int(kn_), un[sel], vn[sel])
+            if centered:
+                s_new = float(new_side.dims(int(kn_))[0])
+                size_new = np.full(len(sel), s_new)
+                size_old = np.full(len(sel), float(old_side.dims(int(k))[0]))
+                if match_density:
+                    # 新旧の窓が同じ表面の長さを覆うよう、テクセル密度の比で旧窓を換算する
+                    _, Wo, Ho, _, _ = old_side.dims(int(k))
+                    _, Wn, Hn, _, _ = new_side.dims(int(kn_))
+                    rho = np.sqrt((area_new[ti_c[sel]] * Wn * Hn)
+                                  / (area_old[ti_c[sel]] * Wo * Ho))
+                    size_old = np.clip(s_new / rho, 1.0, 4.0 * s_new)
+                a = old_side.sample_centered(int(k), uo[sel], vo[sel], size_old)
+                b = new_side.sample_centered(int(kn_), un[sel], vn[sel], size_new)
+            else:
+                a = old_side.sample(int(k), uo[sel], vo[sel])
+                b = new_side.sample(int(kn_), un[sel], vn[sel])
             if is_normal:
                 if a.shape[1] < 3 or b.shape[1] < 3:
                     raise ChannelFormatError("normal map needs at least 3 channels")
@@ -1492,5 +1559,11 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
         notes.append(f"n_valid {n_valid} < {min_valid}")
     else:
         status = "pass"
+    s_min = min([old_side.dims(k)[0] for k in old_src] + [new_side.dims(k)[0] for k in new_src])
+    if s_min < 4 and (status == "fail" or n_bad):
+        notes.append(f"low_resolution_probe: s={s_min} (<4); texel-level detail can raise false alarms")
+    params = {"tau": tau, "max_angle_deg": max_angle, "max_bad_fraction": max_bad_frac,
+              "min_valid": min_valid, "footprint": footprint, "match_density": bool(match_density),
+              "seed": int(seed), "n": int(n)}
     return ProbeReport(status, int(n), n_valid, n_bad, max_err, mean_err, bad_points,
-                       excluded, notes)
+                       excluded, notes, params)
