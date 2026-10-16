@@ -1,0 +1,5 @@
+results/
+scratch/
+__pycache__/
+*.pyc
+._hold.py
