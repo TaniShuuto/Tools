@@ -88,6 +88,124 @@ def _try_cmd(label, fn):
         return {"ok": False, "label": label, "error": exception_observation(exc)}
 
 
+def _edge_components(cmds, mesh, edge_index, mode):
+    """polySelect でリング/ループを取る。失敗時は単一エッジ。"""
+    comps = []
+    try:
+        if hasattr(cmds, "polySelect"):
+            ids = cmds.polySelect(mesh, noSelection=True, **{mode: int(edge_index)}) or []
+            comps = ["{0}.e[{1}]".format(mesh, int(i)) for i in ids]
+    except Exception:
+        comps = []
+    if not comps:
+        comps = ["{0}.e[{1}]".format(mesh, int(edge_index))]
+    return comps
+
+
+def _try_face_increase(cmds, mesh):
+    """面数が増える分割を試す。e[0] の no-op を避け、赤道付近のリング/ループを選ぶ。
+
+    増えなければ polySubdivideFacet 等へ切り替える。
+    面数増加は前提条件。増えなくてもここでは判定せず、evaluate が INCONCLUSIVE にする。
+    """
+    before_faces = mesh_face_vertex_ids(cmds, mesh)[0]
+    before = compute_topology_fingerprint(before_faces)
+    n_edges = int(cmds.polyEvaluate(mesh, edge=True))
+    attempts = []
+
+    def n_faces():
+        return int(cmds.polyEvaluate(mesh, face=True))
+
+    edge_candidates = []
+    if n_edges > 0:
+        for idx in (n_edges // 2, n_edges // 3, min(8, n_edges - 1), 0):
+            if idx not in edge_candidates:
+                edge_candidates.append(idx)
+
+    increased = False
+    if hasattr(cmds, "polySplitRing"):
+        for idx in edge_candidates:
+            if increased:
+                break
+            for mode in ("edgeRing", "edgeLoop"):
+                comps = _edge_components(cmds, mesh, idx, mode)
+                before_n = n_faces()
+
+                def _do(c=list(comps)):
+                    cmds.select(c)
+                    cmds.polySplitRing(c, splitType=1, divisions=1, weight=0.5)
+
+                ran = _try_cmd("polySplitRing_{0}_e{1}".format(mode, idx), _do)
+                after_n = n_faces()
+                attempts.append({
+                    "label": ran.get("label"),
+                    "command": ran,
+                    "mode": mode,
+                    "seed_edge": idx,
+                    "n_edges_used": len(comps),
+                    "edges_head": comps[:16],
+                    "n_faces_before": before_n,
+                    "n_faces_after": after_n,
+                    "increased": after_n > before_n,
+                })
+                if after_n > before_n:
+                    increased = True
+                    break
+
+    if not increased and hasattr(cmds, "polySubdivideFacet"):
+        before_n = n_faces()
+        ran = _try_cmd(
+            "polySubdivideFacet",
+            lambda: cmds.polySubdivideFacet(mesh + ".f[0]", divisions=1),
+        )
+        after_n = n_faces()
+        attempts.append({
+            "label": "polySubdivideFacet",
+            "command": ran,
+            "n_faces_before": before_n,
+            "n_faces_after": after_n,
+            "increased": after_n > before_n,
+        })
+        if after_n > before_n:
+            increased = True
+
+    if not increased and hasattr(cmds, "polySubdivideEdge"):
+        before_n = n_faces()
+        mid = n_edges // 2 if n_edges else 0
+        ran = _try_cmd(
+            "polySubdivideEdge",
+            lambda: cmds.polySubdivideEdge(mesh + ".e[{0}]".format(mid), divisions=1),
+        )
+        after_n = n_faces()
+        attempts.append({
+            "label": "polySubdivideEdge",
+            "command": ran,
+            "n_faces_before": before_n,
+            "n_faces_after": after_n,
+            "increased": after_n > before_n,
+        })
+        if after_n > before_n:
+            increased = True
+
+    after_faces = mesh_face_vertex_ids(cmds, mesh)[0]
+    after = compute_topology_fingerprint(after_faces)
+    any_ok = any((a.get("command") or {}).get("ok") for a in attempts)
+    return {
+        "label": "face_split",
+        "command": {"ok": any_ok, "label": "face_split"} if attempts else {
+            "ok": False, "error": "no_split_command",
+        },
+        "attempts": attempts,
+        "before": before,
+        "after": after,
+        "changed": before != after,
+        "n_faces_before": len(before_faces),
+        "n_faces_after": len(after_faces),
+        "faces_increased": increased,
+        "requires_face_increase": True,
+    }
+
+
 def run_maya_cases(cmds):
     obs = {"steps": [], "invariants": [], "expected_changes": [], "normal_flip": {}}
     new_scratch_scene(cmds)
@@ -132,40 +250,8 @@ def run_maya_cases(cmds):
         lambda: cmds.polyEditUV(all_uv, rot=35.0, pu=0.5, pv=0.5),
     )
 
-    def record_change(label, action):
-        before_faces = mesh_face_vertex_ids(cmds, sphere)[0]
-        before = compute_topology_fingerprint(before_faces)
-        ran = _try_cmd(label, action)
-        after_faces = mesh_face_vertex_ids(cmds, sphere)[0]
-        after = compute_topology_fingerprint(after_faces)
-        row = {
-            "label": label,
-            "command": ran,
-            "before": before,
-            "after": after,
-            "changed": before != after,
-            "n_faces_before": len(before_faces),
-            "n_faces_after": len(after_faces),
-        }
-        obs["expected_changes"].append(row)
-        return row
-
-    if hasattr(cmds, "polySplitRing"):
-        record_change(
-            "polySplitRing",
-            lambda: cmds.polySplitRing(sphere + ".e[0]", splitType=1, divisions=1),
-        )
-    elif hasattr(cmds, "polySubdivideEdge"):
-        record_change(
-            "polySubdivideEdge",
-            lambda: cmds.polySubdivideEdge(sphere + ".e[0]", divisions=1),
-        )
-    else:
-        obs["expected_changes"].append({
-            "label": "edge_split",
-            "command": {"ok": False, "error": "no_split_command"},
-            "changed": None,
-        })
+    split_row = _try_face_increase(cmds, sphere)
+    obs["expected_changes"].append(split_row)
 
     # 削減は別メッシュで(上の分割後だと条件が変わるため)
     reduce_mesh = cmds.polySphere(name="phase0_v6_reduce", sx=10, sy=8)[0]
@@ -213,14 +299,22 @@ def evaluate(obs):
         r for r in obs.get("invariants") or []
         if r.get("command", {}).get("ok")
     ]
+    split_no_increase = [
+        r for r in obs.get("expected_changes") or []
+        if r.get("requires_face_increase") and not r.get("faces_increased")
+    ]
     change_fail = [
         r for r in obs.get("expected_changes") or []
-        if r.get("command", {}).get("ok") and r.get("changed") is False
+        if r.get("command", {}).get("ok")
+        and r.get("changed") is False
+        and not (r.get("requires_face_increase") and not r.get("faces_increased"))
     ]
     change_ran = [
         r for r in obs.get("expected_changes") or []
         if r.get("command", {}).get("ok")
     ]
+    if split_no_increase:
+        return STATUS_INCONCLUSIVE, "分割しても面数が増えなかった(前提条件未達)"
     if not invariant_ran or not change_ran:
         return STATUS_INCONCLUSIVE, "UV操作またはトポロジー変更のコマンドが実行できなかった"
     if invariant_fail or change_fail:

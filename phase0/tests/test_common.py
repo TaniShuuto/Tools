@@ -96,3 +96,103 @@ def test_json_safe_enum_like():
     out = common.json_safe(E())
     assert out["name"] == "SUCCESS"
     assert out["value"] == 1
+
+
+def test_json_safe_scalars_ignore_depth():
+    assert common.json_safe("keep", depth=99) == "keep"
+    assert common.json_safe(23, depth=99) == 23
+    assert common.json_safe(False, depth=99) is False
+    assert common.json_safe(None, depth=99) is None
+    nested = {"_truncated": True, "type": "dict"}
+    assert common.json_safe({"a": {"b": 1}}, depth=common.JSON_SAFE_MAX_DEPTH + 1) == nested
+
+
+def test_json_safe_list_over_200_records_total():
+    items = list(range(250))
+    out = common.json_safe(items)
+    assert out["_total"] == 250
+    assert out["_items"] == list(range(200))
+    assert common.json_safe(list(range(200))) == list(range(200))
+
+
+def test_json_safe_preserves_v4_like_nested_scalars(tmp_path):
+    """実機と同じ入れ子(checks.V4.observations.meshes[].api.*)で欠落しない。"""
+    shader_names = ["phase0_v4_cube_matASG", "phase0_v4_cube_matBSG"]
+    face_indices = [0, 0, 0, 1, 1, -1]
+    face_sg = [
+        "phase0_v4_cube_matASG",
+        "phase0_v4_cube_matASG",
+        "phase0_v4_cube_matASG",
+        "phase0_v4_cube_matBSG",
+        "phase0_v4_cube_matBSG",
+        None,
+    ]
+    cmds_face_sg = [
+        "phase0_v4_cube_matASG",
+        "phase0_v4_cube_matASG",
+        "phase0_v4_cube_matASG",
+        "phase0_v4_cube_matBSG",
+        "phase0_v4_cube_matBSG",
+        "initialShadingGroup",
+    ]
+    sphere_cmds = ["matA"] * 24
+    sphere_cmds[5] = "initialShadingGroup"
+    sphere_cmds[23] = "initialShadingGroup"
+    diffs = [
+        {
+            "face": 5,
+            "api": None,
+            "cmds": "initialShadingGroup",
+            "kind": "unassigned_none_vs_initial",
+        },
+    ]
+    obs = {
+        "meshes": [
+            {
+                "label": "cube_instance1",
+                "instance": 1,
+                "api": {
+                    "shader_names": shader_names,
+                    "face_indices": face_indices,
+                    "face_sg": face_sg,
+                },
+                "cmds_face_sg": cmds_face_sg,
+                "compare": {
+                    "n_faces": 6,
+                    "n_diff": 1,
+                    "diffs": diffs,
+                    "diffs_head": diffs,
+                },
+            },
+            {
+                "label": "sphere_instance0",
+                "cmds_face_sg": sphere_cmds,
+                "compare": {
+                    "n_diff": 1,
+                    "diffs": [{"face": 23, "api": None, "cmds": "initialShadingGroup"}],
+                },
+            },
+        ],
+    }
+    check = common.make_check(common.STATUS_PASS, "nested", obs)
+    path = str(tmp_path / "phase0_results_maya.json")
+    payload = common.write_results(path, {"V4": check}, env={"python_version": "3.x"})
+    api = payload["checks"]["V4"]["observations"]["meshes"][0]["api"]
+    assert api["shader_names"] == shader_names
+    assert api["face_indices"] == face_indices
+    assert api["face_sg"] == face_sg
+    cmp_row = payload["checks"]["V4"]["observations"]["meshes"][0]["compare"]
+    assert cmp_row["diffs"][0]["face"] == 5
+    assert cmp_row["diffs"][0]["cmds"] == "initialShadingGroup"
+    assert cmp_row["diffs_head"][0]["kind"] == "unassigned_none_vs_initial"
+    sphere = payload["checks"]["V4"]["observations"]["meshes"][1]
+    assert sphere["cmds_face_sg"][5] == "initialShadingGroup"
+    assert sphere["cmds_face_sg"][23] == "initialShadingGroup"
+    assert not isinstance(api["shader_names"][0], dict)
+
+
+def test_collect_env_includes_maya_about():
+    env = common.collect_env()
+    assert "maya" in env
+    assert set(env["maya"]["about"].keys()) >= {"version", "apiVersion", "product"}
+    assert "available" in env["maya"]

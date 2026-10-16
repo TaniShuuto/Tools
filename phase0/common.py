@@ -19,6 +19,10 @@ from typing import Any
 
 SCHEMA = 1
 
+# json_safe: スカラーは深さ無制限。入れ子の上限とリスト件数。
+JSON_SAFE_MAX_DEPTH = 8
+JSON_SAFE_MAX_LIST = 200
+
 STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
 STATUS_INCONCLUSIVE = "INCONCLUSIVE"
@@ -157,22 +161,32 @@ def format_exception(exc):
 
 
 def json_safe(value, depth=0):
-    """結果JSONに載せられる形へ落とす。推測で埋めない。"""
-    if depth > 6:
-        return {"_truncated": True, "type": type(value).__name__}
+    """結果JSONに載せられる形へ落とす。推測で埋めない。
+
+    文字列・数値・真偽値・None は深さに関係なく残す。
+    深さ制限は dict/list の入れ子にだけ適用する(上限 JSON_SAFE_MAX_DEPTH)。
+    リストは先頭 JSON_SAFE_MAX_LIST 件。超える場合は _total に総数を残す。
+    """
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
         return anonymize_text(value)
     if isinstance(value, bytes):
         return {"_bytes_hex": value[:64].hex(), "n": len(value)}
+    if depth > JSON_SAFE_MAX_DEPTH:
+        return {"_truncated": True, "type": type(value).__name__}
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():
             out[str(key)] = json_safe(item, depth + 1)
         return out
     if isinstance(value, (list, tuple, set)):
-        return [json_safe(item, depth + 1) for item in list(value)[:200]]
+        items = list(value)
+        total = len(items)
+        out = [json_safe(item, depth + 1) for item in items[:JSON_SAFE_MAX_LIST]]
+        if total > JSON_SAFE_MAX_LIST:
+            return {"_items": out, "_total": total}
+        return out
     if isinstance(value, type):
         return {"_class": getattr(value, "__name__", str(value)),
                 "module": getattr(value, "__module__", None)}
@@ -212,6 +226,33 @@ def probe_module(name):
     return info
 
 
+def collect_maya_about():
+    """cmds.about の version / apiVersion / product。standalone は起動しない。"""
+    info = {
+        "available": False,
+        "about": {"version": None, "apiVersion": None, "product": None},
+        "error": None,
+    }
+    cmds = sys.modules.get("maya.cmds")
+    if cmds is None:
+        try:
+            import maya.cmds as cmds  # type: ignore
+        except Exception as exc:
+            info["error"] = exception_observation(exc)
+            return info
+    try:
+        about = {}
+        for key in ("version", "apiVersion", "product"):
+            called = safe_call(cmds.about, **{key: True})
+            about[key] = called.get("value") if called.get("ok") else called
+        info["about"] = about
+        info["available"] = True
+        return info
+    except Exception as exc:
+        info["error"] = exception_observation(exc)
+        return info
+
+
 def collect_env():
     exe = anonymize_path(sys.executable)
     cwd = anonymize_path(os.getcwd())
@@ -227,6 +268,7 @@ def collect_env():
         "executable": exe,
         "cwd": cwd,
         "argv0": anonymize_path(sys.argv[0]) if sys.argv else None,
+        "maya": collect_maya_about(),
     }
 
 

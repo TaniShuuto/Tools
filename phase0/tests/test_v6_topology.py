@@ -65,3 +65,21 @@ def test_v6_evaluate_without_maya():
         ],
     })
     assert status == "FAIL"
+    status, summary = evaluate({
+        "invariants": [
+            {"command": {"ok": True}, "unchanged": True},
+        ],
+        "expected_changes": [
+            {
+                "command": {"ok": True},
+                "changed": False,
+                "requires_face_increase": True,
+                "faces_increased": False,
+                "n_faces_before": 48,
+                "n_faces_after": 48,
+            },
+            {"command": {"ok": True}, "changed": True},
+        ],
+    })
+    assert status == "INCONCLUSIVE"
+    assert "面数" in summary

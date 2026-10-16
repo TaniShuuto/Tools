@@ -1,6 +1,6 @@
 # Phase 0 実行手順(学校PC / インストール不要)
 
-前提: Maya 2027 と Substance 3D Painter 12.0.0。**ソフトの追加(pip 含む)はしない。** このフォルダ(`phase0/`)だけ使う。**自分の作品シーンや `.spp` は開かない。**
+前提: Maya と Substance 3D Painter。**バージョンは固定しない**(Maya 2026 / 2027 どちらでも可)。**ソフトの追加(pip 含む)はしない。** このフォルダ(`phase0/`)だけ使う。**自分の作品シーンや `.spp` は開かない。**
 
 結果JSONのパスは `common.py` がホームを `~` に置換する。メール・ユーザー名は出さない。指揮役(Claude)には **JSONの中身を貼る**(ファイルそのものを送らなくてよい)。
 
@@ -8,11 +8,32 @@
 
 ## 1. Maya(推奨: mayapy。今開いているシーンに触れない)
 
-コマンドプロンプトで、`phase0` フォルダに移動してから:
+先に `mayapy.exe` の場所を探す(PowerShell):
 
 ```
-"C:\Program Files\Autodesk\Maya2027\bin\mayapy.exe" run_maya_all.py
+Get-ChildItem "C:\Program Files\Autodesk" -Filter mayapy.exe -Recurse -ErrorAction SilentlyContinue
 ```
+
+見つかったパスを変数に入れ、実行前に `Test-Path` する。
+
+PowerShell(引用符で囲んだパスの前に `& ` が必要):
+
+```
+$mayapy = "C:\Program Files\Autodesk\Maya2026\bin\mayapy.exe"
+# 上の年は例。Get-ChildItem で出たパスに置き換える。
+Test-Path $mayapy
+Set-Location <この phase0 フォルダ>
+& $mayapy run_maya_all.py
+```
+
+cmd(引用符の前に `&` は不要):
+
+```
+cd /d <この phase0 フォルダ>
+"C:\Program Files\Autodesk\Maya2026\bin\mayapy.exe" run_maya_all.py
+```
+
+`Test-Path` が `False`、または cmd で「見つからない」なら、年号を 2027 など実際のインストールに合わせるか、`Get-ChildItem` の結果を使う。
 
 これで V1 / V4 / V6 / V9(FBX出力まで)が走り、`phase0\results\phase0_results_maya.json` ができる。所要 **約10分**。
 
@@ -32,7 +53,9 @@ V9のFBXは `phase0\scratch\phase0_v9_triangulated.fbx`。Painter側は `v9_prot
 
 ## 2. Painter(Python コンソールまたはプラグイン)
 
-置き場と有効化は公式どおり。Windows 7.2 以降の Python プラグインは  
+学校の共用PCでは、**プラグイン導入より Python コンソールへ貼り付けを推奨**する(他利用者の環境を汚さない)。
+
+プラグインを使う場合の置き場と有効化は公式どおり。Windows 7.2 以降の Python プラグインは  
 `~\Documents\Adobe\Adobe Substance 3D Painter\python\plugins`  
 (公式: https://experienceleague.adobe.com/en/docs/substance-3d-dev/painter-python/tutorials/create-a-python-plugin )。  
 `plugins` 直下(JavaScript用)ではなく **`python/plugins`**。Painter を起動し、**Python メニューでファイル名をクリックして有効化**(同ページ)。
@@ -62,6 +85,15 @@ python v8_replace_lock.py
 ```
 
 V5 は実機の Final フォルダを指定(中身が空だと INCONCLUSIVE)。V8 は Windows のみ意味がある。結果は `phase0\results\phase0_results_misc.json`。各3〜5分。
+
+---
+
+## 4. 学校の共用PC
+
+1. `phase0` はネットワークドライブや他利用者のホームではなく、**自分のローカルドライブ**(例: `D:\work\...`)に置く。
+2. 実行後、`phase0\results` と `phase0\scratch` を必要な分だけ回収し、**PC上からは削除する**。
+3. Painter はプラグイン導入より、**コンソールへ貼り付け**を推奨する。
+4. 指揮役へ結果を貼る前に、ユーザー名・メール・ホームの絶対パス・認証情報がないか確認する。あれば `~` や `<user>` に直す。
 
 ---
 

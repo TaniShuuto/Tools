@@ -2,7 +2,9 @@
 """V1, V4, V6, V9(FBX出力まで)を一括実行し phase0_results_maya.json を書く。
 
 推奨: mayapy から実行する(利用者の開いているシーンに触れない)。
-  "C:/Program Files/Autodesk/Maya2027/bin/mayapy.exe" run_maya_all.py
+Maya の年号は固定しない。mayapy.exe の場所は PHASE0_RUNBOOK.md を見る。
+  PowerShell: & "C:\\Program Files\\Autodesk\\<Maya>\\bin\\mayapy.exe" run_maya_all.py
+  cmd:       "C:\\Program Files\\Autodesk\\<Maya>\\bin\\mayapy.exe" run_maya_all.py
 """
 from __future__ import annotations
 

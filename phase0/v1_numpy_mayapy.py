@@ -52,7 +52,10 @@ except ImportError:
     )
 
 
-MODULE_NAMES = ("numpy", "PIL", "scipy", "OpenImageIO", "pip")
+MODULE_NAMES = (
+    "numpy", "PIL", "scipy", "OpenImageIO", "pip",
+    "PySide6", "PySide2", "zlib",
+)
 
 
 def _run_cmd(args, timeout=12):
@@ -137,6 +140,13 @@ def collect_v1_observations():
     }
     for name in MODULE_NAMES:
         obs["modules"][name] = probe_module(name)
+    zlib_info = obs["modules"].get("zlib") or {}
+    if zlib_info.get("installed") and zlib_info.get("version") is None:
+        try:
+            import zlib
+            zlib_info["version"] = getattr(zlib, "ZLIB_VERSION", None)
+        except Exception:
+            pass
 
     cmds, meta = try_import_maya()
     obs["maya"] = {

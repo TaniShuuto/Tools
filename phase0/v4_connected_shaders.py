@@ -4,6 +4,10 @@
 テスト用の新規シーンだけを使う。利用者の既存シーンは触らない。
 2マテリアルを面ごとに割り当てたキューブ/球と、インスタンス1つを作る。
 割り当てのないフェースの値も記録する。
+
+比較はインスタンスごと・フェースごと。差分は全件記録し、
+unassigned_none_vs_initial と real_mismatch に分類する。
+real_mismatch が 0 なら、未割当の扱いの違いは observations に残して PASS。
 """
 from __future__ import annotations
 
@@ -33,6 +37,108 @@ from common import (  # noqa: E402
     write_results,
 )
 
+KIND_UNASSIGNED = "unassigned_none_vs_initial"
+KIND_REAL = "real_mismatch"
+INITIAL_SG = "initialShadingGroup"
+
+
+def face_range(transform, start, end_inclusive):
+    """Maya のフェース範囲。start==end なら単一面。"""
+    if start == end_inclusive:
+        return "{0}.f[{1}]".format(transform, start)
+    return "{0}.f[{1}:{2}]".format(transform, start, end_inclusive)
+
+
+def is_initial_sg(name):
+    if name is None:
+        return False
+    text = str(name)
+    return text == INITIAL_SG or text.endswith("|" + INITIAL_SG)
+
+
+def compare_instance_faces(api_row, cmds_list):
+    """インスタンス1つ分をフェースごとに比較し、差分を全件分類する。"""
+    api_list = api_row.get("face_sg") or []
+    n = max(len(api_list), len(cmds_list))
+    diffs = []
+    n_unassigned = 0
+    n_real = 0
+    for i in range(n):
+        a = api_list[i] if i < len(api_list) else "<missing>"
+        b = cmds_list[i] if i < len(cmds_list) else "<missing>"
+        if a == b:
+            continue
+        if a is None and is_initial_sg(b):
+            kind = KIND_UNASSIGNED
+            n_unassigned += 1
+        else:
+            kind = KIND_REAL
+            n_real += 1
+        diffs.append({"face": i, "api": a, "cmds": b, "kind": kind})
+    return {
+        "n_faces": n,
+        "n_diff": len(diffs),
+        "n_unassigned_none_vs_initial": n_unassigned,
+        "n_real_mismatch": n_real,
+        "diffs": diffs,
+        "diffs_head": diffs[:12],
+        "match": len(diffs) == 0 and len(api_list) == len(cmds_list),
+        "match_ignoring_unassigned": n_real == 0 and len(api_list) == len(cmds_list),
+    }
+
+
+def evaluate_meshes(meshes):
+    """real_mismatch が 0 なら PASS。API を呼べなければ INCONCLUSIVE。"""
+    compared = [m for m in meshes or [] if m.get("api_error") is None]
+    if not compared:
+        return STATUS_INCONCLUSIVE, "getConnectedShaders を呼べなかった", {
+            "unassigned_handling": None,
+        }
+    real = [m for m in compared if (m.get("compare") or {}).get("n_real_mismatch")]
+    unassigned_rows = []
+    for mesh in compared:
+        cmp_row = mesh.get("compare") or {}
+        n_u = cmp_row.get("n_unassigned_none_vs_initial") or 0
+        if n_u:
+            unassigned_rows.append({
+                "label": mesh.get("label"),
+                "instance": mesh.get("instance"),
+                "n_unassigned_none_vs_initial": n_u,
+                "faces": [
+                    d.get("face") for d in (cmp_row.get("diffs") or [])
+                    if d.get("kind") == KIND_UNASSIGNED
+                ],
+            })
+    extra = {
+        "unassigned_handling": {
+            "kind": KIND_UNASSIGNED,
+            "treated_as": "not_fail",
+            "note": (
+                "未割当フェースを API は None、cmds は initialShadingGroup と"
+                "返す場合がある。インスタンスのシェーディング接続は"
+                "instObjGroups[n] で別になる。"
+            ),
+            "meshes": unassigned_rows,
+        },
+    }
+    if real:
+        return (
+            STATUS_FAIL,
+            "cmds の割り当てと getConnectedShaders に real_mismatch がある",
+            extra,
+        )
+    if unassigned_rows:
+        return (
+            STATUS_PASS,
+            "real_mismatch は 0。未割当フェースの扱いの違いは observations に記録",
+            extra,
+        )
+    return (
+        STATUS_PASS,
+        "キューブ/球/インスタンスで getConnectedShaders が cmds と一致",
+        extra,
+    )
+
 
 def _make_shader(cmds, name):
     shader = cmds.shadingNode("lambert", asShader=True, name=name)
@@ -48,42 +154,144 @@ def _shape_of(cmds, transform):
     return shapes[0]
 
 
-def cmds_face_to_sg(cmds, shape):
+def _node_name_set(cmds, *nodes):
+    names = set()
+    for node in nodes:
+        if not node:
+            continue
+        names.add(node)
+        try:
+            for found in (cmds.ls(node, long=True) or []):
+                names.add(found)
+                names.add(found.split("|")[-1])
+            for found in (cmds.ls(node) or []):
+                names.add(found)
+                names.add(found.split("|")[-1])
+        except Exception:
+            names.add(str(node).split("|")[-1])
+    return names
+
+
+def _in_names(node, names):
+    if not names:
+        return False
+    if node in names:
+        return True
+    text = str(node)
+    short = text.split("|")[-1]
+    return short in names or text in names
+
+
+def cmds_inst_obj_groups(cmds, shape, instance_number):
+    """instObjGroups[n] の接続を記録する(期待値の根拠)。"""
+    plug = "{0}.instObjGroups[{1}]".format(shape, instance_number)
+    info = {"plug": plug, "object_sgs": [], "object_groups": [], "error": None}
+    try:
+        info["object_sgs"] = cmds.listConnections(plug, type="shadingEngine") or []
+    except Exception as exc:
+        info["error"] = exception_observation(exc)
+        return info
+    try:
+        indices = cmds.getAttr(plug + ".objectGroups", multiIndices=True) or []
+    except Exception:
+        indices = []
+    for index in indices:
+        og = "{0}.objectGroups[{1}]".format(plug, index)
+        row = {"index": int(index), "sgs": [], "comp_list": None}
+        try:
+            row["sgs"] = cmds.listConnections(og, type="shadingEngine") or []
+        except Exception:
+            pass
+        try:
+            row["comp_list"] = cmds.getAttr(og + ".objectGrpCompList")
+        except Exception:
+            pass
+        info["object_groups"].append(row)
+    return info
+
+
+def cmds_face_to_sg(cmds, shape, instance_transform=None, instance_number=0):
+    """cmds でフェース→SG。インスタンスは instObjGroups とセットメンバーで区別する。
+
+    割り当て済み SG は元トランスフォームのメンバーも見る(インスタンスが共有するため)。
+    initialShadingGroup は、インスタンス番号が 0 以外なら、そのインスタンスの
+    コンポーネントに付いている場合だけ採用する。元側の未割当を流用しない。
+    """
     face_count = int(cmds.polyEvaluate(shape, face=True))
     result = [None] * face_count
-    sgs = cmds.listConnections(shape, type="shadingEngine") or []
-    # セットメンバーからも拾う(listConnections 漏れ対策)
-    extra = cmds.listSets(object=shape) or []
-    for name in extra:
-        if name not in sgs:
+    parent = (cmds.listRelatives(shape, parent=True, fullPath=True) or [None])[0]
+    inst_names = _node_name_set(cmds, instance_transform) if instance_transform else set()
+    orig_names = _node_name_set(cmds, parent, shape)
+    if instance_transform:
+        try:
+            inst_shapes = cmds.listRelatives(
+                instance_transform, shapes=True, fullPath=True
+            ) or []
+            inst_names |= _node_name_set(cmds, *inst_shapes)
+        except Exception:
+            pass
+    assigned_names = orig_names | inst_names
+    if instance_number == 0:
+        initial_names = assigned_names
+    else:
+        initial_names = inst_names
+
+    sgs = []
+    inst_plug = "{0}.instObjGroups[{1}]".format(shape, instance_number)
+    try:
+        sgs.extend(cmds.listConnections(inst_plug, type="shadingEngine") or [])
+    except Exception:
+        pass
+    try:
+        og_idx = cmds.getAttr(inst_plug + ".objectGroups", multiIndices=True) or []
+        for index in og_idx:
+            og = "{0}.objectGroups[{1}]".format(inst_plug, index)
+            sgs.extend(cmds.listConnections(og, type="shadingEngine") or [])
+    except Exception:
+        pass
+    try:
+        sgs.extend(cmds.listConnections(shape, type="shadingEngine") or [])
+    except Exception:
+        pass
+    extra_objects = [shape]
+    if instance_transform:
+        extra_objects.append(instance_transform)
+    for obj in extra_objects:
+        try:
+            extra = cmds.listSets(object=obj) or []
+        except Exception:
+            extra = []
+        for name in extra:
             try:
-                if cmds.nodeType(name) == "shadingEngine":
+                if cmds.nodeType(name) == "shadingEngine" and name not in sgs:
                     sgs.append(name)
             except Exception:
                 pass
+
     seen = []
     for sg in sgs:
         if sg in seen:
             continue
         seen.append(sg)
+        accept = initial_names if is_initial_sg(sg) else assigned_names
         members = cmds.sets(sg, query=True) or []
         for item in members:
             flat = cmds.ls(item, flatten=True) or []
             whole = False
-            parent = (cmds.listRelatives(shape, parent=True, fullPath=True) or [None])[0]
             for comp in flat:
-                if ".f[" in comp:
+                node = str(comp).split(".")[0]
+                node_ok = _in_names(node, accept)
+                if ".f[" in str(comp):
+                    if not node_ok:
+                        continue
                     try:
-                        idx = int(comp.split(".f[")[-1].rstrip("]"))
+                        idx = int(str(comp).split(".f[")[-1].rstrip("]"))
                     except ValueError:
                         continue
                     if 0 <= idx < face_count:
                         result[idx] = sg
-                else:
-                    node = comp.split(".")[0]
-                    short = os.path.basename(shape)
-                    if node in (shape, parent, short) or comp == shape or comp.endswith("|" + short):
-                        whole = True
+                elif node_ok or comp == shape:
+                    whole = True
             if whole:
                 for i in range(face_count):
                     if result[i] is None:
@@ -136,26 +344,30 @@ def _assign_two_materials(cmds, transform, unassign_last=True):
     shader_a, sg_a = _make_shader(cmds, transform + "_matA")
     shader_b, sg_b = _make_shader(cmds, transform + "_matB")
     mid = max(1, face_count // 2)
-    faces_a = ["{0}.f[{1}]".format(transform, i) for i in range(0, mid)]
-    faces_b = ["{0}.f[{1}]".format(transform, i) for i in range(mid, face_count)]
-    if unassign_last and faces_b:
-        last = faces_b[-1]
-        faces_b = faces_b[:-1]
-    else:
-        last = None
+    # 範囲指定。球で個別リストだと一部が initialShadingGroup に残ることがある。
+    faces_a = face_range(transform, 0, mid - 1) if face_count else None
+    last = None
+    faces_b = None
+    if unassign_last and face_count:
+        last = face_range(transform, face_count - 1, face_count - 1)
+        if mid <= face_count - 2:
+            faces_b = face_range(transform, mid, face_count - 2)
+    elif face_count and mid <= face_count - 1:
+        faces_b = face_range(transform, mid, face_count - 1)
     if faces_a:
         cmds.sets(faces_a, edit=True, forceElement=sg_a)
     if faces_b:
         cmds.sets(faces_b, edit=True, forceElement=sg_b)
-    unassigned = None
     if last:
-        # どの SG からも外す
-        for sg in (sg_a, sg_b, "initialShadingGroup"):
+        for sg in (sg_a, sg_b, INITIAL_SG):
             try:
                 cmds.sets(last, edit=True, remove=sg)
             except Exception:
                 pass
-        unassigned = last
+    # セットアップ後に cmds で読み戻し、それを期待値として保存する。
+    readback, _n = cmds_face_to_sg(
+        cmds, shape, instance_transform=transform, instance_number=0,
+    )
     return {
         "transform": transform,
         "shape": shape,
@@ -164,24 +376,10 @@ def _assign_two_materials(cmds, transform, unassign_last=True):
         "sg_b": sg_b,
         "shader_a": shader_a,
         "shader_b": shader_b,
-        "unassigned_comp": unassigned,
-    }
-
-
-def _compare(api_row, cmds_list):
-    api_list = api_row.get("face_sg") or []
-    n = max(len(api_list), len(cmds_list))
-    diffs = []
-    for i in range(n):
-        a = api_list[i] if i < len(api_list) else "<missing>"
-        b = cmds_list[i] if i < len(cmds_list) else "<missing>"
-        if a != b:
-            diffs.append({"face": i, "api": a, "cmds": b})
-    return {
-        "n_faces": n,
-        "n_diff": len(diffs),
-        "diffs_head": diffs[:12],
-        "match": len(diffs) == 0 and len(api_list) == len(cmds_list),
+        "faces_a": faces_a,
+        "faces_b": faces_b,
+        "unassigned_comp": last,
+        "cmds_face_sg_after_setup": readback,
     }
 
 
@@ -194,19 +392,30 @@ def run_maya_cases(cmds):
     inst = cmds.instance(cube, name="phase0_v4_cube_inst")[0]
 
     results = []
-    for label, info, inst_no, dag_for_cmds in (
-        ("cube_instance0", cube_info, 0, cube_info["shape"]),
-        ("cube_instance1", cube_info, 1, cube_info["shape"]),
-        ("sphere_instance0", sphere_info, 0, sphere_info["shape"]),
+    for label, info, inst_no, inst_xform in (
+        ("cube_instance0", cube_info, 0, cube_info["transform"]),
+        ("cube_instance1", cube_info, 1, inst),
+        ("sphere_instance0", sphere_info, 0, sphere_info["transform"]),
     ):
-        cmds_map, _n = cmds_face_to_sg(cmds, dag_for_cmds)
+        cmds_map, _n = cmds_face_to_sg(
+            cmds,
+            info["shape"],
+            instance_transform=inst_xform,
+            instance_number=inst_no,
+        )
         try:
             api_row = api_face_to_sg(info["shape"], inst_no)
             api_error = None
         except Exception as exc:
             api_row = {}
             api_error = exception_observation(exc)
-        cmp_row = _compare(api_row, cmds_map) if api_row else {"match": False, "n_diff": None}
+        cmp_row = compare_instance_faces(api_row, cmds_map) if api_row else {
+            "match": False,
+            "n_diff": None,
+            "n_real_mismatch": None,
+            "n_unassigned_none_vs_initial": None,
+            "diffs": [],
+        }
         unassigned_idx = None
         if info.get("unassigned_comp") and ".f[" in info["unassigned_comp"]:
             try:
@@ -217,16 +426,24 @@ def run_maya_cases(cmds):
             "label": label,
             "instance": inst_no,
             "setup": info,
-            "instance_transform": inst if inst_no == 1 else info["transform"],
+            "instance_transform": inst_xform,
+            "inst_obj_groups": cmds_inst_obj_groups(cmds, info["shape"], inst_no),
             "cmds_face_sg": cmds_map,
             "api": api_row,
             "api_error": api_error,
             "compare": cmp_row,
             "unassigned_face_index": unassigned_idx,
-            "unassigned_cmds": cmds_map[unassigned_idx] if unassigned_idx is not None and unassigned_idx < len(cmds_map) else None,
-            "unassigned_api": (api_row.get("face_sg") or [None])[unassigned_idx]
-            if api_row and unassigned_idx is not None and unassigned_idx < len(api_row.get("face_sg") or [])
-            else None,
+            "unassigned_cmds": (
+                cmds_map[unassigned_idx]
+                if unassigned_idx is not None and unassigned_idx < len(cmds_map)
+                else None
+            ),
+            "unassigned_api": (
+                (api_row.get("face_sg") or [None])[unassigned_idx]
+                if api_row and unassigned_idx is not None
+                and unassigned_idx < len(api_row.get("face_sg") or [])
+                else None
+            ),
         })
     return {"meshes": results}
 
@@ -254,23 +471,11 @@ def run_check():
             "Maya 操作中に例外",
             {"maya": meta, "error": exception_observation(exc)},
         )
+    status, summary, extra = evaluate_meshes(obs.get("meshes") or [])
     obs["maya"] = meta
     obs["scratch"] = scratch
-    compared = [m for m in obs.get("meshes") or [] if m.get("api_error") is None]
-    if not compared:
-        return make_check(STATUS_INCONCLUSIVE, "getConnectedShaders を呼べなかった", obs)
-    mismatches = [m for m in compared if not (m.get("compare") or {}).get("match")]
-    if mismatches:
-        return make_check(
-            STATUS_FAIL,
-            "cmds の割り当てと getConnectedShaders が一致しないメッシュがある",
-            obs,
-        )
-    return make_check(
-        STATUS_PASS,
-        "キューブ/球/インスタンスで getConnectedShaders が cmds と一致",
-        obs,
-    )
+    obs.update(extra)
+    return make_check(status, summary, obs)
 
 
 def _output_path():
