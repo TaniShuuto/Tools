@@ -122,6 +122,14 @@ TOOL_FILES = [
     {"name": "maya_live_sync.py", "required": True},
     {"name": "sp_to_aiStandardSurface.py", "required": False},
     {"name": "udim_setup.py", "required": False},
+    {"name": "uvremap_core.py", "required": False},
+    {"name": "uvremap_io.py", "required": False},
+    {"name": "uvremap_worker.py", "required": False},
+    {"name": "uvremap_bridge.py", "required": False},
+    {"name": "uvremap_maya.py", "required": False},
+    {"name": "uvremap_runtime.py", "required": False},
+    {"name": "uvremap_panel.py", "required": False},
+    {"name": "uvremap_integration.py", "required": False},
 ]
 
 # --- シェルフアイコン画像(任意) --------------------------------------------
