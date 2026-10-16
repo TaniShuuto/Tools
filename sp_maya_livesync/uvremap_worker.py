@@ -133,9 +133,24 @@ def _now_iso() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+_HOME_RE = re.compile(r"(?i)(?:[a-z]:)?[\\/](?:home|users)[\\/][^\\/\s'\"<>|:]+")
+
+
+def _scrub(text) -> str:
+    """ログ/結果に載せる文字列から、ホームディレクトリ(ユーザー名を含む)の絶対パスを除く。"""
+    text = str(text)
+    try:
+        home = os.path.expanduser("~")
+    except Exception:
+        home = ""
+    if home and len(home) > 1 and home not in ("/", "\\"):
+        text = text.replace(home, "~")
+    return _HOME_RE.sub("~", text)
+
+
 def _log(text: str) -> None:
     try:
-        print("[uvremap_worker] {0}".format(text), flush=True)
+        print("[uvremap_worker] {0}".format(_scrub(text)), flush=True)
     except Exception:
         pass
 
@@ -221,7 +236,7 @@ def read_json(path, default=None):
 def _format_exc(exc: BaseException) -> tuple[str, str]:
     """(1行の要約, 簡易トレース)。トレースはファイル名のみ(絶対パスを含めない)。"""
     import traceback as _tb
-    summary = "{0}: {1}".format(type(exc).__name__, exc)
+    summary = _scrub("{0}: {1}".format(type(exc).__name__, exc))
     frames = _tb.extract_tb(exc.__traceback__)[-8:]
     lines = ["{0}:{1} in {2}".format(os.path.basename(fr.filename), fr.lineno, fr.name) for fr in frames]
     return summary, " <- ".join(reversed(lines))
@@ -400,6 +415,8 @@ def parse_job(raw) -> dict:
     job["out_res"] = out_res
     if raw.get("source_flag") is not None and not isinstance(raw.get("source_flag"), str):
         raise JobFailed("job.json の source_flag が不正です")
+    if raw.get("latest_generation_path") is not None and not isinstance(raw.get("latest_generation_path"), str):
+        raise JobFailed("job.json の latest_generation_path が不正です")
     return job
 
 
@@ -462,6 +479,7 @@ class _Run:
 
     # ------------------------------------------------------------ messages
     def msg(self, level: str, text: str) -> None:
+        text = _scrub(text)
         self.messages.append({"level": level, "text": text})
         _log("{0}: {1}".format(level, text))
 
@@ -502,7 +520,7 @@ class _Run:
                     self._status_prev_captured = True
                 table[self.ts_name] = {
                     "state": state, "generation": self.generation, "updated": _now_iso(),
-                    "message": message, "job_id": self.job_id, "pid": os.getpid(),
+                    "message": _scrub(message), "job_id": self.job_id, "pid": os.getpid(),
                 }
                 write_json_atomic(self._status_path(), data)
         except Exception as exc:  # status を書けなくても、理由は result.json に残す
@@ -651,6 +669,38 @@ class _Run:
         if isinstance(led_gen, int) and not isinstance(led_gen, bool) and led_gen > self.generation:
             raise Superseded("世代 {0} は台帳の世代 {1} より古いため破棄します".format(
                 self.generation, led_gen))
+        req = self._requested_generation()
+        if req is not None and req > self.generation:
+            raise Superseded("世代 {0} は要求済みの世代 {1} より古いため破棄します".format(
+                self.generation, req))
+
+    def _requested_generation(self) -> int | None:
+        """任意: job の ``latest_generation_path``(Maya が最新要求の世代を書く)を読む。"""
+        path = self.job.get("latest_generation_path")
+        if not path:
+            return None
+        try:
+            raw = Path(path).read_text(encoding="utf-8-sig").strip()
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            self._warn_once("latest_generation_path を読めません: {0}".format(exc))
+            return None
+        try:
+            if raw.startswith("{"):
+                value = json.loads(raw).get("generation")
+            else:
+                value = int(raw)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("整数ではありません")
+            return value
+        except Exception as exc:
+            self._warn_once("latest_generation_path の内容が不正です: {0}".format(exc))
+            return None
+
+    def _warn_once(self, text: str) -> None:
+        if not any(m["text"] == _scrub(text) for m in self.messages):
+            self.msg("warn", text)
 
     # ------------------------------------------------------------ pipeline
     def execute(self) -> None:
