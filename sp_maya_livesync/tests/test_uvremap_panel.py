@@ -1,0 +1,346 @@
+# -*- coding: utf-8 -*-
+"""uvremap_panel.py の単体テスト(Maya 非依存)。
+
+StatusModel は Qt 無しで検証する。ウィジェットは PySide6 があるときだけ
+`QT_QPA_PLATFORM=offscreen` で実行し、無ければ skip する。
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+_MODULE_DIR = Path(__file__).resolve().parents[1]
+if str(_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(_MODULE_DIR))
+
+from uvremap_panel import (  # noqa: E402
+    COLOR_ATTENTION,
+    COLOR_MUTED,
+    COLOR_OK,
+    COLOR_WARN,
+    LABEL_DISABLED,
+    LABEL_NO_INFO,
+    STALLED_MESSAGE,
+    StatusModel,
+    color_for_state,
+)
+
+
+def _write_status(path: Path, ts: dict) -> Path:
+    path.write_text(
+        json.dumps({"schema": 1, "ts": ts}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _entry(state: str, generation=7, updated="2026-10-16T10:15:00", message=""):
+    return {
+        "state": state,
+        "generation": generation,
+        "updated": updated,
+        "message": message,
+    }
+
+
+class TestStatusModel:
+    def test_normal(self, tmp_path):
+        status = _write_status(
+            tmp_path / "status.json",
+            {
+                "Body": _entry("CONVERTED_OK", 7, "2026-10-16T10:15:00", ""),
+                "Face": _entry("STALE", 3, "2026-10-16T09:00:00", "old uv"),
+            },
+        )
+        view = StatusModel(status).load()
+        assert view.available is True
+        assert view.worst_state == "STALE"
+        by_name = {row.ts_name: row for row in view.rows}
+        assert set(by_name) == {"Body", "Face"}
+        assert by_name["Body"].state == "CONVERTED_OK"
+        assert by_name["Body"].generation == 7
+        assert by_name["Body"].updated == "2026-10-16T10:15:00"
+        assert by_name["Body"].message == ""
+        assert by_name["Face"].state == "STALE"
+        assert by_name["Face"].message == "old uv"
+        assert by_name["Body"].stalled is False
+
+    def test_missing_file(self, tmp_path):
+        view = StatusModel(tmp_path / "missing.json").load()
+        assert view.available is False
+        assert view.rows == ()
+        assert view.worst_state == ""
+
+    def test_broken_json(self, tmp_path):
+        path = tmp_path / "status.json"
+        path.write_text('{"schema": 1, "ts": {"Body":', encoding="utf-8")
+        view = StatusModel(path).load()
+        assert view.available is False
+        assert view.rows == ()
+
+    def test_empty_file(self, tmp_path):
+        path = tmp_path / "status.json"
+        path.write_text("", encoding="utf-8")
+        view = StatusModel(path).load()
+        assert view.available is False
+        assert view.rows == ()
+
+    def test_unknown_state_name(self, tmp_path):
+        status = _write_status(
+            tmp_path / "status.json",
+            {"Body": _entry("WEIRD_STATE", 1, "2026-10-16T10:15:00", "??")},
+        )
+        view = StatusModel(status).load()
+        assert view.available is True
+        assert view.rows[0].state == "WEIRD_STATE"
+        assert view.worst_state == "WEIRD_STATE"
+        assert color_for_state("WEIRD_STATE") == COLOR_ATTENTION
+
+    def test_converting_stalled_after_default_timeout(self, tmp_path):
+        now = datetime(2026, 10, 16, 12, 0, 0)
+        status = _write_status(
+            tmp_path / "status.json",
+            {"Body": _entry("CONVERTING", 8, "2026-10-16T11:49:00", "")},
+        )
+        view = StatusModel(status).load(now=now)
+        row = view.rows[0]
+        assert row.state == "CONVERTING"
+        assert row.stalled is True
+        assert STALLED_MESSAGE in row.message
+        assert row.color == COLOR_WARN
+        assert view.worst_color == COLOR_WARN
+
+    def test_converting_recent_is_not_stalled(self, tmp_path):
+        now = datetime(2026, 10, 16, 12, 0, 0)
+        status = _write_status(
+            tmp_path / "status.json",
+            {"Body": _entry("CONVERTING", 8, "2026-10-16T11:51:00", "working")},
+        )
+        view = StatusModel(status).load(now=now)
+        row = view.rows[0]
+        assert row.stalled is False
+        assert row.message == "working"
+        assert row.color == COLOR_ATTENTION
+
+    def test_converting_unparseable_updated_is_stalled(self, tmp_path):
+        now = datetime(2026, 10, 16, 12, 0, 0)
+        status = _write_status(
+            tmp_path / "status.json",
+            {"Body": _entry("CONVERTING", 8, "not-a-date", "")},
+        )
+        view = StatusModel(status).load(now=now)
+        assert view.rows[0].stalled is True
+
+    def test_worst_state_order(self, tmp_path):
+        cases = [
+            ({"A": "FAILED", "B": "ORIGINAL"}, "FAILED"),
+            ({"A": "BLOCKED", "B": "STALE"}, "BLOCKED"),
+            ({"A": "STALE", "B": "CONVERTED_OK"}, "STALE"),
+            ({"A": "CONVERTING", "B": "CONVERTED_OK"}, "CONVERTING"),
+            ({"A": "CONVERTED_OK", "B": "ORIGINAL"}, "CONVERTED_OK"),
+            ({"A": "ORIGINAL"}, "ORIGINAL"),
+            ({"A": "FAILED", "B": "BLOCKED"}, "FAILED"),
+            ({"A": "STALE", "B": "CONVERTING"}, "STALE"),
+            ({"A": "FAILED", "B": "CONVERTING", "C": "ORIGINAL"}, "FAILED"),
+        ]
+        for states, expected in cases:
+            status = _write_status(
+                tmp_path / "status.json",
+                {name: _entry(state) for name, state in states.items()},
+            )
+            view = StatusModel(status).load()
+            assert view.worst_state == expected, states
+
+    def test_none_path_is_no_info(self):
+        view = StatusModel(None).load()
+        assert view.available is False
+        assert view.worst_state == ""
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+def _make_panel(qapp, **kwargs):
+    from uvremap_panel import UVRemapPanel
+
+    defaults = {
+        "on_toggle_enabled": lambda _enabled: None,
+        "on_convert_now": lambda: None,
+        "on_revert": lambda: None,
+        "get_enabled": lambda: False,
+        "get_status_path": lambda: None,
+    }
+    defaults.update(kwargs)
+    panel = UVRemapPanel(**defaults)
+    panel.show()
+    qapp.processEvents()
+    return panel
+
+
+class TestUVRemapPanel:
+    def test_kill_switch_calls_callback(self, qapp):
+        calls = []
+        enabled = {"value": False}
+
+        def on_toggle(value):
+            calls.append(value)
+            enabled["value"] = value
+
+        panel = _make_panel(
+            qapp,
+            on_toggle_enabled=on_toggle,
+            get_enabled=lambda: enabled["value"],
+        )
+        try:
+            box = panel.findChild(type(panel._kill_switch), "kill_switch")
+            assert box is not None
+            assert box.isChecked() is False
+            box.click()
+            qapp.processEvents()
+            assert calls == [True]
+            assert box.isChecked() is True
+            box.click()
+            qapp.processEvents()
+            assert calls == [True, False]
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_buttons_disabled_when_kill_switch_off(self, qapp):
+        enabled = {"value": False}
+        panel = _make_panel(qapp, get_enabled=lambda: enabled["value"])
+        try:
+            assert panel.findChild(type(panel._btn_convert), "btn_convert").isEnabled() is False
+            assert panel.findChild(type(panel._btn_revert), "btn_revert").isEnabled() is False
+            assert panel.findChild(type(panel._btn_refresh), "btn_refresh").isEnabled() is False
+            assert LABEL_DISABLED in panel.findChild(type(panel._overall), "overall_status").text()
+
+            enabled["value"] = True
+            panel.refresh()
+            qapp.processEvents()
+            assert panel.findChild(type(panel._btn_convert), "btn_convert").isEnabled() is True
+            assert panel.findChild(type(panel._btn_revert), "btn_revert").isEnabled() is True
+            assert panel.findChild(type(panel._btn_refresh), "btn_refresh").isEnabled() is True
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_state_color_and_text(self, qapp, tmp_path):
+        status = _write_status(
+            tmp_path / "status.json",
+            {
+                "Body": _entry("CONVERTED_OK", 7, "2026-10-16T10:15:00", "ok"),
+                "Face": _entry("FAILED", 3, "2026-10-16T10:00:00", "probe"),
+                "Trim": _entry("ORIGINAL", 0, "2026-10-16T08:00:00", ""),
+            },
+        )
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: True,
+            get_status_path=lambda: status,
+        )
+        try:
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert "FAILED" in overall.text()
+            assert COLOR_WARN in overall.styleSheet()
+            assert overall.property("state_color") == COLOR_WARN
+
+            body_state = panel.findChild(type(panel._overall), "ts_state_Body")
+            face_state = panel.findChild(type(panel._overall), "ts_state_Face")
+            trim_state = panel.findChild(type(panel._overall), "ts_state_Trim")
+            assert body_state is not None and body_state.text() == "CONVERTED_OK"
+            assert COLOR_OK in body_state.styleSheet()
+            assert face_state is not None and face_state.text() == "FAILED"
+            assert COLOR_WARN in face_state.styleSheet()
+            assert trim_state is not None and trim_state.text() == "ORIGINAL"
+            assert COLOR_MUTED in trim_state.styleSheet()
+
+            assert panel.findChild(type(panel._overall), "ts_name_Body").text() == "Body"
+            assert panel.findChild(type(panel._overall), "ts_generation_Body").text() == "7"
+            assert "probe" in panel.findChild(type(panel._overall), "ts_message_Face").text()
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_attention_states_use_attention_color(self, qapp, tmp_path):
+        status = _write_status(
+            tmp_path / "status.json",
+            {
+                "A": _entry("CONVERTING", 1, "2026-10-16T11:55:00", ""),
+                "B": _entry("STALE", 2, "2026-10-16T11:00:00", ""),
+            },
+        )
+        now_fixed = datetime(2026, 10, 16, 12, 0, 0)
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: True,
+            get_status_path=lambda: status,
+        )
+        panel._converting_stale_s = 600
+        # 再描画時に固定時刻を使うため、StatusModel 側の now を直接当てる
+        view = StatusModel(status, converting_stale_s=600).load(now=now_fixed)
+        panel._render(view, True)
+        qapp.processEvents()
+        try:
+            converting = panel.findChild(type(panel._overall), "ts_state_A")
+            stale = panel.findChild(type(panel._overall), "ts_state_B")
+            assert converting.text() == "CONVERTING"
+            assert COLOR_ATTENTION in converting.styleSheet()
+            assert stale.text() == "STALE"
+            assert COLOR_ATTENTION in stale.styleSheet()
+            assert "CONVERTING" in panel.findChild(type(panel._overall), "overall_status").text()
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_timer_stops_when_hidden(self, qapp):
+        panel = _make_panel(qapp, get_enabled=lambda: True)
+        try:
+            assert panel._timer.isActive() is True
+            assert panel._timer.interval() == 2000
+            panel.hide()
+            qapp.processEvents()
+            assert panel._timer.isActive() is False
+        finally:
+            panel.close()
+
+    def test_convert_and_revert_callbacks(self, qapp):
+        events = []
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: True,
+            on_convert_now=lambda: events.append("convert"),
+            on_revert=lambda: events.append("revert"),
+        )
+        try:
+            panel.findChild(type(panel._btn_convert), "btn_convert").click()
+            panel.findChild(type(panel._btn_revert), "btn_revert").click()
+            qapp.processEvents()
+            assert events == ["convert", "revert"]
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_no_info_label_when_status_missing(self, qapp):
+        panel = _make_panel(qapp, get_enabled=lambda: True, get_status_path=lambda: None)
+        try:
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert LABEL_NO_INFO in overall.text()
+            assert COLOR_MUTED in overall.styleSheet()
+        finally:
+            panel.hide()
+            panel.close()
