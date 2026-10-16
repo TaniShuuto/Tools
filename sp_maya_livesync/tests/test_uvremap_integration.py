@@ -166,6 +166,7 @@ class FakeRuntime:
         self.fail_convert = False
         self.fail_record = False
         self.empty_job = False
+        self.already_running = set()
 
     def record_baseline(self, project_key, ts_names, shape_paths, **kwargs):
         if self.fail_record:
@@ -187,7 +188,12 @@ class FakeRuntime:
         })
         if self.empty_job:
             return ""
+        if ts_name in self.already_running:
+            return ""
         return "job-{0}".format(ts_name)
+
+    def has_running_job_for_ts(self, ts_name):
+        return ts_name in self.already_running
 
     def recover_orphaned(self, project_key):
         self.recover_calls.append(project_key)
@@ -416,6 +422,34 @@ def test_methods_do_not_raise(tmp_path):
     assert ctrl.has_baseline() is False
 
 
+def test_convert_now_already_running_returns_japanese_message(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    ctrl._runtime.already_running = {"Body"}
+    result = ctrl.convert_now()
+    assert result["ok"] is True
+    assert integ.MSG_ALREADY_RUNNING in result["message"]
+    names = [call["ts_name"] for call in ctrl._runtime.convert_calls]
+    assert names == ["Body", "Trim"]
+    assert result["job_ids"] == ["job-Trim"]
+    assert result["already_running"] == ["Body"]
+
+
+def test_convert_now_all_already_running_is_not_started_message(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    ctrl._runtime.already_running = {"Body", "Trim"}
+    result = ctrl.convert_now()
+    assert result["ok"] is False
+    assert result["message"] == integ.MSG_ALREADY_RUNNING
+    assert result["message"] != integ.MSG_NOT_STARTED
+    assert result["job_ids"] == []
+
+
 def test_convert_now_empty_jobs_returns_not_started(tmp_path):
     ctrl = _make_controller(tmp_path)
     dest = ctrl._work / "baseline" / "bl-old"
@@ -595,6 +629,29 @@ def test_maya_live_sync_has_new_config_keys_and_version():
     assert "uvremap_enabled" in keys
     assert "uvremap_root_dir" in keys
     assert "uvremap_mayapy_path" in keys
+
+
+def test_install_destroy_stale_window_calls_uvremap_shutdown():
+    src = (_PKG / "install.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_destroy_stale_livesync_window":
+            fn = node
+            break
+    assert fn is not None
+    dump = ast.dump(fn)
+    assert "_uvremap" in dump
+    assert "shutdown" in dump
+
+
+def test_qt_load_tries_pyside2_before_pyside6():
+    for path in (_PKG / "uvremap_integration.py", _PKG / "uvremap_panel.py"):
+        text = path.read_text(encoding="utf-8")
+        i2 = text.find("from PySide2 import")
+        i6 = text.find("from PySide6 import")
+        assert i2 != -1 and i6 != -1
+        assert i2 < i6
 
 
 def test_install_and_uninstall_list_optional_uvremap_files():

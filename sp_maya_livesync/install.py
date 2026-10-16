@@ -486,6 +486,12 @@ def _destroy_stale_livesync_window():
             except Exception as e:
                 _diag["scene_callbacks_unregister_error"] = str(e)
                 print("[Live Sync Installer] Could not unregister scene callbacks: {0}".format(e))
+            try:
+                uvremap = getattr(window, "_uvremap", None)
+                if uvremap is not None:
+                    uvremap.shutdown()
+            except Exception:
+                pass
             # 安全策: watcher(project_poll_timer/fs_watcher等)はQtの親子
             # 関係(LiveSyncWatcher(self))により、親ウィジェット破棄時に
             # 連動して破棄されるのが期待される標準動作だが、

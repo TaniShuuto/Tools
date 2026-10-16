@@ -41,8 +41,19 @@ class FakeCmds:
     def __init__(self, nodes=None):
         self.nodes = {}
         self.setattr_log = []
+        self.undo_log = []
+        self._undo_enabled = True
+        self.fail_set_attr = False
         for name, data in (nodes or {}).items():
             self.add_node(name, **data)
+
+    def undoInfo(self, query=False, stateWithoutFlush=None, **_kwargs):
+        self.undo_log.append({"query": query, "stateWithoutFlush": stateWithoutFlush})
+        if query:
+            return self._undo_enabled
+        if stateWithoutFlush is not None:
+            self._undo_enabled = stateWithoutFlush
+        return None
 
     def add_node(self, name, fileTextureName="", uvTilingMode=0, extra=None):
         self.nodes[name] = {
@@ -82,6 +93,8 @@ class FakeCmds:
         return rec["extra"][attr]
 
     def setAttr(self, plug, value, type=None):
+        if self.fail_set_attr:
+            raise RuntimeError("setAttr boom")
         self.setattr_log.append((str(plug), value))
         node, attr = self._split(plug)
         rec = self.nodes[node]
@@ -425,6 +438,8 @@ def test_popen_args_env_and_worker_log(tmp_path, monkeypatch):
     job = json.loads(job_path.read_text(encoding="utf-8"))
     assert job["job_id"] == job_id
     assert job["ts_name"] == TS
+    assert job["lock_timeout_s"] == 120
+    assert job["timeout_s"] == 120
     env = kwargs["env"]
     assert "PYTHONHOME" not in env
     assert "PYTHONPATH" not in env
@@ -675,12 +690,36 @@ def _popen_ok_with_files(files):
             "messages": [],
         }
         (job_path.parent / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        root = Path(job["uvremap_root"]) if job.get("uvremap_root") else job_path.parents[1]
+        status_path = root / "status.json"
+        data = {"schema": 1, "ts": {}}
+        if status_path.is_file():
+            try:
+                loaded = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                pass
+        data.setdefault("schema", 1)
+        table = data.setdefault("ts", {})
+        if not isinstance(table, dict):
+            table = data["ts"] = {}
+        ts_name = job.get("ts_name", TS)
+        table[ts_name] = {
+            "state": rt.STATE_CONVERTED_OK,
+            "generation": job.get("generation", 1),
+            "updated": FIXED_NOW,
+            "message": "",
+            "job_id": job_path.parent.name,
+        }
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps(data), encoding="utf-8")
         return FakeProc(0)
 
     return popen_ok
 
 
-def test_second_job_generation_advances_and_writes_latest(tmp_path):
+def test_same_ts_running_job_is_not_restarted(tmp_path):
     popen = CapturedPopen(code=None)
     runtime = _make_runtime(tmp_path, popen=popen)
     runtime.record_baseline("proj", [TS], ["mesh"])
@@ -691,26 +730,76 @@ def test_second_job_generation_advances_and_writes_latest(tmp_path):
     job1 = runtime.convert_now(
         "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
     )
+    status_before = json.loads((runtime._root_path / "status.json").read_text(encoding="utf-8"))
     job2 = runtime.convert_now(
         "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
     )
-    assert job1 and job2 and job1 != job2
-    rec1 = runtime._jobs[job1]
-    rec2 = runtime._jobs[job2]
-    assert rec2["generation"] > rec1["generation"]
+    assert job1 and job2 == ""
+    assert list(runtime._jobs) == [job1]
+    status_after = json.loads((runtime._root_path / "status.json").read_text(encoding="utf-8"))
+    assert status_after == status_before
     latest = rt.latest_generation_file(runtime._root_path, TS)
     assert latest.is_file()
-    assert latest.parent.name == rt.LATEST_GENERATION_DIR
-    assert latest.name == rt.latest_generation_filename(TS)
     data = json.loads(latest.read_text(encoding="utf-8"))
-    assert data["generation"] == rec2["generation"]
-    assert data["ts_name"] == TS
+    assert data["generation"] == runtime._jobs[job1]["generation"]
     j1 = json.loads((runtime._root_path / "jobs" / job1 / "job.json").read_text(encoding="utf-8"))
+    assert j1["generation"] == 1
+    assert j1["lock_timeout_s"] == 30
+
+
+def test_second_job_after_finish_advances_generation(tmp_path):
+    popen = CapturedPopen(code=None)
+    runtime = _make_runtime(tmp_path, popen=popen)
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    channels = [{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}]
+    job1 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
+    )
+    runtime._jobs[job1]["proc"]._code = 10
+    runtime.poll()
+    assert job1 not in runtime._jobs
+    (runtime._root_path / "ledger.json").write_text(json.dumps({
+        "schema": 1,
+        "ts": {TS: {"generation": 1, "last_good_generation": 1}},
+    }), encoding="utf-8")
+    job2 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
+    )
+    assert job2 and job2 != job1
+    rec2 = runtime._jobs[job2]
+    assert rec2["generation"] == 2
+    latest = rt.latest_generation_file(runtime._root_path, TS)
+    data = json.loads(latest.read_text(encoding="utf-8"))
+    assert data["generation"] == 2
     j2 = json.loads((runtime._root_path / "jobs" / job2 / "job.json").read_text(encoding="utf-8"))
-    assert j1["latest_generation_path"] == str(latest)
     assert j2["latest_generation_path"] == str(latest)
-    assert j1["generation"] == rec1["generation"]
-    assert j2["generation"] == rec2["generation"]
+    assert j2["generation"] == 2
+
+
+def test_other_ts_can_start_while_one_is_running(tmp_path):
+    popen = CapturedPopen(code=None)
+    arrays, info = plane_arrays(nx=4, ny=4)
+    arrays = dict(arrays)
+    arrays["ts_faces__1"] = np.array(arrays["ts_faces__0"], dtype=np.int32)
+    info = dict(info)
+    info["ts_names"] = [TS, "Trim"]
+    runtime = _make_runtime(tmp_path, popen=popen, collect=_collect_holder(arrays, info))
+    runtime.record_baseline("proj", [TS, "Trim"], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    channels = [{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}]
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
+    )
+    job_trim = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
+    )
+    assert job_body and job_trim and job_body != job_trim
+    assert set(runtime._jobs) == {job_body, job_trim}
 
 
 def test_latest_generation_filename_sanitizes_without_collision():
@@ -1195,3 +1284,163 @@ def test_poll_switches_when_unsaved_scene_ids_are_both_empty(tmp_path):
     assert "warning" not in events[0]
     assert events[0]["switched"] == ["file_body"]
     assert cmds.nodes["file_body"]["fileTextureName"] != original
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_CONVERTED_OK
+
+
+def test_poll_worker_crash_writes_failed_and_reverts(tmp_path):
+    original = "/src/Final/Body_BaseColor.png"
+    cmds = FakeCmds({
+        "file_body": {
+            "fileTextureName": "/out/Body_BaseColor.png",
+            "uvTilingMode": 0,
+            "extra": {
+                rt.ATTR_ORIGINAL_PATH: original,
+                rt.ATTR_ORIGINAL_TILING: 0,
+                rt.ATTR_TS_NAME: TS,
+            },
+        },
+    })
+    proc = FakeProc(None)
+    runtime = _make_runtime(
+        tmp_path, cmds=cmds, popen=lambda *a, **k: proc, exists_fn=_yes_exists,
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_CONVERTING
+    proc._code = 1
+    events = runtime.poll()
+    assert len(events) == 1
+    assert events[0]["exit_code"] == 1
+    assert events[0]["state"] == rt.STATE_FAILED
+    assert events[0]["reverted"] == ["file_body"]
+    assert "異常終了" in events[0]["message"]
+    assert "終了コード 1" in events[0]["message"]
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_FAILED
+    assert "異常終了" in status["ts"][TS]["message"]
+    assert cmds.nodes["file_body"]["fileTextureName"] == original
+    assert runtime.running_job_ids() == []
+
+
+def test_poll_worker_crash_does_not_overwrite_terminal_status(tmp_path):
+    proc = FakeProc(None)
+
+    def popen(args, **kwargs):
+        job_path = Path(args[3])
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        root = Path(job["uvremap_root"])
+        payload = {
+            "schema": 1,
+            "ts": {
+                job.get("ts_name", TS): {
+                    "state": rt.STATE_CONVERTED_OK,
+                    "generation": job.get("generation", 1),
+                    "updated": FIXED_NOW,
+                    "message": "already ok",
+                },
+            },
+        }
+        (root / "status.json").write_text(json.dumps(payload), encoding="utf-8")
+        return proc
+
+    runtime = _make_runtime(tmp_path, popen=popen, exists_fn=_yes_exists)
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    proc._code = 1
+    events = runtime.poll()
+    assert events[0]["exit_code"] == 1
+    assert events[0]["state"] == rt.STATE_CONVERTED_OK
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_CONVERTED_OK
+    assert status["ts"][TS]["message"] == "already ok"
+
+
+def test_poll_recovers_converting_rows_not_in_jobs(tmp_path):
+    files = [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}]
+    cmds = FakeCmds({
+        "file_body": {"fileTextureName": "/src/Body_BaseColor.png", "uvTilingMode": 0},
+    })
+    runtime = _make_runtime(
+        tmp_path, cmds=cmds, popen=_popen_ok_with_files(files), exists_fn=_yes_exists,
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    root = runtime._root_path
+    _write_status_ts(root, {
+        "Trim": {
+            "state": rt.STATE_CONVERTING, "generation": 3,
+            "updated": FIXED_NOW, "message": "",
+        },
+    })
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    runtime.poll()
+    data = json.loads((root / "status.json").read_text(encoding="utf-8"))
+    assert data["ts"]["Trim"]["state"] == rt.STATE_ORIGINAL
+    assert data["ts"]["Trim"]["message"] == rt.MSG_INTERRUPTED
+    assert data["ts"][TS]["state"] == rt.STATE_CONVERTED_OK
+
+
+def test_switch_and_revert_disable_undo_and_restore_on_exception(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "Body_BaseColor.png").write_bytes(b"x")
+    cmds = FakeCmds({
+        "file_body": {"fileTextureName": "/src/Body_BaseColor.png", "uvTilingMode": 0},
+    })
+    switched = rt.switch_ts_file_nodes(
+        cmds, TS, [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}],
+        out, exists_fn=_yes_exists,
+    )
+    assert switched == ["file_body"]
+    assert cmds.undo_log[0]["query"] is True
+    assert cmds.undo_log[1]["stateWithoutFlush"] is False
+    assert cmds.undo_log[-1]["stateWithoutFlush"] is True
+    assert cmds._undo_enabled is True
+
+    cmds.undo_log.clear()
+    reverted = rt.revert_ts_file_nodes(cmds, ts_name=TS)
+    assert reverted == ["file_body"]
+    assert cmds.undo_log[0]["query"] is True
+    assert cmds.undo_log[1]["stateWithoutFlush"] is False
+    assert cmds.undo_log[-1]["stateWithoutFlush"] is True
+    assert cmds._undo_enabled is True
+
+    cmds.fail_set_attr = True
+    cmds.undo_log.clear()
+    cmds2 = FakeCmds({
+        "file_body": {"fileTextureName": "/src/Body_BaseColor.png", "uvTilingMode": 0},
+    })
+    cmds2.fail_set_attr = True
+    with pytest.raises(RuntimeError, match="setAttr boom"):
+        rt.switch_ts_file_nodes(
+            cmds2, TS, [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}],
+            out, exists_fn=_yes_exists,
+        )
+    assert cmds2._undo_enabled is True
+    assert cmds2.undo_log[-1]["stateWithoutFlush"] is True
+
+    cmds3 = FakeCmds({
+        "file_body": {"fileTextureName": "/src/Body_BaseColor.png", "uvTilingMode": 0},
+    })
+    cmds3.undoInfo = None
+    switched = rt.switch_ts_file_nodes(
+        cmds3, TS, [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}],
+        out, exists_fn=_yes_exists,
+    )
+    assert switched == ["file_body"]

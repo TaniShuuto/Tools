@@ -9,6 +9,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from uvremap_runtime import (
+    MSG_ALREADY_RUNNING,
+    MSG_INTERRUPTED,
+    MSG_NO_BASELINE,
+    MSG_NO_FILE_NODES,
+    MSG_SCENE_CHANGED,
+    WARN_DISABLED,
+    WARN_FILE_MISSING,
+    WARN_NO_FILE_NODES,
+    WARN_SCENE_CHANGED,
+)
+
 DEFAULT_UVREMAP_ROOT = "C:/SPMayaLiveSync/uvremap"
 CONVERT_TIMEOUT_S = 1200
 POLL_INTERVAL_MS = 1000
@@ -23,11 +35,7 @@ MSG_NO_FINAL = (
 )
 MSG_NO_TARGETS = "対象のテクスチャセットがありません"
 MSG_DISABLED = "UV変換は無効のため、変換は行いません"
-MSG_NO_BASELINE = "基準UVが未記録です。Painterへ送った時点で記録してください"
 MSG_NOT_STARTED = "変換を開始できませんでした。下の状態表示の理由を確認してください"
-MSG_INTERRUPTED = (
-    "前回の変換は途中で中断されました。もう一度『今すぐ変換』を押してください"
-)
 MSG_DISABLED_SKIP = "UV変換が無効のため、変換結果の切り替えを見送りました"
 MSG_BASELINE_EXISTS = (
     "基準は記録済みです。作り直すには、作業フォルダの baseline を消してから"
@@ -41,15 +49,7 @@ MSG_FOLDER_INSIDE = (
     "作業フォルダが Live Sync の監視フォルダまたは Final フォルダの内側になるため、"
     "書き込みを中止しました"
 )
-MSG_NO_FILE_NODES = "変換は完了しましたが、切り替え対象のファイルノードが見つかりません"
 MSG_FILE_MISSING = "変換後のファイルが見つからないため、切り替えを見送りました"
-MSG_SCENE_CHANGED = (
-    "シーンが変わったため切り替えを見送りました。もう一度『今すぐ変換』を押してください"
-)
-WARN_NO_FILE_NODES = "no_file_nodes_switched"
-WARN_FILE_MISSING = "converted_file_missing"
-WARN_SCENE_CHANGED = "scene_changed"
-WARN_DISABLED = "uvremap_disabled"
 
 WARN_MESSAGES = {
     WARN_NO_FILE_NODES: MSG_NO_FILE_NODES,
@@ -418,7 +418,15 @@ class UVRemapController:
                 return {"ok": False, "message": MSG_NO_BASELINE}
             out = output_dir_for_root(resolved["root"])
             job_ids = []
+            already = []
             for ts_name in resolved["ts_names"]:
+                running = False
+                checker = getattr(self.runtime, "has_running_job_for_ts", None)
+                if callable(checker):
+                    try:
+                        running = bool(checker(ts_name))
+                    except Exception:
+                        running = False
                 job_id = self.runtime.convert_now(
                     resolved["project_key"],
                     ts_name,
@@ -430,9 +438,20 @@ class UVRemapController:
                 )
                 if job_id:
                     job_ids.append(job_id)
+                elif running:
+                    already.append(ts_name)
             if not job_ids:
+                if already:
+                    return {
+                        "ok": False,
+                        "message": MSG_ALREADY_RUNNING,
+                        "job_ids": [],
+                        "already_running": already,
+                    }
                 return {"ok": False, "message": MSG_NOT_STARTED, "job_ids": []}
             message = "変換を開始しました"
+            if already:
+                message = "{0}。{1}".format(message, MSG_ALREADY_RUNNING)
             if resolved.get("missing"):
                 message = "{0}。シーンに無いテクスチャセット: {1}".format(
                     message, "、".join(resolved["missing"]),
@@ -442,6 +461,7 @@ class UVRemapController:
                 "message": message,
                 "job_ids": job_ids,
                 "missing": list(resolved.get("missing") or []),
+                "already_running": already,
             }
         except Exception:
             return {"ok": False, "message": "変換の開始に失敗しました"}
@@ -509,9 +529,9 @@ class UVRemapController:
 
 def _load_qt():
     try:
-        from PySide6 import QtCore, QtWidgets
-    except ImportError:
         from PySide2 import QtCore, QtWidgets
+    except ImportError:
+        from PySide6 import QtCore, QtWidgets
     return QtCore, QtWidgets
 
 

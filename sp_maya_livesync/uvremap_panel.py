@@ -6,8 +6,8 @@
 このモジュールは表示とコールバック呼び出しだけを担う。設定ファイルや
 Maya API には触れない。組み込み(MayaQWidgetDockableMixin 等)は後続作業。
 
-PySide6 を優先し、無ければ PySide2。どちらも無い環境でも
-`import uvremap_panel` 自体は失敗しない(Qt 部分は遅延)。
+PySide2 を優先し、無ければ PySide6(maya_live_sync.py と同じ順)。
+どちらも無い環境でも `import uvremap_panel` 自体は失敗しない(Qt 部分は遅延)。
 """
 from __future__ import annotations
 
@@ -287,9 +287,9 @@ class StatusModel:
 
 def _load_qt():
     try:
-        from PySide6 import QtCore, QtWidgets
-    except ImportError:
         from PySide2 import QtCore, QtWidgets
+    except ImportError:
+        from PySide6 import QtCore, QtWidgets
     return QtCore, QtWidgets
 
 

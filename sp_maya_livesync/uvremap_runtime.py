@@ -3,7 +3,8 @@
 
 契約: docs/uvremap/CONTRACT.md §2〜§6、D-3 / D-4。
 Maya の import は関数の中だけ。cmds / Popen / 配列収集は差し替え可能。
-既存の maya_live_sync.py は変更しない。
+Live Sync 本体(maya_live_sync.py)への変更は PR #18 で必要最小限に抑えた。
+本モジュールは実行制御を担当する。
 """
 from __future__ import annotations
 
@@ -17,7 +18,11 @@ from pathlib import Path
 
 import uvremap_bridge as br
 import uvremap_core as core
-from uvremap_worker import read_json, write_json_atomic
+from uvremap_worker import (
+    is_windows_reserved_name,
+    read_json,
+    write_json_atomic,
+)
 
 SCHEMA = 1
 ATTR_ORIGINAL_PATH = "uvremapOriginalPath"
@@ -42,6 +47,8 @@ MSG_SCENE_CHANGED = (
 MSG_INTERRUPTED = (
     "前回の変換は途中で中断されました。もう一度『今すぐ変換』を押してください"
 )
+MSG_ALREADY_RUNNING = "このテクスチャセットは変換中です"
+MSG_WORKER_CRASH = "ワーカーが異常終了しました(終了コード {0})"
 WARN_NO_FILE_NODES = "no_file_nodes_switched"
 WARN_FILE_MISSING = "converted_file_missing"
 WARN_SCENE_CHANGED = "scene_changed"
@@ -53,10 +60,9 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 FAIL_EXIT_CODES = (11, 12, 13)
 _TILE_STEM_RE = re.compile(r"^(.+)\.(\d{4})$")
 _UNSAFE_TS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_WIN_RESERVED = frozenset(
-    ["CON", "PRN", "AUX", "NUL"]
-    + ["COM{0}".format(i) for i in range(1, 10)]
-    + ["LPT{0}".format(i) for i in range(1, 10)]
+KNOWN_WORKER_EXITS = (0, 10, 11, 12, 13)
+TERMINAL_STATES = (
+    STATE_CONVERTED_OK, STATE_FAILED, STATE_BLOCKED, STATE_ORIGINAL,
 )
 _STRIP_ENV = (
     "PYTHONHOME",
@@ -207,9 +213,8 @@ def latest_generation_filename(ts_name: str) -> str:
     """
     raw = "" if ts_name is None else str(ts_name)
     safe = _UNSAFE_TS_RE.sub("_", raw).rstrip(" .")
-    reserved = safe.split(".")[0].upper() if safe else ""
     changed = safe != raw
-    if not safe or safe in (".", "..") or reserved in _WIN_RESERVED:
+    if not safe or safe in (".", "..") or is_windows_reserved_name(safe):
         safe = "ts_{0}".format(safe) if safe and safe not in (".", "..") else "ts"
         changed = True
     if len(safe) > 80:
@@ -373,6 +378,28 @@ def _record_original(cmds, node: str) -> None:
         _set_int(cmds, node, ATTR_ORIGINAL_TILING, tiling_i)
 
 
+def _without_undo(cmds, fn):
+    """``setAttr`` 等を Undo に載せない。cmds が偽物/undoInfo が無いときはそのまま実行。"""
+    undo_info = getattr(cmds, "undoInfo", None) if cmds is not None else None
+    if not callable(undo_info):
+        return fn()
+    try:
+        prev = undo_info(query=True, stateWithoutFlush=True)
+    except Exception:
+        return fn()
+    try:
+        undo_info(stateWithoutFlush=False)
+    except Exception:
+        return fn()
+    try:
+        return fn()
+    finally:
+        try:
+            undo_info(stateWithoutFlush=prev)
+        except Exception:
+            pass
+
+
 def switch_ts_file_nodes(
     cmds, ts_name: str, files, output_dir, exists_fn=None, missing_out=None,
 ) -> list:
@@ -392,23 +419,27 @@ def switch_ts_file_nodes(
         missing_out.extend(missing)
     skip = {item["suffix"] for item in missing}
     dest_dir = Path(output_dir)
-    switched = []
-    for node in _cmds_ls_files(cmds):
-        suffix = _match_suffix(cmds, node, ts_name, grouped)
-        if suffix is None or suffix in skip:
-            continue
-        info = grouped[suffix]
-        n_tiles = len(info["tiles"])
-        name = converted_filename(ts_name, suffix, info["ext"], n_tiles)
-        new_path = str(dest_dir / name)
-        tiling = UV_TILING_OFF if n_tiles <= 1 else UV_TILING_UDIM
-        _record_original(cmds, node)
-        _ensure_string_attr(cmds, node, ATTR_TS_NAME)
-        _set_string(cmds, node, ATTR_TS_NAME, str(ts_name))
-        _set_file_texture(cmds, node, new_path)
-        _set_int(cmds, node, "uvTilingMode", tiling)
-        switched.append(node)
-    return switched
+
+    def _apply():
+        switched = []
+        for node in _cmds_ls_files(cmds):
+            suffix = _match_suffix(cmds, node, ts_name, grouped)
+            if suffix is None or suffix in skip:
+                continue
+            info = grouped[suffix]
+            n_tiles = len(info["tiles"])
+            name = converted_filename(ts_name, suffix, info["ext"], n_tiles)
+            new_path = str(dest_dir / name)
+            tiling = UV_TILING_OFF if n_tiles <= 1 else UV_TILING_UDIM
+            _record_original(cmds, node)
+            _ensure_string_attr(cmds, node, ATTR_TS_NAME)
+            _set_string(cmds, node, ATTR_TS_NAME, str(ts_name))
+            _set_file_texture(cmds, node, new_path)
+            _set_int(cmds, node, "uvTilingMode", tiling)
+            switched.append(node)
+        return switched
+
+    return _without_undo(cmds, _apply)
 
 
 def revert_ts_file_nodes(cmds, ts_name=None) -> list:
@@ -417,35 +448,39 @@ def revert_ts_file_nodes(cmds, ts_name=None) -> list:
     ``uvremapTsName`` があるノードは TS 名の完全一致。無い(D2a 当時の)ノードだけ
     ファイル名の ``<ts>_`` 前方一致を使う。
     """
-    reverted = []
-    for node in _cmds_ls_files(cmds):
-        if not _has_attr(cmds, node, ATTR_ORIGINAL_PATH) and not _has_attr(
-            cmds, node, ATTR_ORIGINAL_TILING
-        ):
-            continue
-        if ts_name:
-            if _has_attr(cmds, node, ATTR_TS_NAME):
-                tagged = _get_attr(cmds, node, ATTR_TS_NAME, "")
-                if str(tagged) != str(ts_name):
-                    continue
-            elif not any(
-                _filename_matches_ts(path, ts_name) for path in _node_path_candidates(cmds, node)
+
+    def _apply():
+        reverted = []
+        for node in _cmds_ls_files(cmds):
+            if not _has_attr(cmds, node, ATTR_ORIGINAL_PATH) and not _has_attr(
+                cmds, node, ATTR_ORIGINAL_TILING
             ):
                 continue
-        original = _get_attr(cmds, node, ATTR_ORIGINAL_PATH, None)
-        tiling = _get_attr(cmds, node, ATTR_ORIGINAL_TILING, UV_TILING_OFF)
-        if original is not None:
-            _set_file_texture(cmds, node, str(original))
-        try:
-            tiling_i = int(tiling)
-        except (TypeError, ValueError):
-            tiling_i = UV_TILING_OFF
-        _set_int(cmds, node, "uvTilingMode", tiling_i)
-        _delete_attr(cmds, node, ATTR_ORIGINAL_PATH)
-        _delete_attr(cmds, node, ATTR_ORIGINAL_TILING)
-        _delete_attr(cmds, node, ATTR_TS_NAME)
-        reverted.append(node)
-    return reverted
+            if ts_name:
+                if _has_attr(cmds, node, ATTR_TS_NAME):
+                    tagged = _get_attr(cmds, node, ATTR_TS_NAME, "")
+                    if str(tagged) != str(ts_name):
+                        continue
+                elif not any(
+                    _filename_matches_ts(path, ts_name) for path in _node_path_candidates(cmds, node)
+                ):
+                    continue
+            original = _get_attr(cmds, node, ATTR_ORIGINAL_PATH, None)
+            tiling = _get_attr(cmds, node, ATTR_ORIGINAL_TILING, UV_TILING_OFF)
+            if original is not None:
+                _set_file_texture(cmds, node, str(original))
+            try:
+                tiling_i = int(tiling)
+            except (TypeError, ValueError):
+                tiling_i = UV_TILING_OFF
+            _set_int(cmds, node, "uvTilingMode", tiling_i)
+            _delete_attr(cmds, node, ATTR_ORIGINAL_PATH)
+            _delete_attr(cmds, node, ATTR_ORIGINAL_TILING)
+            _delete_attr(cmds, node, ATTR_TS_NAME)
+            reverted.append(node)
+        return reverted
+
+    return _without_undo(cmds, _apply)
 
 
 def _default_cmds():
@@ -659,12 +694,47 @@ class UVRemapRuntime:
                 gen = 0
             self._set_status(root, name, state, gen, message, iso)
 
+    def _status_row(self, root: Path, ts_name: str):
+        try:
+            data = read_json(root / "status.json", None)
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("ts"), dict):
+            return None
+        entry = data["ts"].get(ts_name)
+        return entry if isinstance(entry, dict) else None
+
+    def _should_write_crash_status(self, root: Path, ts_name: str, gen: int) -> bool:
+        """終端状態を同じ世代以上で書いていれば上書きしない。より新しい世代も残す。"""
+        entry = self._status_row(root, ts_name)
+        if entry is None:
+            return True
+        cur_gen = entry.get("generation", 0)
+        if not isinstance(cur_gen, int) or isinstance(cur_gen, bool):
+            cur_gen = 0
+        if cur_gen > gen:
+            return False
+        state = str(entry.get("state") or "")
+        if state in TERMINAL_STATES and cur_gen >= gen:
+            return False
+        return True
+
     def status_snapshot(self, project_key):
         """パネル(StatusModel)が読む status.json のパス。"""
         return self._root(project_key) / "status.json"
 
     def running_job_ids(self) -> list:
         return list(self._jobs)
+
+    def has_running_job_for_ts(self, ts_name: str) -> bool:
+        """同じ TS のジョブが ``_jobs`` にあれば True。"""
+        want = str(ts_name) if ts_name is not None else ""
+        if not want:
+            return False
+        for rec in self._jobs.values():
+            if rec.get("ts_name") == want:
+                return True
+        return False
 
     def recover_orphaned(self, project_key) -> list:
         """status.json の CONVERTING のうち、この runtime の _jobs に無い TS を ORIGINAL へ戻す。
@@ -759,6 +829,9 @@ class UVRemapRuntime:
         if not ts_name:
             raise RuntimeControlError("ts_name が空です")
 
+        if self.has_running_job_for_ts(ts_name):
+            return ""
+
         baseline_id = _read_active_baseline(root)
         if baseline_id is None:
             ids = _list_baseline_ids(root)
@@ -843,7 +916,7 @@ class UVRemapRuntime:
             copy_retries=int(opts.get("copy_retries", 3)),
             uv_hash=uv_hash,
             baseline_id=baseline_id,
-            lock_timeout_s=opts.get("lock_timeout_s", 60),
+            lock_timeout_s=opts["lock_timeout_s"] if "lock_timeout_s" in opts else timeout_s,
             latest_generation_path=str(latest_path),
         )
         self._write_latest_generation(latest_path, ts_name, generation)
@@ -913,6 +986,8 @@ class UVRemapRuntime:
                     fh.close()
                 except Exception:
                     pass
+        for key in list(self._seen_roots):
+            self.recover_orphaned(key)
         return events
 
     def _finish_job(self, rec: dict, exit_code: int) -> dict:
@@ -956,9 +1031,15 @@ class UVRemapRuntime:
         ts_name = rec["ts_name"]
         root = rec["root"]
         result_path = root / "jobs" / rec["job_id"] / "result.json"
-        result = read_json(result_path, None)
+        result_missing = False
+        try:
+            result = read_json(result_path, None)
+        except Exception:
+            result = None
+            result_missing = True
         if not isinstance(result, dict):
             result = {}
+            result_missing = True
         status = str(result.get("status") or "")
         files = result.get("files") if isinstance(result.get("files"), list) else []
         message = ""
@@ -998,6 +1079,22 @@ class UVRemapRuntime:
             state = STATE_CONVERTED_OK
         elif status in ("failed", "retry_exhausted"):
             state = STATE_FAILED
+        crash = exit_code != 10 and (
+            exit_code not in KNOWN_WORKER_EXITS or result_missing
+        )
+        if crash:
+            crash_msg = MSG_WORKER_CRASH.format(exit_code)
+            if self._should_write_crash_status(root, ts_name, gen):
+                self._set_status(root, ts_name, STATE_FAILED, gen, crash_msg, iso)
+                state = STATE_FAILED
+                if not message:
+                    message = crash_msg
+            else:
+                existing = self._status_row(root, ts_name)
+                if existing is not None:
+                    state = str(existing.get("state") or state)
+                    if not message and existing.get("message"):
+                        message = str(existing.get("message"))
         event = {
             "job_id": rec["job_id"],
             "project_key": rec.get("project_key"),
