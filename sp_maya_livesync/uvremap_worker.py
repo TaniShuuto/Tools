@@ -69,6 +69,7 @@ EXIT_RETRY_EXHAUSTED = 13
 SCHEMA = 1
 DEFAULT_TIMEOUT_S = 300.0
 DEFAULT_COPY_RETRIES = 3
+# ジョブに lock_timeout_s が無いときは timeout_s を使う(この定数は明示指定の参考値)。
 DEFAULT_LOCK_TIMEOUT_S = 60.0
 DEFAULT_HARD_KILL_GRACE_S = 15.0
 LEDGER_LOCK_TIMEOUT_S = 15.0
@@ -77,6 +78,15 @@ TMP_SUFFIX = ".uvremap-tmp"
 FLAG_NAME = "_sync_complete.flag"
 LOCK_POLL_S = 0.05
 _CHUNK = 1024 * 1024
+MAX_FILENAME_COMPONENT = 120
+MSG_UNSAFE_TS_NAME = "ファイル名に使えないテクスチャセット名です"
+WIN_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM{0}".format(i) for i in range(1, 10)]
+    + ["LPT{0}".format(i) for i in range(1, 10)]
+)
+_UNSAFE_FILENAME_CHAR_RE = re.compile(r'[<>"|?*\x00-\x1f]')
+_OS_NAME = os.name
 
 
 # ---------------------------------------------------------------------------
@@ -342,11 +352,51 @@ _COLORSPACES = ("srgb", "raw")
 _KINDS = ("color", "scalar", "normal")
 
 
+def is_windows_reserved_name(name: str) -> bool:
+    """Windows の予約デバイス名(CON / NUL / COM1 等)。拡張子より前だけを見る。"""
+    stem = name.split(".")[0].upper() if name else ""
+    return stem in WIN_RESERVED_NAMES
+
+
+def has_trailing_dot_or_space(name: str) -> bool:
+    return bool(name) and name[-1] in " ."
+
+
+def filename_component_is_unsafe(name: str) -> bool:
+    """予約名・末尾ドット/空白・``<>"|?*``・長さ。``:`` は含めない(呼び出し側で拒否)。"""
+    if not isinstance(name, str) or not name:
+        return True
+    if len(name) > MAX_FILENAME_COMPONENT:
+        return True
+    if has_trailing_dot_or_space(name):
+        return True
+    if is_windows_reserved_name(name):
+        return True
+    if _UNSAFE_FILENAME_CHAR_RE.search(name):
+        return True
+    return False
+
+
+def is_safe_output_name(name) -> bool:
+    """台帳 ``outputs`` のキー。パス区切りや ``..`` を含む名前は使わない。"""
+    if not isinstance(name, str) or not name:
+        return False
+    if Path(name).name != name:
+        return False
+    if ".." in name or "/" in name or "\\" in name or "\0" in name:
+        return False
+    return True
+
+
 def _safe_component(value, what: str) -> str:
     if not isinstance(value, str) or not value or value in (".", ".."):
         raise JobFailed("job.json の {0} が不正です".format(what))
     if any(c in value for c in ("/", "\\", ":", "\0")):
         raise JobFailed("job.json の {0} にパス区切り文字は使えません: {1!r}".format(what, value))
+    if filename_component_is_unsafe(value):
+        if what == "ts_name":
+            raise Blocked(MSG_UNSAFE_TS_NAME)
+        raise JobFailed("job.json の {0} がファイル名に使えません: {1!r}".format(what, value))
     return value
 
 
@@ -401,7 +451,7 @@ def parse_job(raw) -> dict:
     job["normal_mode"] = raw.get("normal_mode", "uv") or "uv"
     job["timeout_s"] = _num(raw.get("timeout_s"), DEFAULT_TIMEOUT_S, "timeout_s", 0.01)
     job["copy_retries"] = int(_num(raw.get("copy_retries"), DEFAULT_COPY_RETRIES, "copy_retries"))
-    job["lock_timeout_s"] = _num(raw.get("lock_timeout_s"), DEFAULT_LOCK_TIMEOUT_S, "lock_timeout_s")
+    job["lock_timeout_s"] = _num(raw.get("lock_timeout_s"), job["timeout_s"], "lock_timeout_s")
     job["hard_kill_grace_s"] = _num(raw.get("hard_kill_grace_s"), DEFAULT_HARD_KILL_GRACE_S,
                                     "hard_kill_grace_s")
     out_res = raw.get("out_res")
@@ -741,12 +791,19 @@ class _Run:
         j = self.job
         self._guard_paths()
         self.root.mkdir(parents=True, exist_ok=True)
-        with FileLock(self.root / "worker.lock", j["lock_timeout_s"], label="worker"):
-            self._start_watchdog()
-            try:
-                self._locked_body()
-            finally:
-                self._stop_watchdog()
+        try:
+            with FileLock(self.root / "worker.lock", j["lock_timeout_s"], label="worker"):
+                self._start_watchdog()
+                try:
+                    self._locked_body()
+                finally:
+                    self._stop_watchdog()
+        except LockTimeout:
+            req = self._requested_generation()
+            if req is not None and req > self.generation:
+                raise Superseded("世代 {0} は要求済みの世代 {1} より古いため破棄します".format(
+                    self.generation, req))
+            raise
 
     def _locked_body(self) -> None:
         j = self.job
@@ -802,10 +859,11 @@ class _Run:
         except OSError as exc:
             raise JobFailed("原本フォルダを読めません: {0}".format(exc))
         found: dict[str, dict] = {}
+        flags = re.IGNORECASE if _OS_NAME == "nt" else 0
         for ch in j["channels"]:
             suffix = ch["suffix"]
             pat = re.compile(r"^{0}_{1}(?:\.(\d{{4}}))?\.([^.]+)$".format(
-                re.escape(self.ts_name), re.escape(suffix)))
+                re.escape(self.ts_name), re.escape(suffix)), flags)
             cands = []  # (tile|None, ext, name, mtime_ns)
             for n in names:
                 m = pat.match(n)
@@ -1085,6 +1143,22 @@ class _Run:
     def _journal_path(self) -> Path:
         return self.root / "publish_journal.{0}.json".format(self.ts_name)
 
+    def _output_root_norm(self) -> str:
+        return _norm(Path(self.job["uvremap_root"]) / "output")
+
+    def _confine_output_path(self, out: Path, name: str, *, warn: bool = True):
+        """台帳キーや出力名を ``uvremap_root/output`` 配下のファイル名に閉じ込める。"""
+        if not is_safe_output_name(name):
+            if warn:
+                self.msg("warn", "台帳の出力名を無視しました(安全でない名前): {0}".format(name))
+            return None
+        dest = out / name
+        if not _is_under(_norm(dest), self._output_root_norm()):
+            if warn:
+                self.msg("warn", "台帳の出力名を無視しました(出力フォルダの外): {0}".format(name))
+            return None
+        return dest
+
     def _backup(self, target: Path, tag: int) -> Path:
         bdir = self.job_dir / "backup"
         bdir.mkdir(parents=True, exist_ok=True)
@@ -1134,10 +1208,20 @@ class _Run:
                 except OSError:
                     pass
 
-            # I6: 手編集の検出(読み取りのみ)
+            # I6: 手編集の検出(読み取りのみ)。台帳キーは出力フォルダ内のファイル名だけ使う。
             edited: list[Path] = []
+            skipped_ledger = set()
             for name in sorted(set(led_outputs) | set(new_files)):
-                p = out / name
+                if name in led_outputs and name not in new_files:
+                    confined = self._confine_output_path(out, name)
+                    if confined is None:
+                        skipped_ledger.add(name)
+                        continue
+                    p = confined
+                else:
+                    p = out / name
+                    if name in new_files and self._confine_output_path(out, name, warn=False) is None:
+                        raise PublishError("出力先が uvremap_root/output の外です: {0}".format(name))
                 if not p.is_file():
                     continue
                 sha = sha1_file(p)
@@ -1194,13 +1278,16 @@ class _Run:
                     uvremap_io.replace_file(tmp_paths[name], target)
 
                 for name in sorted(set(led_outputs) - set(new_files)):  # タイル数変更で不要になった旧出力
-                    stale = out / name
-                    if stale.is_file():
-                        tag += 1
-                        bk = self._backup(stale, tag)
-                        undo.append(lambda bk=bk, t=stale: self._restore(bk, t))
-                        stale.unlink()
-                        self.msg("info", "不要になった旧出力を削除しました: {0}".format(name))
+                    if name in skipped_ledger:
+                        continue
+                    stale = self._confine_output_path(out, name)
+                    if stale is None or not stale.is_file():
+                        continue
+                    tag += 1
+                    bk = self._backup(stale, tag)
+                    undo.append(lambda bk=bk, t=stale: self._restore(bk, t))
+                    stale.unlink()
+                    self.msg("info", "不要になった旧出力を削除しました: {0}".format(name))
 
                 prev_gen = entry.get("generation", 0)
                 prev_gen = prev_gen if isinstance(prev_gen, int) and not isinstance(prev_gen, bool) else 0
@@ -1227,12 +1314,21 @@ class _Run:
             except Exception as exc:
                 summary, tb = _format_exc(exc)
                 self.msg("error", "公開中に失敗したためロールバックします: " + summary)
+                undo_failed = False
                 for fn in reversed(undo):
                     try:
                         fn()
                     except Exception as exc2:
+                        undo_failed = True
                         s2, _t2 = _format_exc(exc2)
                         self.msg("error", "ロールバックに失敗: " + s2)
+                if undo_failed:
+                    try:
+                        if flag_path.exists():
+                            flag_path.unlink()
+                    except OSError:
+                        pass
+                    self.msg("error", "ロールバックに失敗しました。出力が不整合の可能性があります")
                 for tmp in tmp_paths.values():
                     try:
                         tmp.unlink()
@@ -1244,6 +1340,10 @@ class _Run:
                     pass
                 if isinstance(exc, _Abort):
                     raise
+                if undo_failed:
+                    raise PublishError(
+                        "公開に失敗しました。ロールバックに失敗しました。出力が不整合の可能性があります"
+                    ) from exc
                 raise PublishError("公開に失敗しました(ロールバック済み): " + summary) from exc
 
             try:

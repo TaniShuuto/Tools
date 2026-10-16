@@ -578,14 +578,15 @@ def test_publish_failure_rolls_back_to_previous_generation(env, core, monkeypatc
     edited.write_bytes(b"hand edited")  # I6 の退避 → ロールバックで元に戻ること
     edited_state = {"Body_Normal.1001.png": sha1_bytes(b"hand edited")}
     monkeypatch.setattr(uvremap_io, "REPLACE_DELAY_S", 0)
-    monkeypatch.setattr(uvremap_io, "REPLACE_RETRIES", 3)
+    monkeypatch.setattr(uvremap_io, "REPLACE_RETRIES", 1)
     real = os.replace
-    left = {"n": 3}
+    hits = {"n": 0}
 
     def flaky(src, dst, *a, **k):
-        if Path(dst).name == "Body_BaseColor.1002.png" and left["n"] > 0:  # 1 件目の後で失敗させる
-            left["n"] -= 1
-            raise PermissionError(13, "in use by another process")
+        if Path(dst).name == "Body_BaseColor.1002.png":  # 公開の 1 回目だけ失敗。復元は通す
+            hits["n"] += 1
+            if hits["n"] == 1:
+                raise PermissionError(13, "in use by another process")
         return real(src, dst, *a, **k)
 
     monkeypatch.setattr(os, "replace", flaky)
@@ -1578,6 +1579,7 @@ def test_cli_exit_codes_for_usage_and_missing_job(tmp_path):
 def test_worker_publish_survives_transient_replace_failures(env, core, monkeypatch):
     """他プロセスが一瞬開いている状況(2回失敗してから成功)でも、再試行で公開できる。"""
     monkeypatch.setattr(uvremap_io, "REPLACE_DELAY_S", 0)
+    monkeypatch.setattr(uvremap_io, "REPLACE_RETRIES", 3)
     real = os.replace
     left = {"n": 2}
 
@@ -1591,3 +1593,136 @@ def test_worker_publish_survives_transient_replace_failures(env, core, monkeypat
     code, res = env.run()
     assert code == 0 and left["n"] == 0
     assert "Body_Normal.1001.png" in env.out_files()
+
+
+def test_parse_job_lock_timeout_defaults_to_timeout_s(env):
+    job = env.job_dict("j", 1, timeout_s=1200)
+    job.pop("lock_timeout_s")
+    parsed = W.parse_job(job)
+    assert parsed["lock_timeout_s"] == 1200
+    parsed2 = W.parse_job(env.job_dict("j", 1, timeout_s=1200, lock_timeout_s=3))
+    assert parsed2["lock_timeout_s"] == 3
+
+
+def test_lock_timeout_does_not_overwrite_newer_generation(env, core, monkeypatch):
+    env.root.mkdir(parents=True, exist_ok=True)
+    latest = env.root / "latest_generation" / "Body.json"
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    latest.write_text(json.dumps({"generation": 2}), encoding="utf-8")
+    (env.root / "status.json").write_text(json.dumps({
+        "schema": 1,
+        "ts": {
+            "Body": {
+                "state": "CONVERTING", "generation": 2,
+                "updated": "2026-01-01T00:00:00", "message": "",
+            },
+        },
+    }), encoding="utf-8")
+
+    class BoomLock(W.FileLock):
+        def acquire(self):
+            if Path(self.path).name == "worker.lock":
+                raise W.LockTimeout("worker.lock の取得がタイムアウトしました(0.4秒)")
+            return super().acquire()
+
+    monkeypatch.setattr(W, "FileLock", BoomLock)
+    code, res = env.run("old", 1, latest_generation_path=str(latest), lock_timeout_s=0.4)
+    assert code == 10 and res["status"] == "superseded"
+    row = env.status()["Body"]
+    assert row["state"] == "CONVERTING" and row["generation"] == 2
+
+
+def test_publish_rollback_failure_deletes_flag_and_next_run_recovers(env, core, monkeypatch):
+    good = _publish_good_generation(env)
+    monkeypatch.setattr(uvremap_io, "REPLACE_DELAY_S", 0)
+    monkeypatch.setattr(uvremap_io, "REPLACE_RETRIES", 1)
+    real = os.replace
+    counts = {"1001": 0}
+
+    def flaky(src, dst, *a, **k):
+        name = Path(dst).name
+        if name == "Body_BaseColor.1002.png":
+            raise PermissionError(13, "in use by another process")
+        if name == "Body_BaseColor.1001.png":
+            counts["1001"] += 1
+            if counts["1001"] >= 2:
+                raise PermissionError(13, "in use by another process")
+        return real(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    core.CONFIG["salt"] = 0.3
+    code, res = env.run("bad", 2)
+    assert code == 12 and res["status"] == "failed"
+    assert "ロールバックに失敗しました。出力が不整合の可能性があります" in messages_text(res, "error")
+    assert not (env.out / "_sync_complete.flag").exists()
+    assert sha1_path(env.out / "Body_BaseColor.1001.png") != good["out"]["Body_BaseColor.1001.png"][0]
+
+    monkeypatch.setattr(os, "replace", real)
+    monkeypatch.setattr(uvremap_io, "REPLACE_RETRIES", None)
+    core.CONFIG["salt"] = 0.4
+    code2, res2 = env.run("recover", 3)
+    assert code2 == 0, res2["messages"]
+    flag = json.loads((env.out / "_sync_complete.flag").read_text(encoding="utf-8"))
+    assert flag["generation"] == 3
+    assert env.status()["Body"]["state"] == "CONVERTED_OK"
+
+
+def test_ledger_path_escape_is_ignored_and_outside_file_stays(env, core):
+    assert env.run("g1", 1)[0] == 0
+    secret = env.root / "output" / "secret.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("keep-me", encoding="utf-8")
+    led = env.ledger()
+    led["ts"]["Body"]["outputs"]["../secret.txt"] = "deadbeef"
+    env.ledger_path.write_text(json.dumps(led), encoding="utf-8")
+    core.CONFIG["salt"] = 0.2
+    code, res = env.run("g2", 2)
+    assert code == 0, res["messages"]
+    assert secret.is_file() and secret.read_text(encoding="utf-8") == "keep-me"
+    assert not list(env.root.glob("output/secret.txt.edited_*"))
+    assert not list(env.out.glob("secret.txt.edited_*"))
+    assert "../secret.txt" not in env.ledger()["ts"]["Body"]["outputs"]
+    assert "安全でない" in messages_text(res, "warn")
+
+
+def test_windows_input_match_uses_actual_filename(env, core, monkeypatch):
+    monkeypatch.setattr(W, "_OS_NAME", "nt")
+    for p in list(env.src.glob("Body_*")):
+        p.unlink()
+    env.add_png("body_BaseColor.1001.png", c=3, seed=1)
+    env.add_png("body_BaseColor.1002.png", c=3, seed=2)
+    env.add_png("body_Roughness.1001.png", c=1, seed=3)
+    env.add_png("body_Normal.png", c=3, seed=4)
+    env.freeze_times()
+    code, res = env.run()
+    assert code == 0, res["messages"]
+    sources = env.ledger()["ts"]["Body"]["sources"]
+    assert "body_BaseColor.1001.png" in sources
+    assert "Body_BaseColor.1001.png" not in sources
+
+
+def test_posix_input_match_is_case_sensitive(env, core, monkeypatch):
+    monkeypatch.setattr(W, "_OS_NAME", "posix")
+    for p in list(env.src.glob("Body_*")):
+        p.unlink()
+    env.add_png("body_BaseColor.1001.png", c=3, seed=1)
+    env.add_png("body_BaseColor.1002.png", c=3, seed=2)
+    env.add_png("body_Roughness.1001.png", c=1, seed=3)
+    env.add_png("body_Normal.png", c=3, seed=4)
+    env.freeze_times()
+    code, res = env.run()
+    assert code == 11
+    assert "入力テクスチャが見つかりません" in messages_text(res)
+
+
+@pytest.mark.parametrize("name", ["CON", "NUL", "COM1", "Body.", "Body ", "x" * 121, 'Body<>x'])
+def test_unsafe_ts_name_is_blocked(env, core, name):
+    code, res = env.run("j", 1, ts_name=name)
+    assert code == 11 and res["status"] == "blocked"
+    assert W.MSG_UNSAFE_TS_NAME in messages_text(res)
+
+
+def test_namespaced_ts_name_still_rejected_as_job_failed(env, core):
+    code, res = env.run("j", 1, ts_name="ns:Body")
+    assert code == 12
+    assert "パス区切り" in messages_text(res)

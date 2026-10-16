@@ -12,8 +12,9 @@
   (EXR / TIFF / JPEG 等)、PNG として読めないヘッダ。
 - 壊れた PNG(ヘッダは PNG だが CRC 不一致・データ欠落・zlib 破損 等)は ``ImageIOError``。
   ワーカーは前者を終了コード 11、後者を 12 に分ける。
-- ``replace_file``: Windows で他プロセスが開いている場合に ``os.replace`` が失敗する
-  ことへの短い再試行(既定 5回 x 0.2秒)。尽きたら ``ReplaceFailed``。
+- ``replace_file``: Windows の共有違反(``PermissionError`` / winerror 32・33)だけ
+  合計約 5 秒まで再試行する(間隔約 0.25 秒)。ディスクフル(``ENOSPC``)など他の
+  ``OSError`` は再試行せずすぐ失敗。尽きたら ``ReplaceFailed``。
 
 meta は ``{"bit_depth": 8|16, "mode": "L"|"LA"|"RGB"|"RGBA"|"I;16", "ext": ".png"}``。
 16bit のグレーは従来どおり ``"I;16"``、16bit のその他は ``"LA"`` / ``"RGB"`` / ``"RGBA"``
@@ -416,20 +417,69 @@ def write_image(path, arr, meta) -> None:
 # ---------------------------------------------------------------------------
 # os.replace の再試行(Windows で他プロセスが対象を開いていると失敗する)
 # ---------------------------------------------------------------------------
-REPLACE_RETRIES = 5
-REPLACE_DELAY_S = 0.2
+REPLACE_TIMEOUT_S = 5.0
+REPLACE_DELAY_S = 0.25
+# None なら時間上限。テストが回数を指定するときだけ整数を入れる。
+REPLACE_RETRIES = None
+WINERR_SHARING_VIOLATION = 32
+WINERR_LOCK_VIOLATION = 33
 
 
-def replace_file(src, dst, *, retries: int | None = None, delay: float | None = None) -> None:
-    """``os.replace(src, dst)`` を最大 ``retries`` 回(間隔 ``delay`` 秒)試す。
+def is_retryable_replace_error(exc: BaseException) -> bool:
+    """共有違反だけ再試行する。``ENOSPC`` など他の OSError は対象外。"""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (
+        WINERR_SHARING_VIOLATION, WINERR_LOCK_VIOLATION,
+    ):
+        return True
+    return False
 
-    ``FileNotFoundError``(src が無い等)は再試行しても無意味なのでそのまま送出する。
-    試行を使い切ったら ``ReplaceFailed``(OSError のサブクラス)。
+
+def replace_file(
+    src, dst, *,
+    retries: int | None = None,
+    delay: float | None = None,
+    timeout_s: float | None = None,
+    sleep_fn=None,
+    clock_fn=None,
+) -> None:
+    """``os.replace(src, dst)`` を共有違反に限って再試行する。
+
+    既定は合計 ``REPLACE_TIMEOUT_S`` 秒まで、間隔 ``REPLACE_DELAY_S`` 秒。
+    ``retries`` を渡す(または ``REPLACE_RETRIES`` が整数)ときは回数上限。
+    ``FileNotFoundError`` と共有違反以外の ``OSError`` はすぐ送出する。
+    時間/回数を使い切ったら ``ReplaceFailed``。
+    ``sleep_fn`` / ``clock_fn`` で壁時計を注入できる。
     """
-    attempts = max(1, int(REPLACE_RETRIES if retries is None else retries))
-    delay = REPLACE_DELAY_S if delay is None else delay
+    sleep = time.sleep if sleep_fn is None else sleep_fn
+    clock = time.monotonic if clock_fn is None else clock_fn
+    delay_s = REPLACE_DELAY_S if delay is None else float(delay)
+    retry_n = REPLACE_RETRIES if retries is None else retries
     last: Exception | None = None
-    for i in range(attempts):
+
+    if retry_n is not None:
+        attempts = max(1, int(retry_n))
+        for i in range(attempts):
+            try:
+                os.replace(src, dst)
+                return
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                last = exc
+                if not is_retryable_replace_error(exc):
+                    raise
+                if i + 1 < attempts:
+                    sleep(delay_s)
+        raise ReplaceFailed("os.replace が {0} 回失敗しました: {1}: {2}".format(
+            attempts, os.path.basename(str(dst)), last)) from last
+
+    limit = REPLACE_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    deadline = clock() + limit
+    attempts = 0
+    while True:
+        attempts += 1
         try:
             os.replace(src, dst)
             return
@@ -437,7 +487,14 @@ def replace_file(src, dst, *, retries: int | None = None, delay: float | None = 
             raise
         except OSError as exc:
             last = exc
-            if i + 1 < attempts:
-                time.sleep(delay)
-    raise ReplaceFailed("os.replace が {0} 回失敗しました: {1}: {2}".format(
-        attempts, os.path.basename(str(dst)), last)) from last
+            if not is_retryable_replace_error(exc):
+                raise
+            now = clock()
+            if now >= deadline:
+                raise ReplaceFailed("os.replace が {0} 回失敗しました: {1}: {2}".format(
+                    attempts, os.path.basename(str(dst)), last)) from last
+            sleep(delay_s)
+            later = clock()
+            if later <= now and delay_s <= 0:
+                raise ReplaceFailed("os.replace が {0} 回失敗しました: {1}: {2}".format(
+                    attempts, os.path.basename(str(dst)), last)) from last

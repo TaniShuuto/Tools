@@ -180,3 +180,48 @@ D2b マージ前に直した 3 点。
 変換中に「別名で保存」するとシーンの識別子が変わり、完了時に切り替えが見送られる
 (`scene_changed`)。同じシーンのまま保存し直した場合も、Maya が返すシーン名が
 ジョブ記録時と完了時で食い違えば同様に見送る。
+
+## I13. R1 指摘 1〜10 の修正(D2e)
+
+独立レビュー R1 の修正対象(High/Medium/Low の指定分)を直した。実機は未実行。
+
+1. ロック待ち: `lock_timeout_s` の既定をジョブの `timeout_s` にした(統合は 1200)。
+   同一 TS が `_jobs` にあるときは新しいジョブを作らず、status は変えず空文字を返す。
+   統合は `MSG_ALREADY_RUNNING`(このテクスチャセットは変換中です)。他 TS は続行。
+   ロック待ち失敗で `FAILED` を書く前に `latest_generation` を見る。自分より新しければ
+   status は書かず終了コード 10(I4 と同じ「より新しい世代を残す」)。同じ世代なら
+   従来どおり 12。
+2. 公開ロールバック: undo が 1 件でも失敗したら `_sync_complete.flag` を戻さず削除する。
+   無いことを「未完了」とし、次の変換が強制終了後と同じ経路で復帰できるようにする。
+   戻すと新旧混在が旧世代の完了印に見えるため。`os.replace` の再試行は共有違反だけ、
+   合計約 5 秒。`ENOSPC` はすぐ失敗。
+3. ワーカーが status を書かずに死んだとき、`_finish_job` が `FAILED`(終了コード N)を書く。
+   終端状態を同じ世代以上で書いていれば上書きしない。終了コード 10 は触らない。
+   `poll` の最後に `_jobs` に無い CONVERTING を `recover_orphaned` と同じ考えで回収する。
+4. 台帳 `outputs` のキーはファイル名だけ。`..` や区切りは無視して警告。解決後は
+   `uvremap_root/output` 配下に限る。
+5. Windows では入力名を大小無視。コピーは一覧の実名。他 OS は従来どおり。
+6. ファイルノード切替/復帰を `undoInfo(stateWithoutFlush=False)` で囲む
+   (`reload_textures` と同じ保存→戻す)。偽物の cmds では通す。
+7. 再インストールの窓破棄で `_uvremap.shutdown()` を try/except 付きで呼ぶ。
+8. 予約名/末尾ドット空白/`<>"|?*`/長さをワーカーの `_safe_component` でも拒否
+   (終了 11)。名前空間の `:` は従来どおり 12。
+9. Qt は `maya_live_sync.py` と同じく PySide2 → PySide6。R1 の「PySide6 が先」は
+   uvremap 側の当時の順で、Live Sync 本体は当初から PySide2 が先だった。
+10. 操作者向けの重複文言は `uvremap_runtime.py` に集め、統合は import。runtime 冒頭の
+    「maya_live_sync.py は変更しない」は PR #18 で最小変更済み、と直した。
+    成功 poll の偽 Popen は `status.json` に `CONVERTED_OK` を書く。
+
+## I14. 記録のみ: ロック待ちを長くしたあとの合計時間
+
+ロック取得は `timeout_s`(ウォッチドッグ)に含まれない。TS を並列起動しても
+`worker.lock` で直列化するため、TS が多いと待ち+変換の合計が `timeout_s` を
+超え得る。並列数の上限や一括化は後続(I10 と同じ)。
+
+## I15. 記録のみ: このタスクでやらなかった R1 項目
+
+- R1-07 名前空間付きシェーダー名: Painter 側の TS 名が未確認。推測で正規化しない。
+- R1-05 `STALE` 表示、R1-06 品質判定、R1-11 Orig 位置: 設計判断または実機が先。
+- R1-15 プローブ侵食幅、R1-16 メモリ、R1-17 最小バージョン表記: 同上。
+- R1-19 個人情報(メール等): 導入改善の別作業。
+- `maya_live_sync.py` / `sp_live_sync_plugin.py` は変更していない。

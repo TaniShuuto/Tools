@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import os
 import struct
 import subprocess
@@ -550,9 +551,14 @@ def test_png_performance_4096(tmp_path, filters, bit_depth, channels, capsys):
 class _FakeTime:
     def __init__(self):
         self.sleeps = []
+        self.now = 0.0
 
     def sleep(self, s):
         self.sleeps.append(s)
+        self.now += s
+
+    def monotonic(self):
+        return self.now
 
 
 def test_replace_file_retries_then_succeeds(tmp_path, monkeypatch):
@@ -572,10 +578,10 @@ def test_replace_file_retries_then_succeeds(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "replace", flaky)
     monkeypatch.setattr(uvremap_io, "time", ft)
     uvremap_io.replace_file(a, b)
-    assert len(calls) == 3 and ft.sleeps == [0.2, 0.2] and b.read_text() == "new"
+    assert len(calls) == 3 and ft.sleeps == [0.25, 0.25] and b.read_text() == "new"
 
 
-def test_replace_file_default_is_five_tries_then_raises(tmp_path, monkeypatch):
+def test_replace_file_sharing_violation_retries_until_timeout(tmp_path, monkeypatch):
     a, b = tmp_path / "a", tmp_path / "b"
     a.write_text("new")
     b.write_text("old")
@@ -590,8 +596,52 @@ def test_replace_file_default_is_five_tries_then_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(uvremap_io, "time", ft)
     with pytest.raises(uvremap_io.ReplaceFailed) as ei:
         uvremap_io.replace_file(a, b)
-    assert isinstance(ei.value, OSError) and len(calls) == 5 and ft.sleeps == [0.2] * 4
+    assert isinstance(ei.value, OSError)
+    assert ft.sleeps and all(s == 0.25 for s in ft.sleeps)
+    assert ft.now >= 5.0
+    assert len(calls) == len(ft.sleeps) + 1
     assert b.read_text() == "old" and a.read_text() == "new"  # どちらも壊さない
+
+
+def test_replace_file_enospc_is_not_retried(tmp_path, monkeypatch):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("new")
+    b.write_text("old")
+    calls = []
+
+    def full(s, d):
+        calls.append(1)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    ft = _FakeTime()
+    monkeypatch.setattr(os, "replace", full)
+    monkeypatch.setattr(uvremap_io, "time", ft)
+    with pytest.raises(OSError) as ei:
+        uvremap_io.replace_file(a, b)
+    assert ei.value.errno == errno.ENOSPC
+    assert len(calls) == 1 and ft.sleeps == []
+
+
+def test_replace_file_winerror_32_is_retried(tmp_path, monkeypatch):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("new")
+    b.write_text("old")
+    real = os.replace
+    calls = []
+
+    def flaky(s, d):
+        calls.append(1)
+        if len(calls) < 2:
+            err = OSError(13, "sharing violation")
+            err.winerror = 32
+            raise err
+        return real(s, d)
+
+    ft = _FakeTime()
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(uvremap_io, "time", ft)
+    uvremap_io.replace_file(a, b, sleep_fn=ft.sleep, clock_fn=ft.monotonic)
+    assert len(calls) == 2 and ft.sleeps == [0.25] and b.read_text() == "new"
 
 
 def test_replace_file_missing_source_is_not_retried(tmp_path, monkeypatch):
