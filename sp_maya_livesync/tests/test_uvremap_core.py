@@ -1190,3 +1190,386 @@ class TestConvertGeometry:
             for t in ref.tiles:
                 np.testing.assert_array_equal(r.tiles[t], ref.tiles[t])
                 np.testing.assert_array_equal(r.coverage[t], ref.coverage[t])
+
+
+# ============================================================================
+# テスト: convert_channel(色空間・チャンネル種別・パディング・除外面)
+# ============================================================================
+
+def _half_texel_case(res=64):
+    """左半分が 0、右半分が 1 の1枚板を、半テクセルだけ U 方向へ動かして変換する構成。"""
+    pl = plates(1, 1, 1, quads=True)
+    d = 0.5 / res
+    old = {0: ("id", (0.5, 0.5), (0.25, 0.25))}
+    new = {0: ("id", (0.5, 0.5), (0.25 + d, 0.25))}
+    A = snap_of(pl, apply_layout(pl, old))
+    B = with_uv(A, apply_layout(pl, new))
+    tile = np.zeros((res, res, 3), np.float32)
+    tile[:, res // 2:] = 1.0
+    return A, B, {1001: tile}, uvc.classify(A, B, "Body")
+
+
+class TestColorspaceAndChannels:
+    def test_srgb_interpolates_in_linear_light_and_raw_does_not(self):
+        A, B, old, d = _half_texel_case()
+        # 新テクセル x=32 は旧の x=31.5 を引くので、0 と 1 の中点になる
+        raw = uvc.convert_channel(old, A, B, "Body", d, uvc.ChannelSpec("Roughness", "raw", "scalar"), 64)
+        srgb = uvc.convert_channel(old, A, B, "Body", d, uvc.ChannelSpec("BaseColor", "srgb", "color"), 64)
+        y = 32
+        np.testing.assert_allclose(raw.tiles[1001][y, 32], 0.5, atol=1e-4)
+        want = float(uvc.linear_to_srgb(np.float32(0.5)))             # 0.7354
+        np.testing.assert_allclose(srgb.tiles[1001][y, 32], want, atol=1e-4)
+        assert want - 0.5 > 0.2                                        # 取り違えると大きくずれる
+        # 一様領域は色空間に依らず保存される
+        np.testing.assert_allclose(srgb.tiles[1001][y, 48], 1.0, atol=1e-5)
+        np.testing.assert_allclose(srgb.tiles[1001][y, 20], 0.0, atol=1e-5)
+
+    def test_srgb_transfer_functions_roundtrip(self):
+        x = np.linspace(0, 1, 101, dtype=np.float32)
+        np.testing.assert_allclose(uvc.linear_to_srgb(uvc.srgb_to_linear(x)), x, atol=2e-6)
+        assert uvc.srgb_to_linear(np.float32(0.5)) == pytest.approx(0.2140, abs=1e-3)
+
+    def test_alpha_channel_is_not_linearised(self):
+        A, B, old, d = _half_texel_case()
+        rgba = np.concatenate([old[1001], old[1001][..., :1]], axis=2)       # A は 0/1 の階段
+        r = uvc.convert_channel({1001: rgba}, A, B, "Body", d,
+                                uvc.ChannelSpec("BaseColor", "srgb", "color"), 64)
+        assert r.tiles[1001].shape[2] == 4
+        np.testing.assert_allclose(r.tiles[1001][32, 32, 3], 0.5, atol=1e-4)   # アルファは生値
+        assert r.tiles[1001][32, 32, 0] > 0.7
+
+    def test_single_channel_and_2d_and_integer_inputs(self):
+        A, B, old, d = _half_texel_case()
+        spec = uvc.ChannelSpec("Roughness", "raw", "scalar")
+        ref = uvc.convert_channel({1001: old[1001][..., :1]}, A, B, "Body", d, spec, 64)
+        assert ref.tiles[1001].shape == (64, 64, 1)
+        r2d = uvc.convert_channel({1001: old[1001][..., 0]}, A, B, "Body", d, spec, 64)
+        np.testing.assert_array_equal(r2d.tiles[1001], ref.tiles[1001])
+        u8 = (old[1001][..., :1] * 255).astype(np.uint8)
+        r8 = uvc.convert_channel({1001: u8}, A, B, "Body", d, spec, 64)
+        np.testing.assert_allclose(r8.tiles[1001], ref.tiles[1001], atol=1e-6)
+        u16 = (old[1001][..., :1] * 65535).astype(np.uint16)
+        r16 = uvc.convert_channel({1001: u16}, A, B, "Body", d, spec, 64)
+        np.testing.assert_allclose(r16.tiles[1001], ref.tiles[1001], atol=1e-6)
+
+    def test_bad_inputs_raise_typed_errors(self):
+        A, B, old, d = _half_texel_case()
+        spec = uvc.ChannelSpec("Roughness", "raw", "scalar")
+        with pytest.raises(uvc.ChannelFormatError):
+            uvc.convert_channel({}, A, B, "Body", d, spec, 64)
+        with pytest.raises(uvc.ChannelFormatError):
+            uvc.convert_channel({1001: np.zeros((4, 4, 3, 2))}, A, B, "Body", d, spec, 64)
+        with pytest.raises(uvc.ChannelFormatError):
+            uvc.convert_channel({1001: old[1001], 1002: old[1001][..., :1]}, A, B, "Body", d, spec, 64)
+        with pytest.raises(uvc.ChannelFormatError):                    # 法線に 1 チャンネル
+            uvc.convert_channel({1001: old[1001][..., :1]}, A, B, "Body", d,
+                                uvc.ChannelSpec("Normal", "raw", "normal"), 64)
+        with pytest.raises(uvc.TextureSetNotFound):
+            uvc.convert_channel(old, A, B, "Nope", d, spec, 64)
+        with pytest.raises(ValueError):
+            uvc.ChannelSpec("X", "linear", "color")
+        with pytest.raises(ValueError):
+            uvc.ChannelSpec("X", "raw", "mask")
+        with pytest.raises(ValueError):
+            uvc.convert_channel(old, A, B, "Body", d, spec, 64, normal_mode="3d")
+
+    def test_flipped_decision_gives_identical_colour_and_flags_normals(self):
+        pl = plates(2, 4, 4, quads=True)
+        A = snap_of(pl, apply_layout(pl, PLATE_LAYOUT))
+        B = with_uv(A, apply_layout(pl, {0: ("rot90", (0.4, 0.4), (0.1, 0.5)),
+                                         1: ("id", (0.4, 0.4), (0.5, 0.5))}))
+        F = reverse_faces(B)
+        oldt, oldm = bake(A, "Body", 64, f_smooth)
+        old = pad_tiles(oldt, oldm)
+        color = uvc.ChannelSpec("BaseColor", "raw", "color")
+        r_f = uvc.convert_channel(old, A, B, "Body", uvc.classify(A, B, "Body"), color, 64)
+        r_ff = uvc.convert_channel(old, A, F, "Body", uvc.classify(A, F, "Body"), color, 64)
+        np.testing.assert_array_equal(r_f.tiles[1001], r_ff.tiles[1001])
+        assert "normals_flipped_approx" not in r_ff.stats["warnings"]
+        nrm = uvc.ChannelSpec("Normal", "raw", "normal")
+        rn = uvc.convert_channel(old, A, F, "Body", uvc.classify(A, F, "Body"), nrm, 64)
+        assert "normals_flipped_approx" in rn.stats["warnings"] and rn.stats["method"] == "F_FLIPPED"
+
+
+class TestPadding:
+    def test_source_padding_is_required_for_accurate_seams(self):
+        padded = get_case("A", "B", "smooth", 256)
+        bare = get_case("A", "B", "smooth", 256, pad=False)
+        gt, gm = padded.gt
+        r_pad, r_bare = padded.convert(), bare.convert()
+        seam_pad = psnr(r_pad.tiles, gt, gm, "seam")
+        seam_bare = psnr(r_bare.tiles, gt, gm, "seam")
+        assert seam_pad >= 50, seam_pad                       # 試作の実測 69 dB(1024²)、256² で約 61 dB
+        assert seam_bare < 30, seam_bare                      # パディング無しでは大きく劣化する(約 15 dB)
+        assert psnr(r_bare.tiles, gt, gm, "interior") >= 70   # 内部は影響を受けない
+
+    def test_output_is_dilated_by_dilate_px(self):
+        c = get_case("A", "B", "smooth", 256)
+        for px in (0, 4, 16):
+            r = c.convert(dilate_px=px)
+            for t, cov in r.coverage.items():
+                painted = r.tiles[t].sum(axis=-1) != 0
+                np.testing.assert_array_equal(painted, _dil(cov, px), err_msg=f"dilate_px={px} tile={t}")
+        # 既定は 16 px
+        r16, rdef = c.convert(dilate_px=16), c.convert()
+        np.testing.assert_array_equal(r16.tiles[1001], rdef.tiles[1001])
+        # coverage は膨張前のラスタライズ範囲で、dilate_px に依らない
+        np.testing.assert_array_equal(c.convert(dilate_px=0).coverage[1001], rdef.coverage[1001])
+
+    def test_dilation_does_not_touch_covered_texels(self):
+        c = get_case("A", "B", "smooth", 256)
+        r0, r16 = c.convert(dilate_px=0), c.convert(dilate_px=16)
+        for t in r0.tiles:
+            np.testing.assert_array_equal(r0.tiles[t][r0.coverage[t]], r16.tiles[t][r0.coverage[t]])
+
+    def test_normal_map_background_is_flat_normal(self):
+        c = get_case("A", "B", None, 256, kind="normal")
+        r = c.convert(dilate_px=0)
+        for t, cov in r.coverage.items():
+            bg = r.tiles[t][~cov]
+            np.testing.assert_allclose(bg, np.broadcast_to([0.5, 0.5, 1.0], bg.shape))
+
+
+class TestExcludedFaces:
+    @staticmethod
+    def _plates_case(nan_in="current", nonmanifold=True):
+        pl = plates(2, 3, 3, quads=True)
+        old = {0: ("id", (0.4, 0.4), (0.05, 0.05)), 1: ("id", (0.4, 0.4), (0.55, 0.05))}
+        new = {0: ("rot90", (0.4, 0.4), (0.05, 0.55)), 1: ("mirror", (0.4, 0.4), (0.55, 0.55))}
+        uv_o, uv_n = apply_layout(pl, old), apply_layout(pl, new)
+        offs = np.cumsum(pl.counts) - pl.counts
+        vid = pl.vid.copy()
+        f_nm, f_nan = 4, 12                                    # 板0 の中央 / 板1 の中の1枚
+        if nonmanifold:
+            vid[offs[f_nm] + 2] = vid[offs[f_nm]]
+        (uv_n if nan_in == "current" else uv_o)[offs[f_nan]:offs[f_nan] + 4] = np.nan
+        A = uvc.make_snapshot(pl.counts, vid, pl.pos, uv_o)
+        B = uvc.make_snapshot(pl.counts, vid, pl.pos, uv_n, tri_face=A.tri_face, tri_corner=A.tri_corner)
+        return pl, A, B, uv_n, offs, f_nm, f_nan
+
+    @pytest.mark.parametrize("nan_in", ["current", "baseline"])
+    def test_no_uv_and_non_manifold_faces_are_skipped_and_reported(self, nan_in):
+        pl, A, B, uv_n, offs, f_nm, f_nan = self._plates_case(nan_in)
+        assert uvc.classify(A, B, "default").method == "F"
+        oldt, oldm = bake(snap_of(pl, apply_layout(pl, {0: ("id", (0.4, 0.4), (0.05, 0.05)),
+                                                        1: ("id", (0.4, 0.4), (0.55, 0.05))})),
+                          "Body", 128, f_smooth)
+        old = pad_tiles(oldt, oldm)
+        r = uvc.convert_channel(old, A, B, "default", uvc.classify(A, B, "default"),
+                                uvc.ChannelSpec("BaseColor", "raw", "color"), 128, dilate_px=0)
+        st = r.stats
+        assert st["faces_without_uv"] == 1 and st["faces_non_manifold"] == 1
+        assert st["faces_converted"] == pl.n_face - 2
+        assert {"faces_without_uv", "non_manifold_faces"} <= set(st["warnings"])
+        # 除外した面の中心テクセルは未被覆。他の面の中心は被覆される。
+        cov = r.coverage[1001]
+        for f in range(pl.n_face):
+            if f == f_nan and nan_in == "current":
+                continue                                        # 新UVが無いので位置を決められない
+            c = uv_n[offs[f]:offs[f] + 4]
+            if not np.isfinite(c).all():
+                continue
+            u, v = c.mean(axis=0)
+            x, y = int(u * 128), int((1 - v) * 128)
+            assert cov[y, x] == (f not in (f_nm, f_nan)), f"face {f}"
+
+    def test_faces_without_source_texture_or_dropped(self):
+        pl = plates(2, 3, 3, quads=True)
+        old = {0: ("id", (0.4, 0.4), (0.05, 0.05)), 1: ("id", (0.4, 0.4), (0.55, 0.05))}
+        new = {0: ("rot90", (0.4, 0.4), (0.05, 0.55)), 1: ("id", (0.4, 0.4), (0.55, 0.55))}
+        uv_o, uv_n = apply_layout(pl, old), apply_layout(pl, new)
+        half, n = pl.n_face // 2, pl.n_face
+        base = uvc.make_snapshot(pl.counts, pl.vid, pl.pos, uv_o, ts_faces={"T": np.arange(half)})
+        # 現行は TS に 3 面を足し、1 面を外した(マテリアル再割当)
+        cur_ids = np.r_[np.arange(1, half), half, half + 1, half + 2]
+        cur = uvc.make_snapshot(pl.counts, pl.vid, pl.pos, uv_n, ts_faces={"T": cur_ids},
+                                tri_face=base.tri_face, tri_corner=base.tri_corner)
+        d = uvc.classify(base, cur, "T")
+        assert d.method == "F" and any("ts_faces_changed" in w for w in d.warnings)
+        oldt, oldm = bake(base, "T", 64, f_smooth)
+        r = uvc.convert_channel(pad_tiles(oldt, oldm), base, cur, "T", d,
+                                uvc.ChannelSpec("BaseColor", "raw", "color"), 64)
+        assert r.stats["faces_no_source"] == 3 and r.stats["faces_dropped"] == 1
+        assert r.stats["faces_converted"] == half - 1 and "faces_no_source" in r.stats["warnings"]
+
+    def test_empty_conversion_raises(self):
+        pl = plates(1, 2, 2, quads=True)
+        uv = apply_layout(pl, {0: ("id", (0.5, 0.5), (0.1, 0.1))})
+        A = uvc.make_snapshot(pl.counts, pl.vid, pl.pos, uv)
+        nan = uv.copy()
+        nan[:] = np.nan
+        B = uvc.make_snapshot(pl.counts, pl.vid, pl.pos, nan, tri_face=A.tri_face, tri_corner=A.tri_corner)
+        with pytest.raises(uvc.ConversionStopped) as ei:
+            uvc.convert_channel({1001: np.zeros((16, 16, 3), np.float32)}, A, B, "default",
+                                uvc.classify(A, B, "default"),
+                                uvc.ChannelSpec("Roughness", "raw", "scalar"), 16)
+        assert ei.value.reasons == ["no_convertible_faces"]
+
+
+class TestTextureSetsAndMeshes:
+    def test_two_meshes_two_texture_sets_convert_independently(self):
+        _, base = multi_snapshot()
+        sph, pl = cube_sphere(4), plates(2, 3, 3, quads=True)
+        new_sph = apply_layout(sph, LAYOUT_B)
+        new_pl = apply_layout(pl, {0: ("rot90", (0.4, 0.4), (0.1, 1.1)), 1: ("mirror", (0.4, 0.4), (1.1, 1.1))})
+        cur = with_uv(base, np.concatenate([new_sph, new_pl]))
+        assert uvc.classify(base, cur, "Body").method == "F"
+        assert uvc.classify(base, cur, "Plate").method == "F"
+        for ts, want_tiles in (("Body", {1001, 1002}), ("Plate", {1011, 1012})):
+            oldt, oldm = bake(base, ts, 128, f_smooth)
+            gt, gm = bake(cur, ts, 128, f_smooth)
+            r = uvc.convert_channel(pad_tiles(oldt, oldm), base, cur, ts, uvc.classify(base, cur, ts),
+                                    uvc.ChannelSpec("BaseColor", "raw", "color"), 128)
+            assert set(r.tiles) == set(gt) == want_tiles, ts      # 他方の TS のタイルが混ざらない
+            assert psnr(r.tiles, gt, gm, "interior") > 60, ts
+            assert r.stats["faces_total_ts"] == len(base.faces_of(ts))
+
+
+# ============================================================================
+# テスト: 法線マップ
+# ============================================================================
+
+def normal_errors(case, result):
+    """変換結果と、新UVで直接焼いた法線(GT)の角度誤差 [deg](内部テクセル)。"""
+    gt, gm = case.gt
+    e = []
+    for t in gt:
+        inner = _shrink(gm[t], 2)
+        e.append(angle_err_deg(result.tiles[t][inner], gt[t][inner]))
+    return np.concatenate(e)
+
+
+class TestNormals:
+    @pytest.mark.parametrize("dst,off_min", [("rot90", 10.0), ("rot180", 15.0), ("rot270", 10.0),
+                                             ("mirror", 8.0), ("flipv", 8.0),
+                                             ("rot270_mirror", 10.0), ("B", 8.0)])
+    def test_uv_jacobian_correction_vs_none(self, dst, off_min):
+        """補正あり: 平均 2° 以下(試作: 0.05〜1.7°)。補正なし: 回転・反転で大きくずれる。"""
+        c = get_case("A", dst, None, 256, kind="normal")
+        e_uv = normal_errors(c, c.convert(normal_mode="uv"))
+        e_off = normal_errors(c, c.convert(normal_mode="off"))
+        assert e_uv.mean() <= 2.0, e_uv.mean()
+        assert np.percentile(e_uv, 99) <= 8.0
+        assert e_off.mean() >= off_min, e_off.mean()
+        assert e_off.mean() > 5 * e_uv.mean()
+
+    def test_translation_and_uniform_scale_need_no_correction(self):
+        c = get_case("A", "scaled", None, 256, kind="normal")
+        e_uv = normal_errors(c, c.convert(normal_mode="uv"))
+        e_off = normal_errors(c, c.convert(normal_mode="off"))
+        assert e_uv.mean() < 0.2 and e_off.mean() < 0.2
+
+    def test_reverse_direction_and_chained_layouts(self):
+        c = get_case("B", "A", None, 256, kind="normal")
+        assert normal_errors(c, c.convert()).mean() <= 2.0
+
+    def test_output_normals_are_unit_length(self):
+        c = get_case("A", "rot90", None, 256, kind="normal")
+        r = c.convert()
+        for t, cov in r.coverage.items():
+            n = r.tiles[t][cov] * 2 - 1
+            np.testing.assert_allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-4)
+
+    def test_green_down_convention(self):
+        """Normal_DirectX(Y 下向き)のマップは normal_green_down=True で正しく補正される。"""
+        c = get_case("A", "rot90", None, 256, kind="normal", green_down=True)
+        e_ok = normal_errors(c, c.convert())                       # spec.normal_green_down=True
+        assert e_ok.mean() <= 2.0
+        wrong = uvc.ChannelSpec("Normal", "raw", "normal", normal_green_down=False)
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, wrong, 256)
+        assert normal_errors(c, r).mean() > 5.0                    # 規約を取り違えると補正が逆回りになる
+
+    def test_extra_channel_is_passed_through(self):
+        """RGBA の法線マップ: 4つ目のチャンネル(高さ等)は補正せず補間だけする。"""
+        c = get_case("A", "rot90", None, 128, kind="normal")
+        extra = {t: np.concatenate([a, np.full(a.shape[:2] + (1,), 0.25, np.float32)], axis=2)
+                 for t, a in c.old.items()}
+        r = uvc.convert_channel(extra, c.A, c.B, "Body", c.decision, c.spec, 128)
+        for t, cov in r.coverage.items():
+            assert r.tiles[t].shape[2] == 4
+            np.testing.assert_allclose(r.tiles[t][cov][:, 3], 0.25, atol=1e-5)
+
+
+# ============================================================================
+# テスト: 精度回帰 / 決定性 / 原本からの変換
+# ============================================================================
+
+class TestAccuracyRegression:
+    @pytest.mark.parametrize("dst", ["B", "rot90", "mirror", "rot270_mirror"])
+    def test_smooth_signal_interior_psnr_at_least_90db(self, dst):
+        """設計書 付録A / 契約 D-5.5: 方式F・平滑信号の内部PSNR >= 90 dB(1024²、パディング有)。"""
+        c = get_case("A", dst, "smooth", 1024)
+        r = c.convert()
+        gt, gm = c.gt
+        pi = psnr(r.tiles, gt, gm, "interior")
+        ps = psnr(r.tiles, gt, gm, "seam")
+        assert pi >= 90.0, f"{dst}: interior {pi:.1f} dB"
+        assert ps >= 55.0, f"{dst}: seam {ps:.1f} dB"             # 試作: 69 dB
+
+    def test_detail_signal_psnr_floor(self):
+        """細部(チェッカー x 擬似文字)は再サンプリングでぼける。試作 22 dB に対し 18 dB を下限とする。"""
+        c = get_case("A", "B", "detail", 512)
+        r = c.convert()
+        gt, gm = c.gt
+        assert psnr(r.tiles, gt, gm, "interior") >= 18.0
+
+    def test_higher_source_resolution_helps_detail(self):
+        """元解像度を上げると細部の再現が良くなる(試作: 約 +3 dB / 倍)。"""
+        lo = get_case("A", "B", "detail", 256)
+        hi = get_case("A", "B", "detail", 512)
+        gt, gm = lo.gt
+        r_hi = uvc.convert_channel(hi.old, hi.A, hi.B, "Body", hi.decision, hi.spec, 256)
+        assert psnr(r_hi.tiles, gt, gm, "interior") > psnr(lo.convert().tiles, gt, gm, "interior") + 1.0
+
+    def test_same_input_gives_bit_identical_output(self):
+        c = get_case("A", "B", "detail", 256)
+        r1 = c.convert()
+        r2 = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, 256, udim=True)
+        assert sorted(r1.tiles) == sorted(r2.tiles)
+        for t in r1.tiles:
+            np.testing.assert_array_equal(r1.tiles[t], r2.tiles[t])
+            np.testing.assert_array_equal(r1.coverage[t], r2.coverage[t])
+
+    def test_conversion_does_not_modify_its_inputs(self):
+        c = get_case("A", "B", "smooth", 128)
+        before = {t: a.copy() for t, a in c.old.items()}
+        snap_before = (c.A.corner_uv.copy(), c.B.corner_uv.copy())
+        uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, 128)
+        for t in before:
+            np.testing.assert_array_equal(c.old[t], before[t])
+        np.testing.assert_array_equal(c.A.corner_uv, snap_before[0])
+        np.testing.assert_array_equal(c.B.corner_uv, snap_before[1])
+
+    @pytest.mark.parametrize("target,min_gain_db", [("A", 20.0), ("mirror", 3.0)])
+    def test_converting_from_the_original_does_not_accumulate_loss(self, target, min_gain_db):
+        """A→B→C(連鎖)は A→C(原本から)より大きく劣化する。原本から変換すれば経由した世代に依存しない。
+
+        target="A" は UV 編集を元に戻した場合: 原本から変換すれば(ほぼ)完全に元通りになる。
+        """
+        res = 512
+        m = cube_sphere(10)
+        A = snap_of(m, apply_layout(m, LAYOUT_A))
+        B = with_uv(A, apply_layout(m, LAYOUT_B))
+        C = with_uv(A, apply_layout(m, LAYOUTS[target]))
+        spec = uvc.ChannelSpec("BaseColor", "srgb", "color")
+
+        def q8(tiles):                                       # 8bit 保存を模す
+            return {t: np.round(a * 255) / 255 for t, a in tiles.items()}
+
+        oldt, oldm = bake(A, "Body", res, f_detail)
+        orig = q8(pad_tiles(oldt, oldm))
+        gt_c, gm_c = bake(C, "Body", res, f_detail)
+        # 原本から C へ(B を一度も経由しない)
+        direct = uvc.convert_channel(orig, A, C, "Body", uvc.classify(A, C, "Body"), spec, res)
+        # 原本 → B(保存) → C
+        r_b = uvc.convert_channel(orig, A, B, "Body", uvc.classify(A, B, "Body"), spec, res)
+        chained = uvc.convert_channel(q8(r_b.tiles), B, C, "Body", uvc.classify(B, C, "Body"), spec, res)
+        p_direct = psnr(q8(direct.tiles), gt_c, gm_c, "interior")
+        p_chain = psnr(q8(chained.tiles), gt_c, gm_c, "interior")
+        assert p_direct > p_chain + min_gain_db, (p_direct, p_chain)
+        if target == "A":
+            assert p_direct > 50.0                           # 元のレイアウトへ戻せば、ほぼ無損失
+        # 原本から変換し直しても結果は同じ(世代を重ねても劣化しない)
+        again = uvc.convert_channel(orig, A, C, "Body", uvc.classify(A, C, "Body"), spec, res)
+        for t in direct.tiles:
+            np.testing.assert_array_equal(direct.tiles[t], again.tiles[t])
