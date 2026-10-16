@@ -464,7 +464,7 @@ def test_build_job_defaults_and_required_keys(tmp_path):
 
 
 def test_write_job_is_atomic_and_readable(tmp_path):
-    job = br.build_job(**_job_kwargs(tmp_path), quality="live")
+    job = br.build_job(**_job_kwargs(tmp_path, quality="live"))
     path = tmp_path / "jobs" / "j1" / "job.json"
     written = br.write_job(job, path)
     assert written == path
