@@ -538,8 +538,24 @@ def get_case(src, dst, signal="smooth", res=256, **kw):
     return _CASE_CACHE[key]
 
 
+LAYOUT_STRADDLE = dict(LAYOUT_A)       # シェル2が u=0.86..1.16 でタイル境界をまたぐ(他と重ならない)
+LAYOUT_STRADDLE[2] = ("id", (0.30, 0.30), (0.86, 0.05))
+LAYOUT_OVERLAP = dict(LAYOUT_A)        # シェル1をシェル0に重ねる
+LAYOUT_OVERLAP[1] = LAYOUT_OVERLAP[0]
+LAYOUT_WRAPPED = {                     # 非UDIM向け: 0..1 の外(正・負)へ出したシェル
+    0: ("id", (0.30, 0.30), (1.02, 0.05)),
+    1: ("id", (0.30, 0.30), (0.35, 2.05)),
+    2: ("id", (0.30, 0.30), (-0.32, 0.05)),
+    3: ("id", (0.30, 0.30), (3.02, 5.55)),
+    4: ("id", (0.30, 0.30), (0.35, 0.55)),
+    5: ("id", (0.30, 0.30), (0.68, 0.55)),
+}
+
 LAYOUTS = {
     "A": LAYOUT_A,
+    "straddle": LAYOUT_STRADDLE,
+    "overlap": LAYOUT_OVERLAP,
+    "wrapped": LAYOUT_WRAPPED,
     "B": LAYOUT_B,
     "rot90": uniform_layout("rot90"),
     "rot180": uniform_layout("rot180"),
@@ -955,3 +971,222 @@ class TestClassify:
         with pytest.raises(uvc.ConversionStopped):
             uvc.convert_channel({1001: np.zeros((8, 8, 3), np.float32)}, A, B, "Body",
                                 uvc.Decision("P"), spec, 8)
+
+
+# ============================================================================
+# テスト: convert_channel(幾何)
+# ============================================================================
+
+def _dil(mask, k):
+    """8近傍の膨張を k 回(画像の外は無効)。"""
+    m = mask
+    H, W = m.shape
+    for _ in range(k):
+        pad = np.zeros((H + 2, W + 2), bool)
+        pad[1:-1, 1:-1] = m
+        out = m.copy()
+        for dy in range(3):
+            for dx in range(3):
+                out |= pad[dy:dy + H, dx:dx + W]
+        m = out
+    return m
+
+
+def check_against_gt(case, res=None, *, interior_db=70.0, seam_db=45.0, cov_mismatch=0.002, **kw):
+    """変換結果が地上真値(新UVで直接焼いたもの)と一致するか。タイル集合・被覆・PSNR を確認する。"""
+    r = res or case.convert(**kw)
+    gt, gm = case.gt
+    assert sorted(r.tiles) == sorted(gt), "出力タイルの集合が新UVのタイルと一致しない"
+    assert sorted(r.coverage) == sorted(gt)
+    for t in gt:
+        assert r.tiles[t].shape == gt[t].shape and r.tiles[t].dtype == np.float32
+        diff = (r.coverage[t] != gm[t]).sum()
+        assert diff <= cov_mismatch * gm[t].sum() + 2, f"tile {t}: coverage differs in {diff} texels"
+    pi = psnr(r.tiles, gt, gm, "interior")
+    ps = psnr(r.tiles, gt, gm, "seam")
+    assert pi >= interior_db, f"interior PSNR {pi:.1f} dB < {interior_db}"
+    assert ps >= seam_db, f"seam PSNR {ps:.1f} dB < {seam_db}"
+    return pi, ps
+
+
+class TestConvertGeometry:
+    @pytest.mark.parametrize("dst", ["A", "scaled", "rot90", "rot180", "rot270", "mirror", "flipv",
+                                     "rot270_mirror", "B"])
+    def test_shell_transforms_from_layout_A(self, dst):
+        """移動・拡大・90°回転・180°回転・反転(左右/上下)・それらの組み合わせ。"""
+        check_against_gt(get_case("A", dst, "smooth", 256))
+
+    def test_identity_remap_reproduces_the_image(self):
+        c = get_case("A", "A", "smooth", 256)
+        r = c.convert()
+        gt, gm = c.gt
+        for t in gt:
+            inner = _shrink(gm[t], 1)
+            assert np.abs(r.tiles[t][inner] - c.old[t][inner]).max() < 5e-4
+
+    def test_udim_move_changes_tile_set(self):
+        c = get_case("A", "B", "smooth", 256)            # 1 タイル → 2 タイル
+        assert sorted(c.convert().tiles) == [1001, 1002]
+        c = get_case("B", "A", "smooth", 256)            # 2 タイル → 1 タイル
+        r = c.convert()
+        assert sorted(r.tiles) == [1001]
+        check_against_gt(c)
+
+    def test_shells_stay_on_the_right_tile(self):
+        """各シェルのテクセルが、新UVが指すタイルに入っている(別タイルに漏れない)。"""
+        c = get_case("A", "B", "smooth", 256)
+        r = c.convert()
+        sm = c.shells()
+        # LAYOUT_B: シェル 3,4,5 は 1002、0,1,2 は 1001
+        for t, expect in ((1001, {0, 1, 2}), (1002, {3, 4, 5})):
+            got = set(np.unique(sm[t][r.coverage[t]]).tolist()) - {-1}
+            assert got == expect, (t, got)
+
+    def test_tile_boundary_uv_exactly_on_the_edge(self):
+        """旧・新ともに、シェルがタイル境界(u=1.0)ちょうどで終わる/始まる配置。"""
+        pl = plates(2, 4, 4, quads=True)
+        old = {0: ("id", (0.5, 0.5), (0.5, 0.0)), 1: ("id", (0.5, 0.5), (1.0, 0.0))}   # [0.5,1] | [1,1.5]
+        new = {0: ("id", (0.5, 0.5), (0.0, 0.5)), 1: ("id", (0.5, 0.5), (0.5, 0.5))}   # どちらも 1001
+        new2 = {0: ("rot90", (1.0, 1.0), (1.0, 0.0)), 1: ("id", (0.5, 0.5), (0.0, 0.0))}  # シェル0 = 1002 全面
+        for dst in (new, new2):
+            A = snap_of(pl, apply_layout(pl, old))
+            B = with_uv(A, apply_layout(pl, dst))
+            c = Case.__new__(Case)                       # 板用の Case(球を使わない)
+            c.res, c.udim, c.signal, c.kind, c.green_down, c.pad = 256, True, "smooth", "color", False, True
+            c.mesh, c.A, c.B = pl, A, B
+            c.decision = uvc.classify(A, B, "Body")
+            c.spec = uvc.ChannelSpec("BaseColor", "raw", "color")
+            c._old = c._gt = None
+            c._conv = {}
+            assert c.decision.method == "F"
+            r = c.convert()
+            keys = sorted(c.gt[0])
+            assert sorted(r.tiles) == keys and not (set(r.tiles) & {1003, 1011, 1012}), keys
+            check_against_gt(c, r, interior_db=60.0, seam_db=40.0)
+
+    def test_shell_spanning_the_tile_edge_is_split_across_tiles(self):
+        """UDIM 境界またぎ: 両方のタイルに正しく描かれ、stats に報告される。"""
+        c = get_case("A", "straddle", "smooth", 256)
+        r = c.convert()
+        assert sorted(r.tiles) == [1001, 1002]
+        assert r.stats["straddle_faces"] > 0 and "udim_straddle" in r.stats["warnings"]
+        assert r.stats["straddle_face_ids"]
+        check_against_gt(c, r, interior_db=60.0, seam_db=40.0)
+        # 旧UV側の境界またぎ(旧タイルが2枚に分かれている)も正しく読む
+        c2 = get_case("straddle", "A", "smooth", 256)
+        r2 = c2.convert()
+        assert "old_straddle" in r2.stats["warnings"]
+        check_against_gt(c2, r2, interior_db=60.0, seam_db=40.0)
+
+    def test_missing_source_tile_is_reported_not_raised(self):
+        c = get_case("B", "A", "smooth", 256)                  # 旧は 1001 + 1002
+        old = {1001: c.old[1001]}
+        r = uvc.convert_channel(old, c.A, c.B, "Body", c.decision, c.spec, 256)
+        assert r.stats["missing_tile_texels_total"] > 0 and "source_tile_missing" in r.stats["warnings"]
+        full = c.convert()
+        assert r.coverage[1001].sum() < full.coverage[1001].sum()      # 欠けた分は被覆から外れる
+
+    def test_non_udim_wraps_uv_into_the_unit_square(self):
+        c = get_case("A", "wrapped", "smooth", 256, udim=False)
+        r = c.convert()
+        assert sorted(r.tiles) == [1001]                       # タイル扱いしない
+        check_against_gt(c, r)
+        # 旧UVが 0..1 の外にある(非UDIMの折り返し)場合も、小数部で旧テクスチャを引く
+        c2 = get_case("wrapped", "A", "smooth", 256, udim=False)
+        check_against_gt(c2)
+        # 同じ入力を UDIM として解釈すると、タイルが分かれ、範囲外のシェルは除外される
+        r_udim = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, 256, udim=True)
+        assert sorted(r_udim.tiles) == [1001, 1002, 1021, 1054]
+        assert r_udim.stats["faces_out_of_udim_range"] > 0
+        assert "out_of_udim_range" in r_udim.stats["warnings"]
+
+    def test_udim_flag_falls_back_to_baseline_meta(self):
+        c = get_case("A", "wrapped", "smooth", 256, udim=False)
+        c.A.meta["udim"] = False
+        try:
+            r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, 256)
+            assert sorted(r.tiles) == [1001] and r.stats["udim"] is False
+        finally:
+            c.A.meta.pop("udim")
+
+    def test_uv_overlap_is_counted_and_other_shells_stay_correct(self):
+        c = get_case("A", "overlap", "smooth", 256)
+        r = c.convert()
+        assert r.stats["overlap_texels_total"] > 100 and "uv_overlap" in r.stats["warnings"]
+        gt, gm = c.gt
+        sm = c.shells()
+        ok = {t: gm[t] & np.isin(sm[t], [2, 3, 4, 5]) for t in gt}
+        ok = {t: _shrink(m, 2) for t, m in ok.items()}
+        err = np.concatenate([(r.tiles[t][ok[t]] - gt[t][ok[t]]).ravel() for t in gt])
+        assert 10 * np.log10(1 / max((err.astype(np.float64) ** 2).mean(), 1e-20)) > 70
+        assert get_case("A", "B", "smooth", 256).convert().stats["overlap_texels_total"] == 0
+
+    def test_out_res_forms(self):
+        c = get_case("A", "B", "smooth", 256)
+        r = c.convert()
+        assert {t: a.shape for t, a in r.tiles.items()} == {1001: (256, 256, 3), 1002: (256, 256, 3)}
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, (128, 64))   # (W, H)
+        assert {a.shape for a in r.tiles.values()} == {(64, 128, 3)}
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, {1001: 128, 1002: (64, 32)})
+        assert r.tiles[1001].shape == (128, 128, 3) and r.tiles[1002].shape == (32, 64, 3)
+        assert r.stats["res_fallback_tiles"] == []
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, {1001: 128})
+        assert r.stats["res_fallback_tiles"] == [1002] and r.tiles[1002].shape == (256, 256, 3)
+        assert "res_fallback" in r.stats["warnings"]
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, None)
+        assert sorted(r.stats["res_fallback_tiles"]) == [1001, 1002]
+        with pytest.raises(uvc.ChannelFormatError):
+            uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, 0)
+
+    def test_non_square_output_is_accurate(self):
+        c = get_case("A", "rot90", "smooth", 256)
+        W, H = 384, 192
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, (W, H))
+        gt, gm = bake(c.B, "Body", (W, H), f_smooth)
+        assert r.tiles[1001].shape == (H, W, 3)
+        assert psnr(r.tiles, gt, gm, "interior") > 60
+
+    def test_resolution_change(self):
+        c = get_case("A", "B", "smooth", 256)
+        for out in (128, 512):
+            r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, c.spec, out)
+            gt, gm = bake(c.B, "Body", out, f_smooth)
+            assert psnr(r.tiles, gt, gm, "interior") > 55, out
+
+    def test_polygons_with_more_than_three_corners(self):
+        """四角形メッシュでも、基準側の三角形分割を共有して正しく変換できる。"""
+        pl = plates(3, 5, 5, quads=True)
+        assert pl.counts.max() == 4
+        old = {k: ("id", (0.3, 0.3), (0.03 + 0.33 * k, 0.1)) for k in range(3)}
+        new = {0: ("rot90", (0.3, 0.3), (0.05, 0.6)), 1: ("mirror", (0.3, 0.3), (1.2, 0.1)),
+               2: ("rot180", (0.35, 0.35), (0.5, 0.5))}
+        A = snap_of(pl, apply_layout(pl, old))
+        B = with_uv(A, apply_layout(pl, new))
+        oldt, oldm = bake(A, "Body", 256, f_smooth)
+        gt, gm = bake(B, "Body", 256, f_smooth)
+        d = uvc.classify(A, B, "Body")
+        r = uvc.convert_channel(pad_tiles(oldt, oldm), A, B, "Body", d,
+                                uvc.ChannelSpec("BaseColor", "raw", "color"), 256)
+        assert sorted(r.tiles) == sorted(gt)
+        assert psnr(r.tiles, gt, gm, "interior") > 60
+
+    def test_corner_order_does_not_matter(self):
+        """現行側のコーナー列が巡回回転/逆順でも、同じ結果になる(頂点IDで対応付ける)。"""
+        pl = plates(2, 4, 4, quads=True)
+        A = snap_of(pl, apply_layout(pl, PLATE_LAYOUT))
+        B = with_uv(A, apply_layout(pl, {0: ("rot90", (0.4, 0.4), (0.1, 0.5)),
+                                         1: ("mirror", (0.4, 0.4), (1.1, 0.1))}))
+        oldt, oldm = bake(A, "Body", 128, f_smooth)
+        old = pad_tiles(oldt, oldm)
+        spec = uvc.ChannelSpec("BaseColor", "raw", "color")
+        d0 = uvc.classify(A, B, "Body")
+        ref = uvc.convert_channel(old, A, B, "Body", d0, spec, 128)
+        for variant, method in ((rotate_faces(B, 1), "F"), (rotate_faces(B, 3), "F"),
+                                (reverse_faces(B), "F_FLIPPED")):
+            d = uvc.classify(A, variant, "Body")
+            assert d.method == method
+            r = uvc.convert_channel(old, A, variant, "Body", d, spec, 128)
+            assert sorted(r.tiles) == sorted(ref.tiles)
+            for t in ref.tiles:
+                np.testing.assert_array_equal(r.tiles[t], ref.tiles[t])
+                np.testing.assert_array_equal(r.coverage[t], ref.coverage[t])
