@@ -15,6 +15,7 @@ CONFIG のキー:
     raise_in_convert  文字列: convert_channel でこの内容の RuntimeError を送出
     sleep_s       convert_channel で眠る秒数
     marker        convert_channel に入ったら作るファイルのパス(別プロセスの同期用)
+    trace         convert_channel の開始/終了(pid と時刻)を追記するファイルのパス
     on_convert    callable(spec)  ※同一プロセス専用
     salt          出力に加える微小な差(世代ごとに出力を変えたいとき)
 """
@@ -90,11 +91,18 @@ def convert_channel(old_tiles, baseline, current, ts_name, decision, spec, out_r
     CALLS.append(("convert", spec.suffix, out_res, sorted(old_tiles), dilate_px, normal_mode))
     if cfg.get("marker"):
         Path(cfg["marker"]).write_text("in convert", encoding="utf-8")
+    trace = cfg.get("trace")
+    if trace:
+        with open(trace, "a", encoding="utf-8") as f:
+            f.write("start {0} {1!r}\n".format(os.getpid(), time.time()))
     hook = cfg.get("on_convert")
     if callable(hook):
         hook(spec)
     if cfg.get("sleep_s"):
         time.sleep(float(cfg["sleep_s"]))
+    if trace:
+        with open(trace, "a", encoding="utf-8") as f:
+            f.write("end {0} {1!r}\n".format(os.getpid(), time.time()))
     if cfg.get("raise_in_convert"):
         raise RuntimeError(cfg["raise_in_convert"])
     src = old_tiles[min(old_tiles)]
