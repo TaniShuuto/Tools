@@ -17,6 +17,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -359,132 +360,150 @@ def _poll_until(runtime, timeout_s=120.0):
     return events, "timeout"
 
 
+def _cleanup_work(work):
+    try:
+        shutil.rmtree(work, ignore_errors=True)
+        if os.path.isdir(work):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def run_maya_cases(cmds):
     import uvremap_runtime as urm
 
     work = tempfile.mkdtemp(prefix="uvremap_vr_")
-    root = os.path.join(work, "uvremap", "proj")
-    src = os.path.join(work, "src")
-    out = os.path.join(root, "output", "final")
-    os.makedirs(src, exist_ok=True)
-    os.makedirs(out, exist_ok=True)
-    png_name = "{0}_BaseColor.png".format(TS_NAME)
-    png_path = os.path.join(src, png_name)
-    _write_smooth_png(png_path)
-    flag_path = os.path.join(src, "_sync_complete.flag")
-    with open(flag_path, "w", encoding="utf-8") as handle:
-        handle.write("{}")
+    checks = None
+    extra = None
+    try:
+        root = os.path.join(work, "uvremap", "proj")
+        src = os.path.join(work, "src")
+        out = os.path.join(root, "output", "final")
+        os.makedirs(src, exist_ok=True)
+        os.makedirs(out, exist_ok=True)
+        png_name = "{0}_BaseColor.png".format(TS_NAME)
+        png_path = os.path.join(src, png_name)
+        _write_smooth_png(png_path)
+        flag_path = os.path.join(src, "_sync_complete.flag")
+        with open(flag_path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
 
-    cmds.file(new=True, force=True)
-    cube = cmds.polyCube(name="uvremap_rt_cube")[0]
-    cube_shape = _shape_of(cmds, cube)
-    shader, sg = _make_shader(cmds, TS_NAME)
-    cmds.sets(cube, edit=True, forceElement=sg)
-    file_node = cmds.shadingNode("file", asTexture=True, name="uvremap_rt_file")
-    cmds.setAttr(file_node + ".fileTextureName", png_path, type="string")
-    cmds.setAttr(file_node + ".uvTilingMode", 0)
-    original_path = cmds.getAttr(file_node + ".fileTextureName")
-    original_tiling = int(cmds.getAttr(file_node + ".uvTilingMode"))
+        cmds.file(new=True, force=True)
+        cube = cmds.polyCube(name="uvremap_rt_cube")[0]
+        cube_shape = _shape_of(cmds, cube)
+        shader, sg = _make_shader(cmds, TS_NAME)
+        cmds.sets(cube, edit=True, forceElement=sg)
+        file_node = cmds.shadingNode("file", asTexture=True, name="uvremap_rt_file")
+        cmds.setAttr(file_node + ".fileTextureName", png_path, type="string")
+        cmds.setAttr(file_node + ".uvTilingMode", 0)
+        original_path = cmds.getAttr(file_node + ".fileTextureName")
+        original_tiling = int(cmds.getAttr(file_node + ".uvTilingMode"))
 
-    runtime = urm.UVRemapRuntime(
-        get_enabled=lambda: True,
-        get_root=lambda _key: root,
-        cmds_fn=lambda: cmds,
-    )
-    baseline_id = runtime.record_baseline("proj", [TS_NAME], [cube_shape])
-    cmds.polyEditUV(cube + ".map[*]", u=0.07, v=-0.04)
-    job_id = runtime.convert_now(
-        "proj", TS_NAME, [cube_shape], src, out, quality="final",
-        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
-        udim=False, out_res=RES, timeout_s=180, copy_retries=1, lock_timeout_s=30,
-    )
-    events, wait_err = _poll_until(runtime)
-    after_path = cmds.getAttr(file_node + ".fileTextureName")
-    after_tiling = int(cmds.getAttr(file_node + ".uvTilingMode"))
-    has_orig = cmds.attributeQuery(urm.ATTR_ORIGINAL_PATH, node=file_node, exists=True)
-    converted_name = os.path.basename(after_path or "")
-    switched = bool(job_id) and events and events[0].get("exit_code") == 0
-    switched = switched and converted_name == "{0}_BaseColor.png".format(TS_NAME)
-    switched = switched and after_path != original_path
+        runtime = urm.UVRemapRuntime(
+            get_enabled=lambda: True,
+            get_root=lambda _key: root,
+            cmds_fn=lambda: cmds,
+        )
+        baseline_id = runtime.record_baseline("proj", [TS_NAME], [cube_shape])
+        cmds.polyEditUV(cube + ".map[*]", u=0.07, v=-0.04)
+        job_id = runtime.convert_now(
+            "proj", TS_NAME, [cube_shape], src, out, quality="final",
+            channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+            udim=False, out_res=RES, timeout_s=180, copy_retries=1, lock_timeout_s=30,
+        )
+        events, wait_err = _poll_until(runtime)
+        after_path = cmds.getAttr(file_node + ".fileTextureName")
+        after_tiling = int(cmds.getAttr(file_node + ".uvTilingMode"))
+        has_orig = cmds.attributeQuery(urm.ATTR_ORIGINAL_PATH, node=file_node, exists=True)
+        converted_name = os.path.basename(after_path or "")
+        switched = bool(job_id) and events and events[0].get("exit_code") == 0
+        switched = switched and converted_name == "{0}_BaseColor.png".format(TS_NAME)
+        switched = switched and after_path != original_path
 
-    runtime.revert_to_original(TS_NAME)
-    reverted_path = cmds.getAttr(file_node + ".fileTextureName")
-    reverted_tiling = int(cmds.getAttr(file_node + ".uvTilingMode"))
-    still_has_orig = cmds.attributeQuery(urm.ATTR_ORIGINAL_PATH, node=file_node, exists=True)
-    reverted = (reverted_path == original_path and reverted_tiling == original_tiling and not still_has_orig)
+        runtime.revert_to_original(TS_NAME)
+        reverted_path = cmds.getAttr(file_node + ".fileTextureName")
+        reverted_tiling = int(cmds.getAttr(file_node + ".uvTilingMode"))
+        still_has_orig = cmds.attributeQuery(urm.ATTR_ORIGINAL_PATH, node=file_node, exists=True)
+        reverted = (reverted_path == original_path and reverted_tiling == original_tiling and not still_has_orig)
 
-    mayapy = urm.resolve_mayapy()
-    child_obs = {
-        "mayapy": anonymize_path(mayapy) if mayapy else None,
-        "unverified_note": "Maya GUI から mayapy を子プロセス起動する経路は実機未検証",
-    }
-    child_ok = False
-    if mayapy:
-        env = urm.worker_env()
-        kwargs = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.STDOUT,
-            "env": env,
-            "timeout": 30,
+        mayapy = urm.resolve_mayapy()
+        child_obs = {
+            "mayapy": anonymize_path(mayapy) if mayapy else None,
+            "unverified_note": "Maya GUI から mayapy を子プロセス起動する経路は実機未検証",
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = urm.CREATE_NO_WINDOW
-        try:
-            proc = subprocess.run(
-                [mayapy, "-c", "import sys; print('child-ok')"],
-                **kwargs,
-            )
-            text = (proc.stdout or b"")
-            if isinstance(text, bytes):
-                text = text.decode("utf-8", errors="replace")
-            child_obs["returncode"] = proc.returncode
-            child_obs["stdout"] = anonymize_text((text or "").strip()[:200])
-            child_obs["pythonhome_stripped"] = "PYTHONHOME" not in env
-            child_obs["pythonpath_stripped"] = "PYTHONPATH" not in env
-            child_obs["pythonnousersite"] = env.get("PYTHONNOUSERSITE") == "1"
-            child_ok = proc.returncode == 0 and "child-ok" in (text or "")
-        except Exception as exc:
-            child_obs["error"] = exception_observation(exc)
+        child_ok = False
+        if mayapy:
+            env = urm.worker_env()
+            kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "env": env,
+                "timeout": 30,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = urm.CREATE_NO_WINDOW
+            try:
+                proc = subprocess.run(
+                    [mayapy, "-c", "import sys; print('child-ok')"],
+                    **kwargs,
+                )
+                text = (proc.stdout or b"")
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="replace")
+                child_obs["returncode"] = proc.returncode
+                child_obs["stdout"] = anonymize_text((text or "").strip()[:200])
+                child_obs["pythonhome_stripped"] = "PYTHONHOME" not in env
+                child_obs["pythonpath_stripped"] = "PYTHONPATH" not in env
+                child_obs["pythonnousersite"] = env.get("PYTHONNOUSERSITE") == "1"
+                child_ok = proc.returncode == 0 and "child-ok" in (text or "")
+            except Exception as exc:
+                child_obs["error"] = exception_observation(exc)
 
-    checks = {
-        "record_baseline": _pass_or_fail(
-            bool(baseline_id),
-            "基準UVを記録できる",
-            {"baseline_id": baseline_id},
-        ),
-        "convert_and_switch": _pass_or_fail(
-            switched,
-            "convert_now → poll のあとファイルノードが変換後パスを指す",
-            {
-                "job_id": job_id,
-                "events": events,
-                "wait_error": wait_err,
-                "original_basename": os.path.basename(original_path or ""),
-                "after_basename": converted_name,
-                "tiling": after_tiling,
-                "has_original_attr": has_orig,
-            },
-        ),
-        "revert_to_original": _pass_or_fail(
-            reverted,
-            "revert_to_original で原本パスと tiling が戻り属性が消える",
-            {
-                "reverted_basename": os.path.basename(reverted_path or ""),
-                "reverted_tiling": reverted_tiling,
-                "attr_removed": not still_has_orig,
-            },
-        ),
-        "mayapy_child_process": make_check(
-            STATUS_PASS if child_ok else (STATUS_FAIL if mayapy else STATUS_INCONCLUSIVE),
-            "mayapy を PYTHONHOME/PYTHONPATH 無し・PYTHONNOUSERSITE=1 で子プロセス起動できる(実機未検証の項目)",
-            child_obs,
-        ),
-    }
-    extra = {
-        "work_dir": "tmp",
-        "ts_name": TS_NAME,
-        "res": RES,
-    }
+        checks = {
+            "record_baseline": _pass_or_fail(
+                bool(baseline_id),
+                "基準UVを記録できる",
+                {"baseline_id": baseline_id},
+            ),
+            "convert_and_switch": _pass_or_fail(
+                switched,
+                "convert_now → poll のあとファイルノードが変換後パスを指す",
+                {
+                    "job_id": job_id,
+                    "events": events,
+                    "wait_error": wait_err,
+                    "original_basename": os.path.basename(original_path or ""),
+                    "after_basename": converted_name,
+                    "tiling": after_tiling,
+                    "has_original_attr": has_orig,
+                },
+            ),
+            "revert_to_original": _pass_or_fail(
+                reverted,
+                "revert_to_original で原本パスと tiling が戻り属性が消える",
+                {
+                    "reverted_basename": os.path.basename(reverted_path or ""),
+                    "reverted_tiling": reverted_tiling,
+                    "attr_removed": not still_has_orig,
+                },
+            ),
+            "mayapy_child_process": make_check(
+                STATUS_PASS if child_ok else (STATUS_FAIL if mayapy else STATUS_INCONCLUSIVE),
+                "mayapy を PYTHONHOME/PYTHONPATH 無し・PYTHONNOUSERSITE=1 で子プロセス起動できる(実機未検証の項目)",
+                child_obs,
+            ),
+        }
+        extra = {
+            "work_dir": "tmp",
+            "ts_name": TS_NAME,
+            "res": RES,
+        }
+    finally:
+        if not _cleanup_work(work) and isinstance(checks, dict):
+            for check in checks.values():
+                if isinstance(check, dict) and isinstance(check.get("observations"), dict):
+                    check["observations"]["cleanup"] = "削除できなかった"
     return checks, extra
 
 
