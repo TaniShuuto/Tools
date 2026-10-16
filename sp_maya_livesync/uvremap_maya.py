@@ -31,6 +31,7 @@ WARN_NO_UV = "no_uv_faces"
 WARN_INSTANCE = "instance_mismatch"
 WARN_DEFORMER = "deformer_positions_used"
 WARN_DEFAULT_SG = "default_shading_group_ts"
+WARN_TS_NAME_SG = "ts_name_matched_by_shading_group"
 
 
 def is_default_sg(name):
@@ -43,6 +44,138 @@ def is_default_sg(name):
 
 def ts_faces_key(index):
     return "ts_faces__{0}".format(int(index))
+
+
+def group_faces_by_ts_name(sg_faces, sg_to_shader):
+    """シェーディンググループ単位のフェースを TS名(シェーダー名)でまとめる。
+
+    Args:
+        sg_faces: {sg_name: フェースID列}
+        sg_to_shader: {sg_name: surfaceShader ノード名 or None}
+
+    Returns:
+        {ts_name: {
+            "face_ids": 昇順の和集合,
+            "shading_group": 最初に見たグループ名,
+            "shading_groups": 昇順のグループ名,
+            "surface_shader": シェーダー名 or None,
+            "is_default_sg": まとめた中に initialShadingGroup があるか,
+            "ts_name_unresolved": True  # シェーダーが無いときだけ
+        }}
+
+    シェーダーが接続されていないグループは、グループ名をキーにし
+    ts_name_unresolved を付ける。Painter 側の名前はここでは決めない。
+    """
+    grouped = {}
+    sg_to_shader = sg_to_shader or {}
+    for sg, faces in (sg_faces or {}).items():
+        sg_name = str(sg)
+        shader = sg_to_shader.get(sg, sg_to_shader.get(sg_name))
+        if shader is None:
+            ts_name = sg_name
+            unresolved = True
+        else:
+            ts_name = str(shader)
+            unresolved = False
+        bucket = grouped.get(ts_name)
+        if bucket is None:
+            bucket = {
+                "face_ids": [],
+                "shading_group": sg_name,
+                "shading_groups": [],
+                "surface_shader": None if unresolved else ts_name,
+                "is_default_sg": False,
+            }
+            grouped[ts_name] = bucket
+        bucket["shading_groups"].append(sg_name)
+        bucket["face_ids"].extend(int(i) for i in (faces or []))
+        if is_default_sg(sg_name):
+            bucket["is_default_sg"] = True
+        if unresolved:
+            if bucket.get("surface_shader") is None:
+                bucket["ts_name_unresolved"] = True
+        else:
+            bucket["surface_shader"] = ts_name
+            bucket.pop("ts_name_unresolved", None)
+
+    out = {}
+    for ts_name, bucket in grouped.items():
+        entry = {
+            "face_ids": sorted(set(bucket["face_ids"])),
+            "shading_group": bucket["shading_group"],
+            "shading_groups": sorted(set(bucket["shading_groups"])),
+            "surface_shader": bucket["surface_shader"],
+            "is_default_sg": bool(bucket["is_default_sg"]),
+        }
+        if bucket.get("ts_name_unresolved"):
+            entry["ts_name_unresolved"] = True
+        out[ts_name] = entry
+    return out
+
+
+def map_ts_names_to_faces(sg_faces, sg_to_shader, ts_names):
+    """渡された TS名を、そのメッシュ内のフェースID列へ対応付ける。
+
+    まずシェーダー名として探し、どれとも一致しなければグループ名として探す。
+    グループ名で当たったときは WARN_TS_NAME_SG を付ける。
+    当たった TS に initialShadingGroup のフェースが含まれるとき
+    WARN_DEFAULT_SG を付ける。
+
+    Returns:
+        (ts_local_faces, warnings)
+        ts_local_faces: {渡された名前: 昇順のフェースID}
+    """
+    sg_faces = dict(sg_faces or {})
+    sg_to_shader = dict(sg_to_shader or {})
+    grouped = group_faces_by_ts_name(sg_faces, sg_to_shader)
+    shader_keys = set()
+    for info in grouped.values():
+        shader = info.get("surface_shader")
+        if shader is not None and not info.get("ts_name_unresolved"):
+            shader_keys.add(str(shader))
+
+    ts_local = {}
+    warnings = []
+    includes_default = False
+    names = [str(name) for name in (ts_names or [])]
+    for name in names:
+        if name in shader_keys:
+            info = grouped.get(name) or {}
+            faces = list(info.get("face_ids") or [])
+            if info.get("is_default_sg"):
+                includes_default = True
+        elif name in sg_faces:
+            faces = sorted(set(int(i) for i in (sg_faces.get(name) or [])))
+            _append_unique(warnings, WARN_TS_NAME_SG)
+            if is_default_sg(name):
+                includes_default = True
+        else:
+            faces = []
+        ts_local[name] = faces
+
+    if includes_default:
+        _append_unique(warnings, WARN_DEFAULT_SG)
+    return ts_local, warnings
+
+
+def ts_names_for_faces(mapped_sgs, sg_to_shader):
+    """フェースごとのグループ名を TS名(シェーダー名)に読み替える。
+
+    シェーダーが無いグループはグループ名のまま(未解決)。None は None。
+    インスタンス間の不一致判定を TS名単位にするため。
+    """
+    sg_to_shader = sg_to_shader or {}
+    out = []
+    for sg in mapped_sgs:
+        if sg is None:
+            out.append(None)
+            continue
+        shader = sg_to_shader.get(sg, sg_to_shader.get(str(sg)))
+        if shader is None:
+            out.append(str(sg))
+        else:
+            out.append(str(shader))
+    return out
 
 
 def empty_arrays(ts_names):
@@ -247,8 +380,6 @@ def concat_records(records, ts_names, uv_set=""):
             "untriangulated_faces": [],
             "no_uv_faces": [],
         }
-        if any(is_default_sg(name) for name in ts_names):
-            info["warnings"].append(WARN_DEFAULT_SG)
         return arrays, info
 
     counts_parts = []
@@ -317,6 +448,8 @@ def concat_records(records, ts_names, uv_set=""):
             _append_unique(warnings, WARN_INSTANCE)
         if rec.get("deformer_positions_used"):
             _append_unique(warnings, WARN_DEFORMER)
+        for extra_warn in rec.get("ts_resolve_warnings") or []:
+            _append_unique(warnings, extra_warn)
 
         face_offset += face_n
 
@@ -361,9 +494,6 @@ def concat_records(records, ts_names, uv_set=""):
     else:
         bbox_min = [float(x) for x in pos.min(axis=0).tolist()]
         bbox_max = [float(x) for x in pos.max(axis=0).tolist()]
-
-    if any(is_default_sg(name) for name in ts_names):
-        _append_unique(warnings, WARN_DEFAULT_SG)
 
     info = {
         "ts_names": ts_names,
@@ -535,8 +665,8 @@ def _resolve_mesh(om, shape_path):
     return dag, uuid
 
 
-def _instance_shader_mismatch(om, dag, mapped0):
-    """全インスタンスの getConnectedShaders をインスタンス0と比較する。"""
+def _instance_shader_mismatch(om, cmds, dag, mapped0):
+    """全インスタンスの TS名(シェーダー名)列をインスタンス0と比較する。"""
     fn_dag = om.MFnDagNode(dag.node())
     try:
         n_inst = int(fn_dag.instanceCount(False))
@@ -554,6 +684,16 @@ def _instance_shader_mismatch(om, dag, mapped0):
             path_by_inst[int(path.instanceNumber())] = path
         except Exception:
             continue
+
+    def _ts_row(mapped):
+        table = {}
+        for sg in mapped:
+            if sg is None or sg in table:
+                continue
+            table[sg] = _surface_shader_name(cmds, sg)
+        return ts_names_for_faces(mapped, table)
+
+    ts0 = _ts_row(mapped0)
     for inst in range(n_inst):
         if inst == 0:
             continue
@@ -563,7 +703,7 @@ def _instance_shader_mismatch(om, dag, mapped0):
             _names, mapped, _raw = _shader_face_names(om, other_fn, inst)
         except Exception:
             return True
-        if mapped != mapped0:
+        if _ts_row(mapped) != ts0:
             return True
     return False
 
@@ -611,13 +751,16 @@ def _read_mesh_record(om, cmds, dag, uuid, uv_set):
     )
 
     _sg_names, mapped0, _raw = _shader_face_names(om, fn, 0)
-    ts_local = {}
+    sg_faces = {}
     for face_id, sg in enumerate(mapped0):
         if sg is None:
             continue
-        ts_local.setdefault(sg, []).append(int(face_id))
+        sg_faces.setdefault(sg, []).append(int(face_id))
+    sg_to_shader = {}
+    for sg in sg_faces:
+        sg_to_shader[sg] = _surface_shader_name(cmds, sg)
 
-    mismatch = _instance_shader_mismatch(om, dag, mapped0)
+    mismatch = _instance_shader_mismatch(om, cmds, dag, mapped0)
     deformer = _mesh_has_deformer(om, cmds, dag)
 
     return {
@@ -629,7 +772,9 @@ def _read_mesh_record(om, cmds, dag, uuid, uv_set):
         "corner_uv": corner_uv,
         "tri_face": tri_face,
         "tri_corner": tri_corner,
-        "ts_local_faces": ts_local,
+        "sg_faces": sg_faces,
+        "sg_to_shader": sg_to_shader,
+        "ts_local_faces": {},
         "nonmanifold_faces": extras["nonmanifold_faces"],
         "untriangulated_faces": extras["untriangulated_faces"],
         "no_uv_faces": no_uv_faces,
@@ -639,36 +784,45 @@ def _read_mesh_record(om, cmds, dag, uuid, uv_set):
 
 
 def list_texture_sets():
-    """シーン内メッシュのシェーダー(SG)名 → フェース集合。
+    """シーン内メッシュの TS名(シェーダー名) → フェース集合。
 
     戻り値:
-        {sg_name: [{"shape", "uuid", "face_ids", "is_default_sg", "surface_shader"}, ...]}
+        {ts_name: [{"shape", "uuid", "face_ids", "is_default_sg",
+                    "surface_shader", "shading_group", "shading_groups"}, ...]}
 
     インスタンス0の getConnectedShaders(0) を使う。
-    initialShadingGroup は除外しない。
-    Painter の TS 名が SG 名か surfaceShader 名かは未確認のため、キーは SG 名、
-    接続シェーダー名は surface_shader に残すだけにする。
+    initialShadingGroup は除外しない。同じシェーダーを使う複数グループは
+    同じ TS にまとめる。シェーダーが無いグループはグループ名をキーにし
+    ts_name_unresolved を付ける。
     """
     om, cmds = _maya()
     out = {}
     for uuid, dag in _iter_unique_meshes(om):
         fn = om.MFnMesh(dag)
         _names, mapped, _raw = _shader_face_names(om, fn, 0)
-        buckets = {}
+        sg_faces = {}
         for face_id, sg in enumerate(mapped):
             if sg is None:
                 continue
-            buckets.setdefault(sg, []).append(int(face_id))
+            sg_faces.setdefault(sg, []).append(int(face_id))
+        sg_to_shader = {}
+        for sg in sg_faces:
+            sg_to_shader[sg] = _surface_shader_name(cmds, sg)
+        grouped = group_faces_by_ts_name(sg_faces, sg_to_shader)
         shape = dag.fullPathName()
-        for sg, faces in buckets.items():
+        for ts_name, info in grouped.items():
             entry = {
                 "shape": shape,
                 "uuid": uuid,
-                "face_ids": faces,
-                "is_default_sg": is_default_sg(sg),
-                "surface_shader": _surface_shader_name(cmds, sg),
+                "face_ids": list(info["face_ids"]),
+                "is_default_sg": bool(info["is_default_sg"]),
+                "surface_shader": info["surface_shader"],
+                "shading_group": info["shading_group"],
+                "shading_groups": list(info["shading_groups"]),
             }
-            out.setdefault(sg, []).append(entry)
+            if info.get("ts_name_unresolved"):
+                entry["ts_name_unresolved"] = True
+            out.setdefault(ts_name, []).append(entry)
     return out
 
 
@@ -684,7 +838,11 @@ def collect_arrays(shape_paths, ts_names, uv_set=None):
 
     フィンガープリントと UV ハッシュは計算しない。
     頂点ID列は Maya が返した並びのまま(法線反転の補正はしない)。
-    ts_names に initialShadingGroup が含まれていても除外しない。
+    ts_names は TS名(シェーダー名)として扱う。どれとも一致せず
+    グループ名と一致する要素は、そのグループのフェースを使い
+    ts_name_matched_by_shading_group を warnings に入れる。
+    initialShadingGroup のフェースが TS に含まれるときは
+    default_shading_group_ts を warnings に入れる。
     """
     om, cmds = _maya()
     ts_names = [str(name) for name in (ts_names or [])]
@@ -711,5 +869,13 @@ def collect_arrays(shape_paths, ts_names, uv_set=None):
 
     records = []
     for uuid, dag in resolved:
-        records.append(_read_mesh_record(om, cmds, dag, uuid, resolved_uv))
+        rec = _read_mesh_record(om, cmds, dag, uuid, resolved_uv)
+        ts_local, ts_warnings = map_ts_names_to_faces(
+            rec.get("sg_faces") or {},
+            rec.get("sg_to_shader") or {},
+            ts_names,
+        )
+        rec["ts_local_faces"] = ts_local
+        rec["ts_resolve_warnings"] = ts_warnings
+        records.append(rec)
     return concat_records(records, ts_names, uv_set=resolved_uv)

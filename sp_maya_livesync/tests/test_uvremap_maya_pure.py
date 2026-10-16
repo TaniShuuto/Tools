@@ -59,6 +59,7 @@ def _record(
         "no_uv_faces": extra.get("no_uv_faces", []),
         "instance_mismatch": extra.get("instance_mismatch", False),
         "deformer_positions_used": extra.get("deformer_positions_used", False),
+        "ts_resolve_warnings": extra.get("ts_resolve_warnings", []),
     }
     rec["_n_faces"] = n_f
     return rec
@@ -258,19 +259,42 @@ def test_concat_nonmanifold_and_no_uv_face_ids_are_offset():
     np.testing.assert_array_equal(arrays["tri_face"], [2])
 
 
-def test_concat_default_sg_warning_keeps_faces():
+def test_concat_default_sg_warning_from_resolve():
+    sg_faces = {"BodySG": [0], "initialShadingGroup": [1]}
+    sg_to_shader = {"BodySG": "BodyMat", "initialShadingGroup": "lambert1"}
+    ts_local, ts_warnings = um.map_ts_names_to_faces(
+        sg_faces, sg_to_shader, ["BodyMat", "lambert1"],
+    )
     rec = _record(
         "u0",
         counts=[3, 3],
         vids=[0, 1, 2, 3, 4, 5],
-        ts_local={"initialShadingGroup": [1], "BodySG": [0]},
+        ts_local=ts_local,
+        ts_resolve_warnings=ts_warnings,
     )
-    arrays, info = um.concat_records(
-        [rec], ["BodySG", "initialShadingGroup"],
-    )
+    arrays, info = um.concat_records([rec], ["BodyMat", "lambert1"])
     assert um.WARN_DEFAULT_SG in info["warnings"]
     np.testing.assert_array_equal(arrays["ts_faces__0"], [0])
     np.testing.assert_array_equal(arrays["ts_faces__1"], [1])
+
+
+def test_concat_does_not_warn_default_sg_from_name_alone():
+    rec = _record(
+        "u0",
+        counts=[3, 3],
+        vids=[0, 1, 2, 3, 4, 5],
+        ts_local={"BodySG": [0], "Trim": [1]},
+    )
+    _arrays, info = um.concat_records(
+        [rec], ["BodySG", "initialShadingGroup"],
+    )
+    assert um.WARN_DEFAULT_SG not in info["warnings"]
+
+
+def test_concat_empty_no_default_sg_warning_from_name():
+    _arrays, info = um.concat_records([], ["initialShadingGroup"])
+    assert um.WARN_DEFAULT_SG not in info["warnings"]
+    assert info["ts_names"] == ["initialShadingGroup"]
 
 
 def test_concat_instance_and_deformer_warnings():
@@ -307,6 +331,198 @@ def test_is_default_sg():
 def test_public_functions_exist():
     assert callable(um.list_texture_sets)
     assert callable(um.collect_arrays)
+    assert callable(um.group_faces_by_ts_name)
+    assert callable(um.map_ts_names_to_faces)
+    assert callable(um.ts_names_for_faces)
+
+
+def test_group_faces_one_to_one():
+    grouped = um.group_faces_by_ts_name(
+        {"sgA": [2, 0], "sgB": [1]},
+        {"sgA": "matA", "sgB": "matB"},
+    )
+    assert set(grouped) == {"matA", "matB"}
+    assert grouped["matA"]["face_ids"] == [0, 2]
+    assert grouped["matA"]["shading_group"] == "sgA"
+    assert grouped["matA"]["shading_groups"] == ["sgA"]
+    assert grouped["matA"]["surface_shader"] == "matA"
+    assert grouped["matA"]["is_default_sg"] is False
+    assert "ts_name_unresolved" not in grouped["matA"]
+    assert grouped["matB"]["face_ids"] == [1]
+    assert grouped["matB"]["shading_groups"] == ["sgB"]
+
+
+def test_group_faces_merge_two_groups_same_shader():
+    grouped = um.group_faces_by_ts_name(
+        {"sgA": [0, 3], "sgB": [1, 2]},
+        {"sgA": "sharedMat", "sgB": "sharedMat"},
+    )
+    assert list(grouped) == ["sharedMat"]
+    info = grouped["sharedMat"]
+    assert info["face_ids"] == [0, 1, 2, 3]
+    assert info["shading_group"] == "sgA"
+    assert info["shading_groups"] == ["sgA", "sgB"]
+    assert info["surface_shader"] == "sharedMat"
+    assert info["is_default_sg"] is False
+    assert "ts_name_unresolved" not in info
+
+
+def test_group_faces_unresolved_uses_group_name():
+    grouped = um.group_faces_by_ts_name(
+        {"orphanSG": [4, 1], "sgA": [0]},
+        {"orphanSG": None, "sgA": "matA"},
+    )
+    assert set(grouped) == {"orphanSG", "matA"}
+    orphan = grouped["orphanSG"]
+    assert orphan["face_ids"] == [1, 4]
+    assert orphan["surface_shader"] is None
+    assert orphan["ts_name_unresolved"] is True
+    assert orphan["shading_group"] == "orphanSG"
+    assert orphan["shading_groups"] == ["orphanSG"]
+    assert "ts_name_unresolved" not in grouped["matA"]
+
+
+def test_group_faces_default_sg_flag():
+    grouped = um.group_faces_by_ts_name(
+        {"sgA": [0], "initialShadingGroup": [2, 1]},
+        {"sgA": "matA", "initialShadingGroup": "lambert1"},
+    )
+    assert grouped["matA"]["is_default_sg"] is False
+    assert grouped["lambert1"]["is_default_sg"] is True
+    assert grouped["lambert1"]["face_ids"] == [1, 2]
+    assert grouped["lambert1"]["shading_groups"] == ["initialShadingGroup"]
+
+
+def test_group_faces_default_sg_merged_into_shared_shader():
+    grouped = um.group_faces_by_ts_name(
+        {"sgA": [0], "initialShadingGroup": [1]},
+        {"sgA": "sharedMat", "initialShadingGroup": "sharedMat"},
+    )
+    info = grouped["sharedMat"]
+    assert info["is_default_sg"] is True
+    assert info["face_ids"] == [0, 1]
+    assert info["shading_groups"] == ["initialShadingGroup", "sgA"]
+
+
+def test_map_ts_names_shader_match():
+    ts_local, warnings = um.map_ts_names_to_faces(
+        {"sgA": [0, 2], "sgB": [1]},
+        {"sgA": "matA", "sgB": "matB"},
+        ["matA", "matB"],
+    )
+    assert ts_local["matA"] == [0, 2]
+    assert ts_local["matB"] == [1]
+    assert um.WARN_TS_NAME_SG not in warnings
+    assert um.WARN_DEFAULT_SG not in warnings
+
+
+def test_map_ts_names_merge_same_shader():
+    ts_local, warnings = um.map_ts_names_to_faces(
+        {"sgA": [0], "sgB": [2, 1]},
+        {"sgA": "sharedMat", "sgB": "sharedMat"},
+        ["sharedMat"],
+    )
+    assert ts_local["sharedMat"] == [0, 1, 2]
+    assert warnings == []
+
+
+def test_map_ts_names_compat_group_name_warns():
+    ts_local, warnings = um.map_ts_names_to_faces(
+        {"sgA": [0, 3], "sgB": [1]},
+        {"sgA": "matA", "sgB": "matB"},
+        ["sgA", "matB"],
+    )
+    assert ts_local["sgA"] == [0, 3]
+    assert ts_local["matB"] == [1]
+    assert um.WARN_TS_NAME_SG in warnings
+    assert um.WARN_DEFAULT_SG not in warnings
+
+
+def test_map_ts_names_default_sg_warns_when_faces_included():
+    sg_faces = {"sgA": [0], "initialShadingGroup": [1]}
+    sg_to_shader = {"sgA": "matA", "initialShadingGroup": "lambert1"}
+    _local, warnings = um.map_ts_names_to_faces(
+        sg_faces, sg_to_shader, ["matA", "lambert1"],
+    )
+    assert um.WARN_DEFAULT_SG in warnings
+
+    _local2, warnings2 = um.map_ts_names_to_faces(
+        sg_faces, sg_to_shader, ["matA"],
+    )
+    assert um.WARN_DEFAULT_SG not in warnings2
+
+
+def test_map_ts_names_compat_default_sg_name():
+    ts_local, warnings = um.map_ts_names_to_faces(
+        {"sgA": [0], "initialShadingGroup": [2]},
+        {"sgA": "matA", "initialShadingGroup": "lambert1"},
+        ["initialShadingGroup"],
+    )
+    assert ts_local["initialShadingGroup"] == [2]
+    assert um.WARN_TS_NAME_SG in warnings
+    assert um.WARN_DEFAULT_SG in warnings
+
+
+def test_map_ts_names_unknown_is_empty():
+    ts_local, warnings = um.map_ts_names_to_faces(
+        {"sgA": [0]},
+        {"sgA": "matA"},
+        ["missing"],
+    )
+    assert ts_local["missing"] == []
+    assert warnings == []
+
+
+def test_map_then_concat_multi_mesh_global_ids():
+    ts0, warn0 = um.map_ts_names_to_faces(
+        {"sgA": [1, 2], "sgB": []},
+        {"sgA": "matA", "sgB": "matB"},
+        ["matA", "matB"],
+    )
+    ts1, warn1 = um.map_ts_names_to_faces(
+        {"otherSG": [0], "trimSG": [0]},
+        {"otherSG": "matA", "trimSG": "matB"},
+        ["matA", "matB"],
+    )
+    rec0 = _record(
+        "m0",
+        counts=[3, 3, 3],
+        vids=[0, 1, 2, 0, 2, 3, 0, 3, 4],
+        ts_local=ts0,
+        ts_resolve_warnings=warn0,
+    )
+    rec1 = _record(
+        "m1",
+        counts=[3],
+        vids=[0, 1, 2],
+        ts_local=ts1,
+        ts_resolve_warnings=warn1,
+    )
+    arrays, info = um.concat_records([rec0, rec1], ["matA", "matB"])
+    np.testing.assert_array_equal(arrays["ts_faces__0"], [1, 2, 3])
+    np.testing.assert_array_equal(arrays["ts_faces__1"], [3])
+    assert info["ts_names"] == ["matA", "matB"]
+    assert um.WARN_TS_NAME_SG not in info["warnings"]
+
+
+def test_ts_names_for_faces_reads_shader():
+    mapped = ["sgA", "sgB", None, "sgA"]
+    row = um.ts_names_for_faces(mapped, {"sgA": "matA", "sgB": "matB"})
+    assert row == ["matA", "matB", None, "matA"]
+
+
+def test_ts_names_for_faces_same_shader_hides_group_diff():
+    row0 = um.ts_names_for_faces(
+        ["sgA", "sgB"], {"sgA": "shared", "sgB": "shared"},
+    )
+    row1 = um.ts_names_for_faces(
+        ["sgC", "sgD"], {"sgC": "shared", "sgD": "shared"},
+    )
+    assert row0 == row1 == ["shared", "shared"]
+    row_diff = um.ts_names_for_faces(
+        ["sgC", "sgD"], {"sgC": "shared", "sgD": "other"},
+    )
+    assert row0 != row_diff
 
 
 def test_concat_does_not_flip_corners():

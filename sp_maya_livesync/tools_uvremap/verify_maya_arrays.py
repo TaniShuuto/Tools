@@ -331,6 +331,25 @@ def _make_shader(cmds, name):
     return shader, sg
 
 
+def _make_named_shader(cmds, shader_name, sg_name):
+    shader = cmds.shadingNode("lambert", asShader=True, name=shader_name)
+    sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=sg_name)
+    cmds.connectAttr(shader + ".outColor", sg + ".surfaceShader", force=True)
+    return str(shader), str(sg)
+
+
+def _surface_shader_of(cmds, sg_name):
+    try:
+        conns = cmds.listConnections(
+            sg_name + ".surfaceShader", source=True, destination=False,
+        ) or []
+    except Exception:
+        return None
+    if not conns:
+        return None
+    return str(conns[0])
+
+
 def _shape_of(cmds, transform):
     shapes = cmds.listRelatives(transform, shapes=True, fullPath=True) or []
     if not shapes:
@@ -489,8 +508,10 @@ def run_maya_cases(cmds):
     cube_shape = cube_info["shape"]
     sphere_shape = sphere_info["shape"]
 
+    default_shader = _surface_shader_of(cmds, INITIAL_SG)
     listed = um.list_texture_sets()
-    default_entries = listed.get(INITIAL_SG) or []
+    default_key = default_shader if default_shader else INITIAL_SG
+    default_entries = listed.get(default_key) or []
     cube_default = None
     for entry in default_entries:
         if cube_shape in str(entry.get("shape") or "") or str(entry.get("shape") or "").endswith(
@@ -507,7 +528,9 @@ def run_maya_cases(cmds):
                 cube_default = entry
                 break
 
-    ts_names = [cube_info["sg_a"], cube_info["sg_b"], INITIAL_SG]
+    ts_names = [cube_info["shader_a"], cube_info["shader_b"]]
+    if default_shader:
+        ts_names.append(default_shader)
     arrays, info = um.collect_arrays(
         [cube_shape, sphere_shape], ts_names, uv_set=None,
     )
@@ -576,6 +599,8 @@ def run_maya_cases(cmds):
         sew_error = exception_observation(exc)
 
     inst = cmds.instance(cube, name="uvremap_arr_cube_inst")[0]
+    inst_mat, inst_sg = _make_shader(cmds, "uvremap_arr_inst_mat")
+    cmds.sets(inst + ".f[0]", edit=True, forceElement=inst_sg)
     arrays_inst, info_inst = um.collect_arrays(
         [cube_shape, sphere_shape], ts_names, uv_set=info.get("uv_set"),
     )
@@ -587,26 +612,133 @@ def run_maya_cases(cmds):
             "shape": entry.get("shape"),
             "is_default_sg": entry.get("is_default_sg"),
             "surface_shader": entry.get("surface_shader"),
+            "shading_group": entry.get("shading_group"),
+            "shading_groups": entry.get("shading_groups"),
             "face_ids": entry.get("face_ids"),
             "uuid": entry.get("uuid"),
+            "ts_name_unresolved": entry.get("ts_name_unresolved"),
         })
     face_ids_ok = False
     if cube_default is not None:
         face_ids_ok = cube_info["unassigned_idx"] in (cube_default.get("face_ids") or [])
         default_flag_ok = bool(cube_default.get("is_default_sg") is True)
+        default_key_ok = (
+            default_shader is not None
+            and default_key == default_shader
+            and default_key in listed
+            and INITIAL_SG not in listed
+        )
     else:
         default_flag_ok = False
+        default_key_ok = False
+
+    named_mesh = cmds.polyCube(name="uvremap_chk_named")[0]
+    named_shape = _shape_of(cmds, named_mesh)
+    named_faces = int(cmds.polyEvaluate(named_shape, face=True))
+    named_mid = max(1, named_faces // 2)
+    mat_a, sg_a = _make_named_shader(cmds, "chkMatA", "chkSgA")
+    mat_b, sg_b = _make_named_shader(cmds, "chkMatB", "chkSgB")
+    cmds.sets(_face_range(named_mesh, 0, named_mid - 1), edit=True, forceElement=sg_a)
+    if named_mid <= named_faces - 1:
+        cmds.sets(
+            _face_range(named_mesh, named_mid, named_faces - 1),
+            edit=True, forceElement=sg_b,
+        )
+    share_cube = cmds.polyCube(name="uvremap_chk_share")[0]
+    share_shape = _shape_of(cmds, share_cube)
+    share_mat, share_sg1 = _make_named_shader(cmds, "chkShareMat", "chkShareSg1")
+    share_sg2 = cmds.sets(
+        renderable=True, noSurfaceShader=True, empty=True, name="chkShareSg2",
+    )
+    cmds.connectAttr(share_mat + ".outColor", share_sg2 + ".surfaceShader", force=True)
+    share_faces = int(cmds.polyEvaluate(share_shape, face=True))
+    share_mid = max(1, share_faces // 2)
+    cmds.sets(_face_range(share_cube, 0, share_mid - 1), edit=True, forceElement=share_sg1)
+    if share_mid <= share_faces - 1:
+        cmds.sets(
+            _face_range(share_cube, share_mid, share_faces - 1),
+            edit=True, forceElement=share_sg2,
+        )
+    listed_named = um.list_texture_sets()
+    plane_keys = []
+    share_entries = []
+    for key, entries in listed_named.items():
+        for entry in entries:
+            shape = str(entry.get("shape") or "")
+            if named_shape in shape or named_mesh in shape:
+                plane_keys.append(key)
+            if share_shape in shape or share_cube in shape:
+                share_entries.append((key, entry))
+    named_keys_ok = (
+        mat_a in plane_keys
+        and mat_b in plane_keys
+        and sg_a not in plane_keys
+        and sg_b not in plane_keys
+    )
+    share_keys = sorted(set(item[0] for item in share_entries))
+    share_ok = (
+        share_keys == [share_mat]
+        and share_entries
+        and sorted(share_entries[0][1].get("shading_groups") or [])
+        == sorted([share_sg1, share_sg2])
+    )
+
+    arrays_sg, info_sg = um.collect_arrays(
+        [cube_shape], [cube_info["sg_a"]], uv_set=info.get("uv_set"),
+    )
+    sg_fallback_ok = um.WARN_TS_NAME_SG in (info_sg.get("warnings") or [])
 
     checks = {
+        "list_texture_sets_shader_keys": _pass_or_fail(
+            named_keys_ok,
+            "シェーダー名とグループ名が違うとき list_texture_sets のキーはシェーダー名",
+            {
+                "mat_a": mat_a,
+                "sg_a": sg_a,
+                "mat_b": mat_b,
+                "sg_b": sg_b,
+                "plane_keys": plane_keys,
+                "named_shape": named_shape,
+            },
+        ),
+        "list_texture_sets_merge_shared_shader": _pass_or_fail(
+            share_ok,
+            "1つのシェーダーを2つのグループに繋ぐと1つのTSにまとまる",
+            {
+                "share_mat": share_mat,
+                "share_sg1": share_sg1,
+                "share_sg2": share_sg2,
+                "share_keys": share_keys,
+                "share_groups": (
+                    share_entries[0][1].get("shading_groups") if share_entries else None
+                ),
+                "share_face_ids": (
+                    share_entries[0][1].get("face_ids") if share_entries else None
+                ),
+            },
+        ),
         "list_texture_sets_default_sg": _pass_or_fail(
-            bool(default_entries) and default_flag_ok and face_ids_ok,
-            "未割当フェースが initialShadingGroup (is_default_sg) として出る",
+            bool(default_entries) and default_flag_ok and face_ids_ok and default_key_ok,
+            "未割当フェースのキーは initialShadingGroup の surfaceShader(その場の名前)で is_default_sg",
             {
                 "n_default_entries": len(default_entries),
                 "entries": listed_flags,
+                "default_shader": default_shader,
+                "default_key": default_key,
                 "cube_unassigned_idx": cube_info["unassigned_idx"],
                 "face_ids_ok": face_ids_ok,
                 "is_default_sg_ok": default_flag_ok,
+                "default_key_ok": default_key_ok,
+            },
+        ),
+        "collect_arrays_sg_name_fallback": _pass_or_fail(
+            sg_fallback_ok,
+            "ts_names がグループ名のときは互換一致し ts_name_matched_by_shading_group を出す",
+            {
+                "sg_a": cube_info["sg_a"],
+                "warnings": info_sg.get("warnings"),
+                "ts_names": info_sg.get("ts_names"),
+                "n_faces": int(arrays_sg["ts_faces__0"].size) if "ts_faces__0" in arrays_sg else 0,
             },
         ),
         "array_consistency": _pass_or_fail(
@@ -677,6 +809,9 @@ def run_maya_cases(cmds):
         },
         "list_keys": sorted(listed.keys()),
         "n_listed_ts": len(listed),
+        "default_shader": default_shader,
+        "named_shader_keys": sorted(set(plane_keys)),
+        "share_shader_keys": share_keys,
     }
     return checks, extra
 
