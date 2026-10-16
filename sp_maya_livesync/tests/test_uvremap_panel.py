@@ -166,7 +166,10 @@ class TestStatusModel:
 def qapp():
     pytest.importorskip("PySide6")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError as exc:
+        pytest.skip(f"PySide6 を import できない: {exc}")
 
     app = QApplication.instance()
     if app is None:
@@ -302,7 +305,11 @@ class TestUVRemapPanel:
             assert COLOR_ATTENTION in converting.styleSheet()
             assert stale.text() == "STALE"
             assert COLOR_ATTENTION in stale.styleSheet()
-            assert "CONVERTING" in panel.findChild(type(panel._overall), "overall_status").text()
+            overall_text = panel.findChild(type(panel._overall), "overall_status").text()
+            assert "STALE" in overall_text
+            assert COLOR_ATTENTION in panel.findChild(
+                type(panel._overall), "overall_status"
+            ).styleSheet()
         finally:
             panel.hide()
             panel.close()
