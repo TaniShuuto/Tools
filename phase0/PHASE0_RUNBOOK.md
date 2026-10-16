@@ -47,7 +47,7 @@ Script Editor(Python)で個別実行する場合は、**空の新規シーン**�
 | V9 Maya | `v9_triangulated_fbx.py` | 3分 |
 | V9 Painter | `v9_protocol.md`(手動) | 15分 |
 
-V9のFBXは `phase0\scratch\phase0_v9_triangulated.fbx`。Painter側は `v9_protocol.md`。
+V9のFBXは `phase0\scratch\phase0_v9b_triangulated.fbx`。Painter側は `v9_protocol.md`。
 
 ---
 
