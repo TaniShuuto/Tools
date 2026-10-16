@@ -109,7 +109,7 @@ def diag_c1_check_qobject_validity(window):
 #  ここを更新すること。
 #
 #  変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.6.3"
+__version__ = "1.7.0"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -262,6 +262,11 @@ DEFAULT_CONFIG = {
     # 内での紐付けをここにも保持しておく(セッション内フォールバック用)。
     # 恒久的な紐付けは常にシーンファイル側(fileInfo)を正とする。
     "last_scene_project_links": {},
+    # UV再マップ(試験運用)。既定OFF。Painter側と共有する設定ファイルへ
+    # 追加するキー。save_config() はディスク上の他キーを消さない。
+    "uvremap_enabled": False,
+    "uvremap_root_dir": "C:/SPMayaLiveSync/uvremap",
+    "uvremap_mayapy_path": "",
 }
 
 # Phase 3: file ノードのcolorSpaceに設定する値の候補。カラーマネジメント
@@ -2763,6 +2768,11 @@ class LiveSyncWatcher(QtCore.QObject):
         try:
             for node in file_nodes:
                 try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        continue
+                except Exception:
+                    pass
+                try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
                     continue
@@ -2939,6 +2949,11 @@ class LiveSyncWatcher(QtCore.QObject):
         corrected = []
         try:
             for node in file_nodes:
+                try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        continue
+                except Exception:
+                    pass
                 try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
@@ -3953,6 +3968,11 @@ class LiveSyncWatcher(QtCore.QObject):
         nodes = []
         for node in cmds.ls(type="file") or []:
             try:
+                if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                    continue
+            except Exception:
+                pass
+            try:
                 tex_path = cmds.getAttr(node + ".fileTextureName")
             except Exception:
                 continue
@@ -3975,6 +3995,11 @@ class LiveSyncWatcher(QtCore.QObject):
             normalized_target = _normalize_project_key_for_compare(project_key)
             managed_dirs_all = self._managed_dirs()
             for node in cmds.ls(type="file") or []:
+                try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        continue
+                except Exception:
+                    pass
                 try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
@@ -4003,6 +4028,11 @@ class LiveSyncWatcher(QtCore.QObject):
         cmds.undoInfo(stateWithoutFlush=True)
         try:
             for node in nodes:
+                try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        continue
+                except Exception:
+                    pass
                 try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
@@ -4865,6 +4895,17 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         stats_layout.addRow("直近で反映したテクスチャ数", self.node_count_label)
         layout.addWidget(stats_group)
 
+        self._uvremap = None
+        try:
+            import uvremap_integration
+            self._uvremap = uvremap_integration.attach(self, layout)
+        except Exception:
+            self._uvremap = None
+            _append_history(
+                "uvremap",
+                "UV再マップ欄の組み込みに失敗しました。Live Sync は従来どおり動作します",
+            )
+
         layout.addWidget(QtWidgets.QLabel("ログ（動作の記録）"))
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -5682,6 +5723,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 self.enable_btn.blockSignals(False)
             self._refresh_scene_link_label()
             self._refresh_material_table()
+            try:
+                if getattr(self, "_uvremap", None) is not None:
+                    self._uvremap.on_scene_changed()
+            except Exception:
+                pass
 
             # 2026.07.23 追加(実機報告: シーンを閉じて開き直すとUDIM
             # テクスチャを使っているオブジェクトが未割り当てのように
@@ -5748,6 +5794,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 except Exception:
                     pass
             self._scene_callback_ids = []
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_uvremap", None) is not None:
+                self._uvremap.shutdown()
         except Exception:
             pass
         super(LiveSyncWindow, self).closeEvent(event)

@@ -36,8 +36,12 @@ MSG_NO_MAYAPY = (
     "mayapy が見つかりません。Maya の mayapy のパスを mayapy_path で指定してください"
 )
 MSG_NO_FILE_NODES = "変換は完了しましたが、切り替え対象のファイルノードが見つかりません"
+MSG_SCENE_CHANGED = (
+    "シーンが変わったため切り替えを見送りました。もう一度『今すぐ変換』を押してください"
+)
 WARN_NO_FILE_NODES = "no_file_nodes_switched"
 WARN_FILE_MISSING = "converted_file_missing"
+WARN_SCENE_CHANGED = "scene_changed"
 WORKER_SCRIPT = Path(__file__).resolve().parent / "uvremap_worker.py"
 ACTIVE_BASELINE_NAME = "active.json"
 LATEST_GENERATION_DIR = "latest_generation"
@@ -450,6 +454,18 @@ def _default_collect(shape_paths, ts_names, uv_set=None):
     return um.collect_arrays(shape_paths, ts_names, uv_set=uv_set)
 
 
+def _default_scene_id():
+    """現在のシーン識別子。未保存は空文字(未保存同士は区別できない)。"""
+    try:
+        import maya.cmds as cmds  # type: ignore
+        name = cmds.file(query=True, sceneName=True)
+    except Exception:
+        return ""
+    if not name:
+        return ""
+    return str(name)
+
+
 def _list_baseline_ids(root: Path) -> list:
     base = root / "baseline"
     if not base.is_dir():
@@ -524,6 +540,7 @@ class UVRemapRuntime:
         collect_arrays_fn=None,
         worker_script=None,
         exists_fn=None,
+        scene_id_fn=None,
     ):
         if get_enabled is None or not callable(get_enabled):
             raise RuntimeControlError("get_enabled がありません")
@@ -538,12 +555,22 @@ class UVRemapRuntime:
         self.collect_arrays_fn = collect_arrays_fn or _default_collect
         self.worker_script = Path(worker_script) if worker_script else WORKER_SCRIPT
         self.exists_fn = exists_fn if exists_fn is not None else os.path.isfile
+        self.scene_id_fn = scene_id_fn if scene_id_fn is not None else _default_scene_id
         self._seq = 0
         self._jobs = {}
         self._seen_roots = {}
 
     def _now(self) -> str:
         return _as_iso(self.now_fn())
+
+    def _scene_id(self) -> str:
+        try:
+            value = self.scene_id_fn()
+        except Exception:
+            return ""
+        if value is None:
+            return ""
+        return str(value)
 
     def _next_id(self, prefix: str, iso: str) -> str:
         self._seq += 1
@@ -806,6 +833,7 @@ class UVRemapRuntime:
             "proc": proc,
             "log_fh": log_fh,
             "log_path": log_path,
+            "scene_id": self._scene_id(),
         }
         return job_id
 
@@ -837,6 +865,26 @@ class UVRemapRuntime:
         return events
 
     def _finish_job(self, rec: dict, exit_code: int) -> dict:
+        if self._scene_id() != str(rec.get("scene_id") or ""):
+            iso = self._now()
+            ts_name = rec["ts_name"]
+            root = rec["root"]
+            gen = rec.get("generation", 0)
+            if not isinstance(gen, int) or isinstance(gen, bool):
+                gen = 0
+            self._set_status(root, ts_name, STATE_ORIGINAL, gen, MSG_SCENE_CHANGED, iso)
+            return {
+                "job_id": rec["job_id"],
+                "project_key": rec.get("project_key"),
+                "ts_name": ts_name,
+                "exit_code": exit_code,
+                "state": STATE_ORIGINAL,
+                "message": MSG_SCENE_CHANGED,
+                "switched": [],
+                "reverted": [],
+                "updated": iso,
+                "warning": WARN_SCENE_CHANGED,
+            }
         iso = self._now()
         ts_name = rec["ts_name"]
         root = rec["root"]

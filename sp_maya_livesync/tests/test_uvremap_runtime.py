@@ -156,7 +156,7 @@ def _yes_exists(_path):
 
 def _make_runtime(
     tmp_path, *, enabled=True, cmds=None, popen=None, collect=None, mayapy=None,
-    exists_fn=None,
+    exists_fn=None, scene_id_fn=None,
 ):
     root = tmp_path / "uvremap" / "proj"
     root.mkdir(parents=True, exist_ok=True)
@@ -185,6 +185,7 @@ def _make_runtime(
         mayapy_path=mayapy,
         collect_arrays_fn=collect,
         exists_fn=exists_fn,
+        scene_id_fn=scene_id_fn,
     )
     runtime._now_box = now_box
     runtime._root_path = root
@@ -896,3 +897,62 @@ def test_converting_written_before_popen(tmp_path):
     assert seen["status"]["ts"][TS]["state"] == rt.STATE_CONVERTING
     assert seen["status"]["ts"][TS]["updated"] == FIXED_NOW
     assert seen["status"]["ts"][TS]["generation"] == 1
+
+
+def test_poll_skips_switch_when_scene_id_changes(tmp_path):
+    scene = {"id": "sceneA.ma"}
+    original = "/src/Final/Body_BaseColor.png"
+    cmds = FakeCmds({
+        "file_body": {"fileTextureName": original, "uvTilingMode": 0},
+    })
+    files = [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}]
+    runtime = _make_runtime(
+        tmp_path, cmds=cmds, popen=_popen_ok_with_files(files),
+        exists_fn=_yes_exists, scene_id_fn=lambda: scene["id"],
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    scene["id"] = "sceneB.ma"
+    events = runtime.poll()
+    assert len(events) == 1
+    assert events[0]["warning"] == rt.WARN_SCENE_CHANGED
+    assert events[0]["state"] == rt.STATE_ORIGINAL
+    assert events[0]["message"] == rt.MSG_SCENE_CHANGED
+    assert events[0]["switched"] == []
+    assert events[0]["reverted"] == []
+    assert events[0]["updated"] == FIXED_NOW
+    assert cmds.nodes["file_body"]["fileTextureName"] == original
+    assert rt.ATTR_ORIGINAL_PATH not in cmds.nodes["file_body"]["extra"]
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"][TS]["message"] == rt.MSG_SCENE_CHANGED
+    assert status["ts"][TS]["updated"] == FIXED_NOW
+
+
+def test_poll_switches_when_unsaved_scene_ids_are_both_empty(tmp_path):
+    original = "/src/Final/Body_BaseColor.png"
+    cmds = FakeCmds({
+        "file_body": {"fileTextureName": original, "uvTilingMode": 0},
+    })
+    files = [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}]
+    runtime = _make_runtime(
+        tmp_path, cmds=cmds, popen=_popen_ok_with_files(files),
+        exists_fn=_yes_exists, scene_id_fn=lambda: "",
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    events = runtime.poll()
+    assert len(events) == 1
+    assert "warning" not in events[0]
+    assert events[0]["switched"] == ["file_body"]
+    assert cmds.nodes["file_body"]["fileTextureName"] != original

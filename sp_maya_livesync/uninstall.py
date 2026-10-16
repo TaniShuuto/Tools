@@ -93,7 +93,19 @@ def onMayaDroppedPythonFile(*args, **kwargs):
 # 動作できるようにするため)。
 # 2026.07.20(見落とし修正): udim_setup.py を追加。install.py の
 # TOOL_FILES と UDIM_LABEL / UDIM_ICON_NAME に対応。
-TOOL_FILE_NAMES = ["maya_live_sync.py", "sp_to_aiStandardSurface.py", "udim_setup.py"]
+TOOL_FILE_NAMES = [
+    "maya_live_sync.py",
+    "sp_to_aiStandardSurface.py",
+    "udim_setup.py",
+    "uvremap_core.py",
+    "uvremap_io.py",
+    "uvremap_worker.py",
+    "uvremap_bridge.py",
+    "uvremap_maya.py",
+    "uvremap_runtime.py",
+    "uvremap_panel.py",
+    "uvremap_integration.py",
+]
 LIVESYNC_LABEL = "LiveSync"
 AISS_LABEL = "aiSS"
 UDIM_LABEL = "UDIM"

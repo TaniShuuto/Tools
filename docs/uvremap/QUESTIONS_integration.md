@@ -1,0 +1,141 @@
+# 指揮役への質問・記録(レーン D2b Live Sync 組み込み)
+
+契約 `CONTRACT.md` §6、`QUESTIONS_runtime.md`、既存の `uvremap_runtime.py` /
+`uvremap_panel.py` / `uvremap_maya.py` の公開部分と、`maya_live_sync.py` の
+指定箇所を読んで組み込んだ。既存 Live Sync の監視・再読込・品質切替の意味は
+変えない方針。ここで勝手に決めず、確認結果と判断を残す。
+
+## I1. `save_config` のマージ(他キーを消さない)
+
+`save_config(cfg)` は「ディスク上の最新 JSON を読む → `merged.update(cfg)` →
+一時ファイル経由で原子置換」(`_merge_and_write_config`)。呼び出し元が渡した
+キーだけが上書きされ、ディスク上の他キーは残る。
+
+`load_config()` は `dict(DEFAULT_CONFIG)` の上にディスク内容を `update` する。
+ディスクに無い新キー(`uvremap_enabled` 等)は、メモリ上では DEFAULT の値が入る。
+ディスクへは、こちらが `save_config({"uvremap_enabled": ...})` したときだけ書かれる。
+
+キルスイッチの保存は `LiveSyncWatcher.save_mapping_only`(メモリ更新 +
+`save_config`、監視の再起動なし)を使う。Painter 側と共有する設定ファイルなので、
+全キーの上書き保存はしていない。
+
+ロック取得がタイムアウトしたときは、従来どおりロック無しで同じマージを 1 回行う。
+
+## I2. 未保存シーンの識別子は空文字同士で一致する
+
+`UVRemapRuntime` の `scene_id_fn` 既定は `cmds.file(query=True, sceneName=True)`。
+未保存は空文字。ジョブ記録時と `poll()` 完了処理時を比べ、不一致なら切替も
+原本復帰もせず、`warning=scene_changed`、当該 TS の status を `ORIGINAL`、
+メッセージ「シーンが変わったため切り替えを見送りました。もう一度『今すぐ変換』を
+押してください」。
+
+未保存のシーン同士は空文字同士になるため区別できない。別の未保存シーンへ
+切り替えても、完了処理は通常どおりファイルノードを切り替える。
+保存済みパス同士、または保存済みと未保存の組み合わせだけが不一致になる。
+
+## I3. 干渉の確認(fileTextureName を書き換える処理)
+
+読んだ関数と結論。属性名 `uvremapOriginalPath` は runtime 側の公開名のまま。
+
+書き換えがある(スキップを入れた):
+
+- `LiveSyncWatcher.reload_textures`(ループ先頭、`file_nodes` 走査)
+- `LiveSyncWatcher.reload_final_textures`(同上)
+- `LiveSyncWatcher.switch_texture_quality`(対象収集の 2 ループと、実際の
+  `setAttr` ループ。3 か所)
+
+変換後ノードの `fileTextureName` は既定では
+`<uvremap_root_dir>/<Finalサブフォルダ>/output/final` を指し、
+`watch_dir` / `final_export_dir` の外になる。この場合、フォルダ一致だけでは
+上記ループに入らない。ただし作業フォルダを監視/Final の内側に置いた誤設定や、
+ファイル名 prefix のフォールバック経路では書き換え得るため、属性がある
+ノードは触らないようにした。各所 5 行以内。
+
+書き換えが無い(変更していない):
+
+- `backup_final_textures_to_sourceimages`: ファイルコピーのみ。file ノードの
+  パスは変えない。
+- `create_shader_network`(fileTextureName を書く 4177 行付近): 新規ノード作成。
+  変換後ノードを上書きする処理ではない。
+- `is_texture_set_mapped`: 読み取りのみ。
+
+判断に迷ったため変更していない:
+
+- `find_orphan_file_nodes`(3784 行付近): 書き換えはしない。変換後パスは
+  `managed_dirs`(watch/Final)の外なので、既定では孤立にも載らない。
+  もし作業フォルダが `managed_dirs` の内側だと、ファイル名は
+  `<ts>_<suffix>` のままなので prefix 一致で孤立にはならない想定。
+  誤検出の実機確認は未実行。
+- `detect_quality_by_project`(3818 行付近): 読み取りのみ。変換後ノードは
+  watch/Final のどちらにも属さないため、全ノードが変換後だと品質判定の
+  キーが立たない可能性がある。品質ボタンの見た目への影響は実機必須。
+- `is_texture_set_mapped` のパス照合: 変換後パスは `managed_dirs` 外なので、
+  シェーダー対応の記録が無いと「未対応」に見えうる。SG マップがあれば先に
+  True を返す既存経路がある。実機必須。
+
+## I4. 基準UVは自動記録しない。force 再記録は UI に出さない
+
+「基準UVを記録」は利用者が押す。確認ダイアログは画面側
+(`handle_record_request` / `decide_baseline_prompt`)。コントローラは確認を
+持たない。既にあれば上書きせず、「基準は記録済みです。作り直すには…」と返す。
+`force=True` の再記録ボタンは、このタスクでは出していない。
+
+## I5. 対象 TS とフォルダ
+
+- 作業対象: `LiveSyncWindow._current_quality_target_project_key()`(正規化済み)。
+  None なら操作せず、パネルメッセージに理由を出す。
+- 既知 TS: そのプロジェクトの `known_texture_sets_by_project` だけ。
+  シーン全体の和集合は使わない。
+- シーン側: `uvremap_maya.list_texture_sets()` のキー(シェーダー名 = TS名)。
+  無い TS は対象外にして名前を出す。0 件なら何もしない。
+- メッシュ: 対象 TS の `shape` の和集合(昇順)。
+- 入力(原本テクスチャ): `watcher._final_dir_for_project(project_key)`。
+  None なら「このプロジェクトの Final 書き出し先が未登録です。…」。
+- 作業フォルダ: `<uvremap_root_dir>/<Finalサブフォルダ名>`。
+- 出力: `<uvremap_root>/output/final`。
+  `final_export_dir` / `watch_dir` の内側なら書き込まず中止する。
+
+`convert_now` は TS ごとに `runtime.convert_now(..., timeout_s=1200)`。
+`out_res` は取らない。
+
+## I6. キルスイッチと poll の警告
+
+OFF のとき変換は何もしない。OFF にした瞬間に `revert_to_original()`。
+基準UVの記録は OFF でも許可する。
+
+`poll()` の `warning`(`no_file_nodes_switched` / `converted_file_missing` /
+`scene_changed`)は日本語でパネルのメッセージ行へ出し、
+`_append_history("uvremap", ...)` にも残す。
+
+`converted_file_missing` で一部だけ切り替わった場合、runtime は
+`CONVERTED_OK` のまま warning と `missing` を付ける(QUESTIONS_runtime.md
+D2c-3)。こちらは status.json を上書きせず、メッセージ行にだけ出す。
+ワーカー/runtime が書いた状態と矛盾させない。
+
+## I7. バージョン整合
+
+`maya_live_sync.__version__` を `1.7.0` にした。`install.py` の
+`_collect_installed_versions` は、ロード済みモジュールの `__version__` を
+一覧するだけで、他ファイルが同じ文字列であることは要求しない。
+uvremap_* は `required: False` のため、無くても Live Sync 本体は入る。
+`install.py` 自身の `__version__`(インストーラ 1.0.4)は変えていない。
+
+## I8. 未実行(実機必須)
+
+このクラウド環境に Maya は無い。次は学校 PC で確認すること。
+
+1. `feat/uvremap-integration` を入れ、`install.py` をドラッグ&ドロップする。
+2. Live Sync 窓の「同期」タブに「UV再マップ(試験運用)」があること。
+   既定は折りたたみ。展開できること。import 失敗時も Live Sync が従来どおり動くこと。
+3. プロジェクト未リンク / Final 未登録のとき、操作が拒否されメッセージが出ること。
+4. Painter へメッシュを送った直後に「基準UVを記録」。確認ダイアログのあと 1 回だけ
+   記録され、再押しでは上書きせず案内だけになること。
+5. キルスイッチ ON で「今すぐ変換」。完了後にファイルノードが変換後パスになること。
+   監視フォルダ・Final フォルダの中に変換結果が書かれないこと。
+6. 「原本に戻す」で `uvremapOriginalPath` 経由に戻り、属性が消えること。
+7. キルスイッチ OFF で変換が動かず、OFF にした瞬間に原本へ戻ること。OFF でも
+   基準記録はできること。
+8. 変換中に別の保存済みシーンを開いたとき、切替が見送られ
+   `scene_changed` の案内が出ること。未保存同士は区別できないこと。
+9. 変換後にプレビュー再読込・Final 再読込・表示品質切替を行い、変換後ノードの
+   パスが watch/Final 側へ巻き戻されないこと。孤立ノード一覧に誤って出ないこと。
