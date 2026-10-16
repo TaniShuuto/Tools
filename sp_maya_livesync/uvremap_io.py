@@ -47,6 +47,7 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_CHANNELS = {0: 1, 4: 2, 2: 3, 6: 4}
 _MODE_8BIT = {1: "L", 2: "LA", 3: "RGB", 4: "RGBA"}
 _MODE_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4, "I;16": 1}
+MODE_CHANNELS = _MODE_CHANNELS  # ワーカーから参照する公開名
 
 
 def _require_pillow():
@@ -176,13 +177,14 @@ REPLACE_RETRIES = 5
 REPLACE_DELAY_S = 0.2
 
 
-def replace_file(src, dst, *, retries: int = REPLACE_RETRIES, delay: float = REPLACE_DELAY_S) -> None:
+def replace_file(src, dst, *, retries: int | None = None, delay: float | None = None) -> None:
     """``os.replace(src, dst)`` を最大 ``retries`` 回(間隔 ``delay`` 秒)試す。
 
     ``FileNotFoundError``(src が無い等)は再試行しても無意味なのでそのまま送出する。
     試行を使い切ったら ``ReplaceFailed``(OSError のサブクラス)。
     """
-    attempts = max(1, int(retries))
+    attempts = max(1, int(REPLACE_RETRIES if retries is None else retries))
+    delay = REPLACE_DELAY_S if delay is None else delay
     last: Exception | None = None
     for i in range(attempts):
         try:
