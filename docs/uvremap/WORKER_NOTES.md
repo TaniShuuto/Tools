@@ -11,11 +11,11 @@
 | `lock_timeout_s` | 60 | `worker.lock` の待機上限(超過で終了コード 12) |
 | `hard_kill_grace_s` | 15 | `timeout_s` 超過後、協調的に止まらない処理を強制終了するまでの猶予 |
 | `latest_generation_path` | なし | Maya が「最新に要求した世代」を書く小さなファイル(整数、または `{"generation": N}`)。N > job.generation なら、開始時と公開直前に 10 で破棄する |
-| `uv_hash` | `current_snapshot_dir/meta.json` の `uv_hash` | ledger / flag に書く UV ハッシュ。**TS 単位の値を Maya が渡すこと**(QUESTIONS Q2) |
+| `uv_hash` | `core.compute_uv_hash(現行, ts_name)`(TS 単位)。core に無ければ `current_snapshot_dir/meta.json` の `uv_hash` | ledger / flag に書く UV ハッシュ。job が渡せばそれを優先(A3 で既定を TS 単位に変更、QUESTIONS_e2e.md E4) |
 | `baseline_id` | `baseline_dir/meta.json` の `baseline_id`、無ければフォルダ名 | ledger の `baseline_id` |
 | `channels[].normal_green_down` | false | `ChannelSpec.normal_green_down` へそのまま渡す |
 
-`udim` は、`core.convert_channel` が `udim` キーワード引数(または `**kwargs`)を受け取る場合だけ渡す。契約 §3 のシグネチャには無いので、A1 が追加しなければ無視される。
+`udim` は、`core.convert_channel` と `core.probe_verify` が `udim` キーワード引数(または `**kwargs`)を受け取る場合に渡す。`normal_mode` も `probe_verify` に渡す(変換と同じ値でなければプローブが別の変換と比べてしまう。A3 で追加、QUESTIONS_e2e.md E2)。契約 §3 のシグネチャには無いが、実際の core は受け取る(QUESTIONS_core Q4)。
 
 ## 2. 意味の補足
 
@@ -38,3 +38,25 @@
 5. 手順 4 の途中で例外が出たら、バックアップから出力・flag・ledger・退避ファイルを元に戻して 12。
 
 **プロセスごと死んだ場合(SIGKILL・電源断)**: 手順 4 の途中なら出力が新旧混在し得るが、flag は外れたままなので「完了」には見えない。次の実行は、残った一時ファイルを掃除し、`publish_journal` に書かれた sha1 は「手編集ではない」と認めるため、誤って `.edited_` へ退避することなく新しい完全な世代を公開する。変換中(手順 1〜2)に死んだ場合は出力・ledger とも無変更。
+
+## 4. 画像 I/O(`uvremap_io.py`、A3 で Pillow 非依存の自前実装に置き換え)
+
+実機の mayapy(3.11 / numpy 1.26.4)には Pillow が無いため、PNG の読み書きは `zlib` + `struct` + `numpy` だけで行う(QUESTIONS_e2e.md E1)。
+Pillow が入っている環境でも使わない(`PIL` を import しない)ので、環境による結果の差は出ない。Pillow はテストでの照合にだけ使う。
+
+- **対応**: 色タイプ 0 / 2 / 4 / 6、ビット深度 8 と 16、非インターレース、フィルタ 5 種(行ごとに混在可)、複数 IDAT(長さ 0 も可)、
+  補助チャンク(読み飛ばす。CRC は検査する)、IEND 後の余分なバイト(無視)。
+- **対応外**: パレット、インターレース、ビット深度 1/2/4、未知の重要チャンク(先頭が大文字)、PNG 以外 -> `UnsupportedFormat`(終了コード 11)。
+  ヘッダが PNG として正しく、本体が壊れている(CRC 不一致、チャンク欠落・途中切れ、zlib 破損、データ量の不一致、フィルタ種別が不正)-> `ImageIOError`(12)。
+  IHDR の CRC 不一致も、署名と IHDR の形が正しければ 12。
+- **読み込みの速度**: Sub は `cumsum`、Up は行の加算、None は何もしない。Average / Paeth は画素 (y, x) が (y, x-1)・(y-1, x)・(y-1, x-1) だけに依存するので、
+  **反対角線(y + x が同じ画素)ごとにまとめて**計算する(同じ反対角線上の画素は互いに独立で、依存先は前の 2 本にある)。画素単位の Python ループは無い。
+  結果は PNG 仕様 9.2 そのままの素朴な参照実装(`tests/png_testkit.py`)とビット一致する(`tests/test_uvremap_io.py`)。
+  4096² RGBA 8bit で、Paeth 全行の読み込みは約 3 秒(E2E_REPORT.md の表)。
+- **書き込み**: 原本(`meta`)と同じビット深度・モード。16bit は big-endian。値は 0..1 にクリップ(NaN は 0)して `rint` で丸める。
+  フィルタは行ごとに None / Sub / Up のうち「絶対値の和が最小」を選び、zlib は level 4、IDAT は 1 MB ごとに分割する。
+- **保持しないもの**: 補助チャンク(`gAMA` / `cHRM` / `sRGB` / `iCCP` / `pHYs` / `tEXt` / `tIME` / `bKGD` / `tRNS` など)は読み飛ばし、書き出さない。
+  出力 PNG は IHDR + IDAT + IEND だけで、色空間のタグ(ICC・ガンマ)を持たない。画素値は原本と同じ規約のまま(sRGB / raw は job の `colorspace` で決まる)。
+  `tRNS`(パレット無しのカラーキー透過)も無視される。Painter は通常これらを出力しないが、Maya のファイルノードが ICC を参照する運用がある場合は要確認(QUESTIONS_e2e.md E1)。
+- **メモリ**: 4096² RGBA 8bit の読み込みでピーク約 400 MB(float32 の配列 268 MB を含む)、書き込みでピーク約 440 MB。
+

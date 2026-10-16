@@ -24,7 +24,7 @@
 core(uvremap_core)は遅延 import し、契約 §3 のシグネチャだけに依存する。
 ワーカーは世代番号を採番しない(Maya側が採番する)。
 
-標準ライブラリ + numpy(+ 任意で Pillow: uvremap_io 経由)のみ。Python 3.10+。
+標準ライブラリ + numpy のみ(画像 I/O は uvremap_io 経由。Pillow は使わない)。Python 3.10+。
 """
 from __future__ import annotations
 
@@ -445,6 +445,39 @@ def _accepts_kwarg(func, name: str) -> bool:
     return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _core_error_kind(exc: BaseException) -> str | None:
+    """uvremap_core の例外の種類("ConversionStopped" 等)。core の例外でなければ None。
+
+    core は遅延 import でスタブに差し替えられることもあるため、クラスの実体ではなく
+    「uvremap_core モジュールで定義された例外クラスの名前」で見分ける。
+    """
+    for cls in type(exc).__mro__:
+        if getattr(cls, "__module__", "") == "uvremap_core" and cls.__name__ in (
+                "ConversionStopped", "TextureSetNotFound", "SnapshotError", "ChannelFormatError"):
+            return cls.__name__
+    return None
+
+
+def _translate_core_error(exc: BaseException) -> "_Abort | None":
+    """core の例外を、契約の終了コード(11 停止 / 12 失敗)に対応する ``_Abort`` へ写す。
+
+    ConversionStopped(Decision が STOP、変換できる面が無い)、TextureSetNotFound、
+    ChannelFormatError(入力テクスチャの形式が変換できない)は 11。SnapshotError は 12。
+    それ以外の core の例外は呼び出し側の「予期しない例外」(12)に任せる。
+    """
+    kind = _core_error_kind(exc)
+    if kind == "ConversionStopped":
+        reasons = getattr(exc, "reasons", None) or [str(exc)]
+        return Blocked("変換を停止しました(理由: {0})".format(", ".join(str(r) for r in reasons)))
+    if kind == "TextureSetNotFound":
+        return Blocked("テクスチャセットがスナップショットにありません(ts_missing): {0}".format(exc))
+    if kind == "ChannelFormatError":
+        return Blocked("入力テクスチャの形式が変換できません: {0}".format(exc))
+    if kind == "SnapshotError":
+        return JobFailed("スナップショットを読めません/不正です: {0}".format(exc))
+    return None
+
+
 # ---------------------------------------------------------------------------
 # ジョブ本体
 # ---------------------------------------------------------------------------
@@ -476,6 +509,7 @@ class _Run:
         self._src_norm: str | None = None
         self._status_prev = None
         self._status_prev_captured = False
+        self._core = None
 
     # ------------------------------------------------------------ messages
     def msg(self, level: str, text: str) -> None:
@@ -730,9 +764,10 @@ class _Run:
         self._tick()
 
         core = _import_core()
+        self._core = core
         t1 = time.monotonic()
-        base = core.load_snapshot(Path(j["baseline_dir"]))
-        cur = core.load_snapshot(Path(j["current_snapshot_dir"]))
+        base = self._load_snapshot(core, j["baseline_dir"], "基準")
+        cur = self._load_snapshot(core, j["current_snapshot_dir"], "現行")
         decision = core.classify(base, cur, self.ts_name)
         self.method = getattr(decision, "method", None)
         for w in getattr(decision, "warnings", None) or []:
@@ -748,6 +783,14 @@ class _Run:
         t2 = time.monotonic()
         self._publish(staged, found, sources, base, cur)
         self.timings["publish"] = time.monotonic() - t2
+
+    def _load_snapshot(self, core, path, label: str):
+        try:
+            return core.load_snapshot(Path(path))
+        except Exception as exc:
+            if _core_error_kind(exc) == "SnapshotError":
+                raise JobFailed("{0}スナップショットを読めません/不正です: {1}".format(label, exc)) from exc
+            raise
 
     # --------------------------------------------------------- 入力の発見
     def _discover(self) -> dict[str, dict]:
@@ -898,6 +941,13 @@ class _Run:
         extra = {}
         if _accepts_kwarg(convert_func, "udim"):
             extra["udim"] = j["udim"]
+        # プローブは変換と同じ udim / normal_mode で検証する(QUESTIONS_core Q4)。
+        # 渡さないと、非UDIMや normal_mode="off" の変換が「別の変換」と比べられて誤って fail する。
+        probe_extra = {}
+        if _accepts_kwarg(core.probe_verify, "udim"):
+            probe_extra["udim"] = j["udim"]
+        if _accepts_kwarg(core.probe_verify, "normal_mode"):
+            probe_extra["normal_mode"] = j["normal_mode"]
         for ch in j["channels"]:
             suffix = ch["suffix"]
             info = found.get(suffix)
@@ -926,7 +976,7 @@ class _Run:
             self.stats[suffix] = getattr(result, "stats", {}) or {}
 
             tp = time.monotonic()
-            report = core.probe_verify(old_tiles, tiles, base, cur, self.ts_name, spec)
+            report = core.probe_verify(old_tiles, tiles, base, cur, self.ts_name, spec, **probe_extra)
             probe_time += time.monotonic() - tp
             self.timings["probe"] = probe_time
             self._record_probe(suffix, report, probe_failed)
@@ -992,11 +1042,23 @@ class _Run:
                     names[(suffix, tile)] = "{0}_{1}.{2}{3}".format(self.ts_name, suffix, tile, ext)
         return names
 
-    def _meta_info(self) -> tuple[str, str]:
-        """(uv_hash, baseline_id)。job > スナップショットの meta.json の順。"""
+    def _meta_info(self, cur=None) -> tuple[str, str]:
+        """(uv_hash, baseline_id)。job > core.compute_uv_hash(cur, ts) > スナップショットの meta.json の順。
+
+        meta.json の ``uv_hash`` はメッシュ全体の値で、別のテクスチャセットの UV を編集しても変わる。
+        D-3(現行UVハッシュとの比較)は TS 単位の値で行うので、job が渡さないときは
+        契約 §3 の ``compute_uv_hash(snap, ts_name)`` で TS 単位の値を求める。
+        """
         j = self.job
         uv_hash = j.get("uv_hash")
         baseline_id = j.get("baseline_id")
+        fn = getattr(self._core, "compute_uv_hash", None)
+        if not uv_hash and cur is not None and callable(fn):
+            try:
+                uv_hash = fn(cur, self.ts_name)
+            except Exception as exc:
+                self.msg("warn", "TS単位の uv_hash を計算できません(メッシュ全体の値を使います): {0}".format(exc))
+                uv_hash = None
         if not uv_hash:
             try:
                 meta = read_json(Path(j["current_snapshot_dir"]) / "meta.json", {}) or {}
@@ -1044,7 +1106,7 @@ class _Run:
         for (suffix, tile), name in names.items():
             s = staged[suffix][tile]
             new_files[name] = {"staged": s["path"], "sha1": s["sha1"], "tile": tile}
-        uv_hash, baseline_id = self._meta_info()
+        uv_hash, baseline_id = self._meta_info(cur)
 
         # ここから先はタイムアウトで強制終了されない(公開は短時間)
         with self._phase_lock:
@@ -1228,7 +1290,15 @@ class _Run:
             self.job_dir = self.root / "jobs" / self.job_id
             self._src_norm = _norm(j["source_dir"])
             _log("job {0} (ts={1}, generation={2}) 開始".format(self.job_id, self.ts_name, self.generation))
-            self.execute()
+            try:
+                self.execute()
+            except _Abort:
+                raise
+            except Exception as exc:
+                mapped = _translate_core_error(exc)
+                if mapped is None:
+                    raise
+                raise mapped from exc
         except _Abort as exc:
             level = "info" if isinstance(exc, Superseded) else "error"
             self.msg(level, str(exc))

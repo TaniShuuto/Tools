@@ -86,9 +86,10 @@ class ConvertResult:
 
 
 def convert_channel(old_tiles, baseline, current, ts_name, decision, spec, out_res, *,
-                    dilate_px: int = 16, normal_mode: str = "uv"):
+                    dilate_px: int = 16, normal_mode: str = "uv", udim=None):
+    """本物の core と同じ追加引数(``udim``)を持つ(QUESTIONS_core Q4。ワーカーが渡す必要がある)。"""
     cfg = _cfg()
-    CALLS.append(("convert", spec.suffix, out_res, sorted(old_tiles), dilate_px, normal_mode))
+    CALLS.append(("convert", spec.suffix, out_res, sorted(old_tiles), dilate_px, normal_mode, udim))
     if cfg.get("marker"):
         Path(cfg["marker"]).write_text("in convert", encoding="utf-8")
     trace = cfg.get("trace")
@@ -128,8 +129,11 @@ class ProbeReport:
     bad_points: list = field(default_factory=list)
 
 
-def probe_verify(old_tiles, new_tiles, baseline, current, ts_name, spec, *, n: int = 512, seed: int = 0):
+def probe_verify(old_tiles, new_tiles, baseline, current, ts_name, spec, *, n: int = 512, seed: int = 0,
+                 udim=None, normal_mode: str = "uv"):
+    """本物の core と同じ追加引数(``udim`` / ``normal_mode``)を持つ。変換と同じ値を渡す必要がある。"""
     cfg = _cfg()
+    CALLS.append(("probe", spec.suffix, udim, normal_mode))
     status = cfg.get("probe", {}).get(spec.suffix, cfg.get("probe_default", "pass"))
     if status == "fail":
         return ProbeReport("fail", n, 400, 80, 0.9, 0.3, bad_points=[{"u": 0.5, "v": 0.5}])

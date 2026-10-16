@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """uvremap_worker / uvremap_io のテスト(契約 CONTRACT.md §4・§5、不変条件 I1〜I8)。
 
-実行(Maya 不要。標準ライブラリ + numpy + Pillow):
+実行(Maya 不要。標準ライブラリ + numpy。Pillow は不要で、入っていれば比較テストが追加で走る):
 
     python -m pytest sp_maya_livesync/tests/test_uvremap_worker.py
 
@@ -25,15 +25,11 @@ import subprocess
 import sys
 import threading
 import time
-import zlib
-import struct
 from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import pytest
-
-pytest.importorskip("PIL")
 
 _TESTS = Path(__file__).resolve().parent
 _PKG = _TESTS.parent
@@ -42,6 +38,7 @@ for _p in (str(_PKG), str(_TESTS)):
         sys.path.insert(0, _p)
 
 import stub_uvremap_core as stub  # noqa: E402
+from png_testkit import make_png_bytes  # noqa: E402
 import uvremap_io  # noqa: E402
 import uvremap_worker as W  # noqa: E402
 
@@ -111,7 +108,7 @@ class Env:
     def add_png(self, name: str, *, size: int = 32, c: int = 3, seed: int = 1, bit_depth: int = 8):
         p = self.src / name
         arr = make_array(size, size, c, seed)
-        meta = {"bit_depth": bit_depth, "mode": "I;16" if bit_depth == 16 else MODE_FOR_C[c], "ext": ".png"}
+        meta = {"bit_depth": bit_depth, "mode": uvremap_io.mode_for_channels(bit_depth, c), "ext": ".png"}
         uvremap_io.write_image(p, arr, meta)
         self._files.append(p)
         return p
@@ -347,7 +344,7 @@ def test_out_res_square_default_and_explicit(env, core):
     assert {c[2] for c in core.CALLS if c[0] == "convert"} == {32}  # 元タイルが正方形なら整数
     core.CALLS.clear()
     assert env.run("j2", 2, out_res={"1001": [64, 64], "1002": [32, 16]})[0] == 0
-    assert core.CALLS[-1][2] == {1001: (64, 64), 1002: (32, 16)}
+    assert [c for c in core.CALLS if c[0] == "convert"][-1][2] == {1001: (64, 64), 1002: (32, 16)}
     core.CALLS.clear()
     assert env.run("j3", 3, out_res=128, dilate_px=4, normal_mode="off")[0] == 0
     last = [c for c in core.CALLS if c[0] == "convert"][0]
@@ -409,6 +406,101 @@ def test_16bit_gray_channel_round_trips_through_worker(env, core):
     assert np.allclose(arr, src_arr[:, ::-1, :], atol=1e-6)  # スタブ変換(U反転)が16bit精度で出る
     _arr8, meta8 = uvremap_io.read_image(env.out / "Body_Roughness.png")
     assert meta8["bit_depth"] == 8 and meta8["mode"] == "L"
+
+
+def test_udim_and_normal_mode_are_passed_to_both_convert_and_probe(env, core):
+    """QUESTIONS_core Q4: convert_channel と probe_verify に、job の udim / normal_mode を同じ値で渡す。"""
+    for udim, mode in ((True, "uv"), (False, "off")):
+        core.CALLS.clear()
+        code, res = env.run("j_{0}".format(mode), 1, udim=udim, normal_mode=mode)
+        assert code == 0, res["messages"]
+        converts = [c for c in core.CALLS if c[0] == "convert"]
+        probes = [c for c in core.CALLS if c[0] == "probe"]
+        assert converts and len(probes) == len(converts)
+        assert {(c[5], c[6]) for c in converts} == {(mode, udim)}
+        assert {(c[3], c[2]) for c in probes} == {(mode, udim)}
+
+
+def test_udim_defaults_to_true_when_job_omits_it(env, core):
+    p = env.write_job("j1", 1)
+    job = json.loads(p.read_text(encoding="utf-8"))
+    job.pop("udim", None)
+    p.write_text(json.dumps(job), encoding="utf-8")
+    assert W.run_job(p) == 0
+    assert {c[6] for c in core.CALLS if c[0] == "convert"} == {True}
+    assert {c[2] for c in core.CALLS if c[0] == "probe"} == {True}
+
+
+# ---------------------------------------------------------------------------
+# core の例外 -> 終了コード(11 停止 / 12 失敗)。本物の core との接続は test_uvremap_e2e.py
+# ---------------------------------------------------------------------------
+def _core_error(name: str, *args, bases=(Exception,)):
+    """``uvremap_core`` モジュールで定義された例外クラスを模す(ワーカーはモジュール名とクラス名で見分ける)。"""
+    cls = type(name, bases, {"__module__": "uvremap_core"})
+    exc = cls(*args)
+    if name == "ConversionStopped":
+        exc.reasons = list(args[0]) if args else []
+    return exc
+
+
+@pytest.mark.parametrize("where", ["convert", "probe"])
+@pytest.mark.parametrize("name,code,state,needle", [
+    ("ConversionStopped", 11, "BLOCKED", "no_convertible_faces"),
+    ("TextureSetNotFound", 11, "BLOCKED", "ts_missing"),
+    ("ChannelFormatError", 11, "BLOCKED", "形式"),
+])
+def test_core_exceptions_map_to_blocked_without_touching_outputs(env, core, monkeypatch, where, name, code, state, needle):
+    exc = _core_error(name, ["no_convertible_faces"] if name == "ConversionStopped" else "details here")
+
+    def boom(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(core, "convert_channel" if where == "convert" else "probe_verify", boom)
+    got, res = env.run()
+    assert got == code and res["status"] == "blocked", res["messages"]
+    assert needle in messages_text(res, "error") and "予期しない例外" not in messages_text(res)
+    assert env.status()["Body"]["state"] == state
+    assert not env.out.exists() and not env.ledger_path.exists()
+
+
+@pytest.mark.parametrize("which", ["baseline", "current"])
+def test_snapshot_error_is_failed_with_a_clear_message(env, core, monkeypatch, which):
+    real = core.load_snapshot
+
+    def load(dirpath):
+        if (which == "baseline") == (Path(dirpath).name == "bl1"):
+            raise _core_error("SnapshotError", "mesh.npz is missing keys")
+        return real(dirpath)
+
+    monkeypatch.setattr(core, "load_snapshot", load)
+    got, res = env.run()
+    label = "基準" if which == "baseline" else "現行"
+    assert got == 12 and res["status"] == "failed"
+    assert label + "スナップショット" in messages_text(res, "error") and "予期しない例外" not in messages_text(res)
+    assert env.status()["Body"]["state"] == "FAILED" and not env.out.exists()
+
+
+def test_unrelated_exceptions_with_core_like_names_are_still_unexpected_failures(env, core, monkeypatch):
+    class ConversionStopped(Exception):      # uvremap_core 以外のモジュールで定義された同名の例外
+        pass
+
+    def boom(*a, **k):
+        raise ConversionStopped("not from core")
+
+    monkeypatch.setattr(core, "convert_channel", boom)
+    got, res = env.run()
+    assert got == 12 and "予期しない例外" in messages_text(res, "error")
+
+
+def test_ts_uv_hash_prefers_job_then_core_compute_then_meta(env, core, monkeypatch):
+    """ledger / flag の uv_hash: job の値 > core.compute_uv_hash(現行, ts) > スナップショット meta.json の値。"""
+    code, res = env.run("j1", 1)
+    assert code == 0 and env.ledger()["ts"]["Body"]["uv_hash"] == "uv-1"   # スタブ core には compute_uv_hash が無い -> meta.json
+    monkeypatch.setattr(core, "compute_uv_hash", lambda snap, ts=None: "ts-level:{0}".format(ts), raising=False)
+    code, res = env.run("j2", 2)
+    assert code == 0 and env.ledger()["ts"]["Body"]["uv_hash"] == "ts-level:Body"
+    code, res = env.run("j3", 3, uv_hash="from-job")
+    assert code == 0 and env.ledger()["ts"]["Body"]["uv_hash"] == "from-job"
 
 
 # ---------------------------------------------------------------------------
@@ -1374,19 +1466,34 @@ def test_unsupported_exr_exits_11_with_message_and_publishes_nothing(env, core):
     assert tree_state(env.src) == before
 
 
-def test_unsupported_when_pillow_is_missing(env, core, monkeypatch):
-    monkeypatch.setattr(uvremap_io, "_Image", None)
+def test_worker_runs_without_pillow(env, core, monkeypatch):
+    """画像 I/O は自前の PNG 実装だけで動く。Pillow が import できない環境でも変換できる。"""
+    monkeypatch.setitem(sys.modules, "PIL", None)          # import PIL -> ImportError
+    monkeypatch.setitem(sys.modules, "PIL.Image", None)
     code, res = env.run()
-    assert code == 11 and "Pillow" in messages_text(res, "error") and "未対応形式" in messages_text(res, "error")
-    assert not env.out.exists()
+    assert code == 0, res["messages"]
+    assert (env.out / "Body_Roughness.png").exists() or any(env.out.glob("Body_Roughness*"))
 
 
-def test_unsupported_16bit_rgb_png_exits_11(env, core):
-    env.add_raw("Body_Emissive.1001.png", make_png_bytes(8, 8, bit_depth=16, color_type=2))
+def test_unsupported_interlaced_png_exits_11(env, core):
+    env.add_raw("Body_Emissive.1001.png", make_png_bytes(8, 8, bit_depth=8, color_type=2, interlace=1))
     env.freeze_times()
     code, res = env.run()
-    assert code == 11 and "16bit" in messages_text(res, "error")
+    assert code == 11 and "インターレース" in messages_text(res, "error")
     assert not env.out.exists()
+
+
+def test_16bit_rgb_channel_round_trips_through_worker(env, core):
+    """16bit のカラー PNG(Painter が出す可能性がある)も、ビット深度とモードを保ったまま変換される。"""
+    env.add_png("Body_Emissive.1001.png", c=3, seed=11, bit_depth=16)
+    env.freeze_times()
+    core.CONFIG["new_tiles"] = [1001]
+    code, res = env.run()
+    assert code == 0, res["messages"]
+    arr, meta = uvremap_io.read_image(env.out / "Body_Emissive.png")
+    assert meta["bit_depth"] == 16 and meta["mode"] == "RGB" and arr.shape == (32, 32, 3)
+    src_arr, _ = uvremap_io.read_image(env.src / "Body_Emissive.1001.png")
+    assert np.allclose(arr, src_arr[:, ::-1, :], atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -1397,7 +1504,7 @@ _FORBIDDEN_MODULES = {"subprocess", "socket", "ssl", "http", "urllib", "ftplib",
                       "socketserver", "selectors", "pty", "shlex"}
 _ALLOWED_MODULES = {"__future__", "argparse", "datetime", "hashlib", "importlib", "inspect", "json", "os",
                     "re", "shutil", "signal", "sys", "threading", "time", "pathlib", "traceback", "struct",
-                    "msvcrt", "fcntl", "numpy", "uvremap_io", "PIL"}
+                    "msvcrt", "fcntl", "numpy", "uvremap_io", "zlib"}
 
 
 @pytest.mark.parametrize("fname", ["uvremap_worker.py", "uvremap_io.py"])
@@ -1466,155 +1573,8 @@ def test_cli_exit_codes_for_usage_and_missing_job(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 画像 I/O と replace_file の再試行(契約 §5)
+# replace_file の再試行(契約 §5)。単体テストは test_uvremap_io.py。ここはワーカーの公開との接続
 # ---------------------------------------------------------------------------
-def make_png_bytes(w: int, h: int, *, bit_depth: int, color_type: int) -> bytes:
-    """Pillow を介さずに PNG を組み立てる(Pillow が扱えない 16bit RGB 等の入力用)。"""
-    channels = {0: 1, 2: 3, 4: 2, 6: 4}[color_type]
-    row = b"\x00" + bytes(w * channels * bit_depth // 8)
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        body = tag + data
-        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
-
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, bit_depth, color_type, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(row * h)) + chunk(b"IEND", b""))
-
-
-@pytest.mark.parametrize("c", [1, 2, 3, 4])
-def test_io_8bit_png_round_trip_is_exact(tmp_path, c):
-    arr = make_array(7, 5, c, seed=c)
-    p = tmp_path / "t.png"
-    uvremap_io.write_image(p, arr, {"bit_depth": 8, "mode": MODE_FOR_C[c], "ext": ".png"})
-    back, meta = uvremap_io.read_image(p)
-    assert back.dtype == np.float32 and back.shape == (7, 5, c)
-    assert meta == {"bit_depth": 8, "mode": MODE_FOR_C[c], "ext": ".png"}
-    assert np.array_equal(np.rint(back * 255), np.rint(arr * 255))
-
-
-def test_io_16bit_gray_round_trip(tmp_path):
-    rng = np.random.default_rng(0)
-    q = rng.integers(0, 65536, size=(6, 9, 1)).astype(np.float32) / 65535.0
-    p = tmp_path / "h.png"
-    uvremap_io.write_image(p, q, {"bit_depth": 16, "mode": "I;16", "ext": ".png"})
-    back, meta = uvremap_io.read_image(p)
-    assert meta["bit_depth"] == 16 and meta["mode"] == "I;16" and back.shape == (6, 9, 1)
-    assert np.abs(back - q).max() < 1e-5
-
-
-def test_io_values_are_clipped_and_nan_becomes_zero(tmp_path):
-    arr = np.array([[[-0.5], [1.5], [np.nan], [0.5]]], dtype=np.float32)
-    p = tmp_path / "c.png"
-    uvremap_io.write_image(p, arr, {"bit_depth": 8, "mode": "L", "ext": ".png"})
-    back, _ = uvremap_io.read_image(p)
-    assert np.rint(back[0, :, 0] * 255).tolist() == [0, 255, 0, 128]
-
-
-@pytest.mark.parametrize("bit_depth,color_type", [(16, 2), (16, 6), (16, 4)])
-def test_io_16bit_color_png_is_unsupported(tmp_path, bit_depth, color_type):
-    p = tmp_path / "x.png"
-    p.write_bytes(make_png_bytes(4, 4, bit_depth=bit_depth, color_type=color_type))
-    with pytest.raises(uvremap_io.UnsupportedFormat):
-        uvremap_io.read_image(p)
-
-
-def test_io_palette_and_other_formats_are_unsupported(tmp_path):
-    from PIL import Image
-    pal = tmp_path / "pal.png"
-    Image.new("P", (4, 4)).save(pal)
-    with pytest.raises(uvremap_io.UnsupportedFormat):
-        uvremap_io.read_image(pal)
-    for name in ("a.exr", "a.tif", "a.jpg", "a.tga", "noext"):
-        f = tmp_path / name
-        f.write_bytes(b"junk")
-        with pytest.raises(uvremap_io.UnsupportedFormat):
-            uvremap_io.read_image(f)
-        with pytest.raises(uvremap_io.UnsupportedFormat):
-            uvremap_io.write_image(tmp_path / ("out_" + name), np.zeros((2, 2, 3), np.float32),
-                                   {"bit_depth": 8, "mode": "RGB", "ext": f.suffix})
-    with pytest.raises(uvremap_io.UnsupportedFormat):  # 16bit のカラー書き出しは不可
-        uvremap_io.write_image(tmp_path / "w.png", np.zeros((2, 2, 3), np.float32),
-                               {"bit_depth": 16, "mode": "RGB", "ext": ".png"})
-
-
-def test_io_corrupt_png_is_io_error_not_unsupported(tmp_path):
-    p = tmp_path / "bad.png"
-    p.write_bytes(make_png_bytes(8, 8, bit_depth=8, color_type=2)[:-30] + b"\x00" * 30)
-    with pytest.raises(uvremap_io.ImageIOError):
-        uvremap_io.read_image(p)
-
-
-def test_io_without_pillow_reports_unsupported(tmp_path, monkeypatch):
-    p = tmp_path / "x.png"
-    uvremap_io.write_image(p, np.zeros((2, 2, 3), np.float32), {"bit_depth": 8, "mode": "RGB", "ext": ".png"})
-    monkeypatch.setattr(uvremap_io, "_Image", None)
-    with pytest.raises(uvremap_io.UnsupportedFormat, match="Pillow"):
-        uvremap_io.read_image(p)
-    with pytest.raises(uvremap_io.UnsupportedFormat, match="Pillow"):
-        uvremap_io.write_image(p, np.zeros((2, 2, 3), np.float32), {"bit_depth": 8, "mode": "RGB", "ext": ".png"})
-
-
-class _FakeTime:
-    def __init__(self):
-        self.sleeps = []
-
-    def sleep(self, s):
-        self.sleeps.append(s)
-
-
-def test_replace_file_retries_then_succeeds(tmp_path, monkeypatch):
-    a, b = tmp_path / "a", tmp_path / "b"
-    a.write_text("new")
-    b.write_text("old")
-    real = os.replace
-    calls = []
-
-    def flaky(s, d):
-        calls.append(1)
-        if len(calls) < 3:
-            raise PermissionError(13, "used by another process")
-        return real(s, d)
-
-    ft = _FakeTime()
-    monkeypatch.setattr(os, "replace", flaky)
-    monkeypatch.setattr(uvremap_io, "time", ft)
-    uvremap_io.replace_file(a, b)
-    assert len(calls) == 3 and ft.sleeps == [0.2, 0.2] and b.read_text() == "new"
-
-
-def test_replace_file_default_is_five_tries_then_raises(tmp_path, monkeypatch):
-    a, b = tmp_path / "a", tmp_path / "b"
-    a.write_text("new")
-    b.write_text("old")
-    calls = []
-
-    def always(s, d):
-        calls.append(1)
-        raise PermissionError(13, "used by another process")
-
-    ft = _FakeTime()
-    monkeypatch.setattr(os, "replace", always)
-    monkeypatch.setattr(uvremap_io, "time", ft)
-    with pytest.raises(uvremap_io.ReplaceFailed) as ei:
-        uvremap_io.replace_file(a, b)
-    assert isinstance(ei.value, OSError) and len(calls) == 5 and ft.sleeps == [0.2] * 4
-    assert b.read_text() == "old" and a.read_text() == "new"  # どちらも壊さない
-
-
-def test_replace_file_missing_source_is_not_retried(tmp_path, monkeypatch):
-    calls = []
-    real = os.replace
-
-    def counting(s, d):
-        calls.append(1)
-        return real(s, d)
-
-    monkeypatch.setattr(os, "replace", counting)
-    with pytest.raises(FileNotFoundError):
-        uvremap_io.replace_file(tmp_path / "none", tmp_path / "b")
-    assert len(calls) == 1
-
-
 def test_worker_publish_survives_transient_replace_failures(env, core, monkeypatch):
     """他プロセスが一瞬開いている状況(2回失敗してから成功)でも、再試行で公開できる。"""
     monkeypatch.setattr(uvremap_io, "REPLACE_DELAY_S", 0)
