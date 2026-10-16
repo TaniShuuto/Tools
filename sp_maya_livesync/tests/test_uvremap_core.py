@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+import warnings
 
 import numpy as np
 import pytest
@@ -34,9 +35,14 @@ if _PKG_DIR not in sys.path:
 import uvremap_core as uvc  # noqa: E402
 
 
-# 重いテストは UVREMAP_SLOW=1 のときだけ実行する(マーカー slow)
+# 重いテストは UVREMAP_SLOW=1 のときだけ実行する(マーカー slow。-m "not slow" でも除外できる)
 _RUN_SLOW = bool(os.environ.get("UVREMAP_SLOW"))
-slow = pytest.mark.skipif(not _RUN_SLOW, reason="slow test: set UVREMAP_SLOW=1")
+warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)   # slow は設定ファイル無しで使う
+
+
+def slow(fn):
+    fn = pytest.mark.slow(fn)
+    return fn if _RUN_SLOW else pytest.mark.skip(reason="slow test: set UVREMAP_SLOW=1")(fn)
 
 
 # ============================================================================
@@ -1573,3 +1579,501 @@ class TestAccuracyRegression:
         again = uvc.convert_channel(orig, A, C, "Body", uvc.classify(A, C, "Body"), spec, res)
         for t in direct.tiles:
             np.testing.assert_array_equal(direct.tiles[t], again.tiles[t])
+
+
+# ============================================================================
+# テスト: probe_verify(契約 §3.1)
+# ============================================================================
+
+PROBE_RES = 1024            # s = 4。細部ノイズの偽陽性を調べるには s >= 4 が要る(PROBE_CALIBRATION.md)
+NOISE2 = 2 * 6.67 / PROBE_RES     # 3D空間のノイズセル幅 = 約 2 テクセル(1024²で、球のシェル 0.3 タイル相当)
+
+PROBE_SIGNALS = {"smooth": "smooth", "detail": "detail", "noise": NOISE2}
+POSITIVE_LAYOUTS = [("A", "B"), ("B", "A"), ("A", "rot90"), ("A", "mirror"),
+                    ("B", "rot270_mirror"), ("A", "scaled")]
+
+
+def probe_case(src, dst, sig, **kw):
+    return get_case(src, dst, PROBE_SIGNALS[sig], PROBE_RES, **kw)
+
+
+class TestProbeNoFalsePositives:
+    """正しい変換は、細部・ノイズ・シーム周辺・UDIM移動・法線のいずれでも pass(偽陽性ゼロ)。"""
+
+    @pytest.mark.parametrize("sig", ["smooth", "detail", "noise"])
+    @pytest.mark.parametrize("src,dst", POSITIVE_LAYOUTS)
+    def test_correct_colour_conversion_passes(self, sig, src, dst):
+        c = probe_case(src, dst, sig)
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass", (rep.n_bad, rep.n_valid, rep.max_err, rep.bad_points[:2])
+        assert rep.n_bad == 0 and rep.n_valid >= 300
+        # 余裕: tau を 25% 下げても pass する(最大誤差は単独の1点なので尺度にしない)
+        assert c.probe(c.convert().tiles, tau=0.075).status == "pass"
+
+    @pytest.mark.parametrize("sig", ["detail", "noise"])
+    def test_without_source_padding_still_passes(self, sig):
+        """元テクスチャにパディングが無くシームが荒れても、島の境界は除外されるので偽陽性にならない。"""
+        c = probe_case("A", "B", sig, pad=False)
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass" and rep.n_bad == 0
+        assert rep.excluded.get("island_border", 0) > 0
+
+    @pytest.mark.parametrize("sig", ["detail", "noise"])
+    @pytest.mark.parametrize("src,dst", [("A", "B"), ("A", "rot90"), ("B", "A")])
+    def test_srgb_conversion_passes(self, sig, src, dst):
+        """sRGB カラーは線形光で補間して変換する。プローブも窓平均を線形光で取るので偽陽性にならない。"""
+        c = probe_case(src, dst, sig, colorspace="srgb")
+        rep = c.probe(c.convert().tiles, n=2000)       # 点数を増やして割合を安定させる
+        assert rep.status == "pass" and rep.params["linear_light_average"] is True
+        assert rep.n_bad / rep.n_valid <= 0.01                            # しきい値 2% の半分以下
+
+    def test_srgb_average_matters_for_high_contrast_content(self):
+        """符号化値のまま平均すると(spec を raw として検証すると)、正しい sRGB 変換でも誤検出する。"""
+        c = probe_case("A", "B", "noise", colorspace="srgb")
+        r = c.convert()
+        as_raw = uvc.ChannelSpec("BaseColor", "raw", "color")
+        rep = uvc.probe_verify(c.old, r.tiles, c.A, c.B, "Body", as_raw)
+        assert rep.status == "fail" and rep.params["linear_light_average"] is False
+
+    def test_8bit_quantised_textures_pass(self):
+        c = probe_case("A", "B", "detail")
+        q = {t: np.round(a * 255) / 255 for t, a in c.old.items()}
+        r = uvc.convert_channel(q, c.A, c.B, "Body", c.decision, c.spec, PROBE_RES)
+        rep = uvc.probe_verify(q, {t: np.round(a * 255) / 255 for t, a in r.tiles.items()},
+                               c.A, c.B, "Body", c.spec)
+        assert rep.status == "pass" and rep.n_bad == 0
+
+    @pytest.mark.parametrize("dst", ["B", "rot90", "rot180", "rot270_mirror"])
+    @pytest.mark.parametrize("green_down", [False, True])
+    def test_corrected_normal_conversion_passes(self, dst, green_down):
+        c = get_case("A", dst, None, 512, kind="normal", green_down=green_down)
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass" and rep.n_bad == 0
+        assert c.probe(c.convert().tiles, max_angle_deg=6.0).status == "pass"   # 余裕: 角度しきい値を 25% 下げても pass
+
+    def test_uv_overlap_and_straddle_and_wrap_are_excluded_not_failed(self):
+        c = get_case("A", "overlap", PROBE_SIGNALS["detail"], PROBE_RES)
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass" and rep.excluded.get("uv_overlap", 0) > 0
+        c = get_case("A", "straddle", PROBE_SIGNALS["detail"], PROBE_RES)
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass" and rep.excluded.get("tile_straddle", 0) > 0
+        c = get_case("A", "wrapped", PROBE_SIGNALS["smooth"], 512)           # UDIM として解釈 → 範囲外あり
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass" and rep.excluded.get("udim_out_of_range", 0) > 0
+        c = get_case("A", "wrapped", PROBE_SIGNALS["smooth"], 512, udim=False)
+        rep = c.probe(c.convert().tiles)
+        assert rep.status == "pass" and "udim_out_of_range" not in rep.excluded
+
+    def test_defective_faces_do_not_trigger_alarms(self):
+        pl, A, B, uv_n, offs, f_nm, f_nan = TestExcludedFaces._plates_case("current")
+        oldt, oldm = bake(snap_of(pl, apply_layout(pl, {0: ("id", (0.4, 0.4), (0.05, 0.05)),
+                                                        1: ("id", (0.4, 0.4), (0.55, 0.05))})),
+                          "Body", 512, noise_signal(0.01))
+        old = pad_tiles(oldt, oldm)
+        spec = uvc.ChannelSpec("BaseColor", "raw", "color")
+        d = uvc.classify(A, B, "default")
+        r = uvc.convert_channel(old, A, B, "default", d, spec, 512)
+        rep = uvc.probe_verify(old, r.tiles, A, B, "default", spec, n=1024)
+        assert rep.status == "pass" and rep.n_bad == 0
+
+    def test_a_single_hard_edge_texture_passes(self):
+        """白黒の鋭いエッジ(半テクセルずれる)を含む変換でも、エッジ近傍の点で偽陽性にならない。"""
+        A, B, old, d = _half_texel_case(256)
+        old[1001][:, :] = 0
+        old[1001][:, 128:] = 1.0
+        spec = uvc.ChannelSpec("Roughness", "raw", "scalar")
+        r = uvc.convert_channel(old, A, B, "Body", d, spec, 256)
+        rep = uvc.probe_verify(old, r.tiles, A, B, "Body", spec, n=512)
+        assert rep.status == "pass", (rep.n_bad, rep.n_valid, rep.max_err)
+
+
+class TestProbeDetectsDefects:
+    """故意の不具合は fail: U方向のずれ(>= 2%)、1シェルのみ反転、タイル番号の取り違え、領域の欠落。"""
+
+    @pytest.mark.parametrize("sig", ["detail", "noise"])
+    @pytest.mark.parametrize("frac", [0.02, 0.05])
+    def test_u_shift_of_two_percent_or_more(self, sig, frac):
+        c = probe_case("A", "B", sig)
+        rep = c.probe(inject_shift_u(c.convert().tiles, frac))
+        assert rep.status == "fail" and rep.n_bad / rep.n_valid > 0.1
+
+    def test_u_shift_on_a_smooth_texture_needs_three_percent(self):
+        """平滑なテクスチャはずらしても画素がほとんど変わらないため、検出は 3% 以上(2% は pass し得る)。"""
+        c = probe_case("A", "B", "smooth")
+        r = c.convert()
+        assert c.probe(inject_shift_u(r.tiles, 0.03)).status == "fail"
+        assert c.probe(inject_shift_u(r.tiles, 0.05)).status == "fail"
+
+    @pytest.mark.parametrize("sig", ["smooth", "detail", "noise"])
+    @pytest.mark.parametrize("shell", [0, 1, 2, 3, 4, 5])
+    def test_single_flipped_shell(self, sig, shell):
+        c = probe_case("A", "B", sig)
+        r = c.convert()
+        rep = c.probe(inject_flip_shell(r.tiles, c.shells(), shell))
+        assert rep.status == "fail", (shell, rep.n_bad, rep.n_valid)
+        assert rep.n_bad / rep.n_valid > 0.05
+
+    @pytest.mark.parametrize("sig", ["smooth", "detail", "noise"])
+    def test_tile_numbers_swapped_or_wrong(self, sig):
+        c = probe_case("A", "B", sig)
+        r = c.convert()
+        assert c.probe(inject_swap_tiles(r.tiles, 1001, 1002)).status == "fail"
+        rep = c.probe(inject_relabel_tile(r.tiles, 1002, 1003))          # 1002 を 1003 と取り違え
+        assert rep.status == "fail" and any(b["missing_new_tile"] for b in rep.bad_points)
+        rep = c.probe({1001: r.tiles[1001]})                              # タイル 1002 の欠落
+        assert rep.status == "fail" and any(b["missing_new_tile"] for b in rep.bad_points)
+
+    @pytest.mark.parametrize("sig", ["smooth", "detail", "noise"])
+    @pytest.mark.parametrize("frac", [0.03, 0.10])
+    def test_dropout_regions(self, sig, frac):
+        c = probe_case("A", "B", sig)
+        r = c.convert()
+        rep = c.probe(inject_dropout(r.tiles, r.coverage, frac))
+        assert rep.status == "fail", (frac, rep.n_bad, rep.n_valid)
+
+    def test_missing_whole_output(self):
+        c = probe_case("A", "B", "detail")
+        rep = c.probe({1001: np.zeros_like(c.old[1001])})                 # 全面が黒
+        assert rep.status == "fail" and rep.n_bad / rep.n_valid > 0.5
+
+    @pytest.mark.parametrize("fault", ["shift", "flip", "swap", "dropout"])
+    def test_normal_map_defects(self, fault):
+        c = get_case("A", "B", None, 512, kind="normal")
+        r = c.convert()
+        tiles = {"shift": lambda: inject_shift_u(r.tiles, 0.02),
+                 "flip": lambda: inject_flip_shell(r.tiles, c.shells(), 2),
+                 "swap": lambda: inject_swap_tiles(r.tiles, 1001, 1002),
+                 "dropout": lambda: inject_dropout(r.tiles, r.coverage, 0.05)}[fault]()
+        assert c.probe(tiles).status == "fail"
+
+    def test_uncorrected_normals_are_flagged_unless_correction_is_off(self):
+        c = get_case("A", "rot90", None, 512, kind="normal")
+        off = c.convert(normal_mode="off")
+        assert c.probe(off.tiles).status == "fail"                       # 接空間補正が必要なのに無い
+        assert c.probe(off.tiles, normal_mode="off").status == "pass"    # 補正なしを承知で変換した場合
+        assert c.probe(c.convert().tiles, normal_mode="off").status == "fail"
+
+    def test_green_channel_convention_mismatch_is_flagged(self):
+        c = get_case("A", "rot90", None, 512, kind="normal", green_down=True)
+        wrong = uvc.ChannelSpec("Normal", "raw", "normal", normal_green_down=False)
+        r = uvc.convert_channel(c.old, c.A, c.B, "Body", c.decision, wrong, 512)
+        assert c.probe(r.tiles).status == "fail"
+
+
+class TestProbeBehaviour:
+    def test_report_fields_and_accounting(self):
+        c = probe_case("A", "B", "detail")
+        rep = c.probe(c.convert().tiles, n=300)
+        assert rep.n_total == 300
+        assert rep.n_valid + sum(rep.excluded.values()) == rep.n_total
+        assert rep.status == "pass" and rep.bad_points == [] and 0 <= rep.mean_err <= rep.max_err
+        d = rep.to_dict()
+        assert set(d) >= {"status", "n_total", "n_valid", "n_bad", "max_err", "mean_err", "bad_points"}
+        json.dumps(d)                                                      # JSON にそのまま書ける
+        assert d["params"]["footprint"] == uvc.PROBE_FOOTPRINT and d["params"]["tau"] == uvc.PROBE_TAU
+
+    def test_bad_points_describe_the_failure(self):
+        c = probe_case("A", "B", "detail")
+        rep = c.probe(inject_shift_u(c.convert().tiles, 0.05))
+        assert 0 < len(rep.bad_points) <= 32
+        b = rep.bad_points[0]
+        assert {"face", "bary", "old_uv", "new_uv", "old_tile", "new_tile", "err"} <= set(b)
+        assert b["err"] == max(x["err"] for x in rep.bad_points)           # 誤差の大きい順
+        json.dumps(rep.to_dict())
+
+    def test_seed_determinism(self):
+        c = probe_case("A", "B", "noise")
+        tiles = inject_shift_u(c.convert().tiles, 0.02)
+        a, b = c.probe(tiles, seed=3), c.probe(tiles, seed=3)
+        assert a.to_dict() == b.to_dict()
+        assert c.probe(tiles, seed=4).to_dict() != a.to_dict()
+        assert a.params["seed"] == 3
+        assert c.probe(tiles).to_dict() == c.probe(tiles, seed=0).to_dict()   # 既定シードは固定
+
+    def test_few_valid_points_is_inconclusive(self):
+        c = probe_case("A", "B", "detail")
+        rep = c.probe(c.convert().tiles, n=40)
+        assert rep.status == "inconclusive" and rep.n_valid < 64
+        assert any("n_valid" in s for s in rep.notes)
+
+    def test_fail_takes_precedence_over_inconclusive(self):
+        c = probe_case("A", "B", "detail")
+        rep = c.probe(inject_shift_u(c.convert().tiles, 0.05), n=40)
+        assert rep.n_valid < 64 and rep.status == "fail"
+
+    def test_nothing_to_check_is_inconclusive(self):
+        pl = plates(1, 2, 2, quads=True)
+        uv = apply_layout(pl, {0: ("id", (0.5, 0.5), (0.1, 0.1))})
+        A = uvc.make_snapshot(pl.counts, pl.vid, pl.pos, uv)
+        B = uvc.make_snapshot(pl.counts, pl.vid, pl.pos, np.full_like(uv, np.nan),
+                              tri_face=A.tri_face, tri_corner=A.tri_corner)
+        spec = uvc.ChannelSpec("Roughness", "raw", "scalar")
+        z = {1001: np.zeros((64, 64, 1), np.float32)}
+        rep = uvc.probe_verify(z, z, A, B, "default", spec)
+        assert rep.status == "inconclusive" and rep.n_valid == 0
+
+    def test_missing_old_tile_points_are_excluded(self):
+        c = probe_case("B", "A", "detail")
+        r = c.convert()
+        rep = uvc.probe_verify({1001: c.old[1001]}, r.tiles, c.A, c.B, "Body", c.spec)
+        assert rep.excluded.get("old_tile_missing", 0) > 0
+
+    def test_lattice_footprint_is_available_and_documented_to_false_alarm(self):
+        """契約文言どおりの格子固定の縮小は、正しい変換でも細部テクスチャで誤検出する(理由は QUESTIONS.md Q1)。"""
+        c = probe_case("A", "B", "detail")
+        r = c.convert()
+        assert c.probe(r.tiles).status == "pass"
+        lattice = c.probe(r.tiles, footprint="lattice")
+        assert lattice.status == "fail" and lattice.params["footprint"] == "lattice"
+        # 平滑なテクスチャなら格子固定でも問題ない
+        cs = probe_case("A", "B", "smooth")
+        assert cs.probe(cs.convert().tiles, footprint="lattice").status == "pass"
+        with pytest.raises(ValueError):
+            c.probe(r.tiles, footprint="nearest")
+
+    def test_low_resolution_adds_a_note_when_alarms_are_raised(self):
+        c = get_case("A", "B", 6.67 / 256, 256)                          # 256²: s = 1。テクセル単位のノイズ
+        rep = c.probe(c.convert().tiles)
+        assert rep.n_bad > 0 and any("low_resolution_probe" in s for s in rep.notes)
+
+    def test_thresholds_are_overridable_and_documented_defaults(self):
+        # 契約の既定は tau=0.08。0.10 へ調整した根拠は docs/uvremap/PROBE_CALIBRATION.md
+        assert (uvc.PROBE_TAU, uvc.PROBE_NORMAL_DEG, uvc.PROBE_MAX_BAD_FRACTION, uvc.PROBE_MIN_VALID) \
+            == (0.10, 8.0, 0.02, 64)
+        c = probe_case("A", "B", "detail")
+        shifted = inject_shift_u(c.convert().tiles, 0.02)
+        assert c.probe(shifted, tau=1.0).status == "pass"                  # 緩めれば通る(= 値を使っている)
+        assert c.probe(shifted, max_bad_fraction=0.99).status == "pass"
+
+    def test_wrong_texture_set_and_bad_arrays(self):
+        c = probe_case("A", "B", "smooth")
+        with pytest.raises(uvc.TextureSetNotFound):
+            uvc.probe_verify(c.old, c.old, c.A, c.B, "Nope", c.spec)
+        with pytest.raises(uvc.ChannelFormatError):
+            uvc.probe_verify({}, c.old, c.A, c.B, "Body", c.spec)
+
+
+class TestSlow:
+    """2048² のテスト(UVREMAP_SLOW=1 で実行)。実運用に近い解像度(s = 8)での精度と所要時間。"""
+
+    @slow
+    def test_2048_smooth_psnr_and_probe_on_texel_level_noise(self):
+        res = 2048
+        c = get_case("A", "B", "smooth", res)
+        t0 = time.time()
+        r = c.convert()
+        dt = time.time() - t0
+        gt, gm = c.gt
+        assert psnr(r.tiles, gt, gm, "interior") >= 100.0          # 試作: 102.6 dB
+        assert psnr(r.tiles, gt, gm, "seam") >= 60.0
+        assert dt < 60.0, f"convert took {dt:.1f}s for 2 tiles at 2048"
+        cn = Case(LAYOUT_A, LAYOUT_B, 6.67 / res, res)               # テクセル単位の白色ノイズ
+        rn = cn.convert()
+        assert cn.probe(rn.tiles).status == "pass"                   # s = 8 ならテクセル単位でも偽陽性なし
+        assert cn.probe(inject_shift_u(rn.tiles, 0.02)).status == "fail"
+
+    @slow
+    def test_2048_four_udim_tiles(self):
+        wide = {s: ("id", (0.45, 0.45), (0.03 + 1.0 * (s % 4) + 0.5 * (s // 4), 0.05 + 0.5 * (s // 4)))
+                for s in range(6)}
+        LAYOUTS_LOCAL = {"A": LAYOUT_A, "wide": wide}
+        c = Case(LAYOUTS_LOCAL["A"], LAYOUTS_LOCAL["wide"], "smooth", 2048)
+        r = c.convert()
+        assert len(r.tiles) >= 4
+        check_against_gt(c, r, interior_db=95.0, seam_db=55.0)
+
+
+# ============================================================================
+# 較正: プローブのしきい値の測定表(docs/uvremap/PROBE_CALIBRATION.md の元データ)
+#   python sp_maya_livesync/tests/test_uvremap_core.py --calibrate [--json out.json]
+# ============================================================================
+
+CAL_TAUS = (0.04, 0.06, 0.08, 0.10, 0.12, 0.16)
+CAL_ANGLES = (2.0, 4.0, 6.0, 8.0, 10.0, 12.0)
+CAL_N = 2000
+
+
+def _bad_fractions(case, tiles, taus, **kw):
+    """しきい値ごとの n_bad / n_valid と、既定しきい値での報告(最大/平均誤差)。"""
+    is_normal = case.kind == "normal"
+    out = {}
+    for t in (CAL_ANGLES if is_normal else taus):
+        rep = case.probe(tiles, n=CAL_N, **({"max_angle_deg": t} if is_normal else {"tau": t}), **kw)
+        out[t] = rep.n_bad / max(rep.n_valid, 1)
+    base = case.probe(tiles, n=CAL_N, **kw)
+    return {"bad": out, "n_valid": base.n_valid, "max_err": base.max_err, "mean_err": base.mean_err,
+            "status": base.status, "excluded": base.excluded}
+
+
+def calibration_data():
+    """正例(正しい変換)と負例(故意の不具合)を測る。重いので通常のテスト実行には含めない。"""
+    pos, neg = [], []
+    for sig in ("smooth", "detail", "noise"):
+        for cs in (("raw",) if sig == "smooth" else ("raw", "srgb")):
+            for src, dst in POSITIVE_LAYOUTS:
+                c = probe_case(src, dst, sig, colorspace=cs)
+                m = _bad_fractions(c, c.convert().tiles, CAL_TAUS)
+                pos.append({"name": f"{sig}/{cs} {src}->{dst}", "kind": "color", **m})
+        c = probe_case("A", "B", sig, pad=False)
+        pos.append({"name": f"{sig}/raw A->B (unpadded source)", "kind": "color",
+                    **_bad_fractions(c, c.convert().tiles, CAL_TAUS)})
+    for dst in ("B", "rot90", "rot180", "rot270_mirror"):
+        for gd in (False, True):
+            c = get_case("A", dst, None, 512, kind="normal", green_down=gd)
+            pos.append({"name": f"normal{'/DX' if gd else '/GL'} A->{dst}", "kind": "normal",
+                        **_bad_fractions(c, c.convert().tiles, CAL_TAUS)})
+    for sig in ("smooth", "detail", "noise"):
+        c = probe_case("A", "B", sig)
+        r = c.convert()
+        sm = c.shells()
+        faults = [(f"shift_u {f:.0%}", inject_shift_u(r.tiles, f)) for f in (0.01, 0.02, 0.03, 0.05)]
+        faults += [(f"flip shell {k}", inject_flip_shell(r.tiles, sm, k)) for k in range(6)]
+        faults += [("tiles swapped", inject_swap_tiles(r.tiles, 1001, 1002)),
+                   ("tile 1002 relabelled 1003", inject_relabel_tile(r.tiles, 1002, 1003)),
+                   ("tile 1002 missing", {1001: r.tiles[1001]})]
+        faults += [(f"dropout {f:.0%}", inject_dropout(r.tiles, r.coverage, f)) for f in (0.02, 0.03, 0.05, 0.10)]
+        for name, tiles in faults:
+            # 1% のずらしは要求外。平滑なテクスチャの 2% ずらしは画素がほぼ変わらないため要求外(3% 以上が対象)
+            req = not (name == "shift_u 1%" or (sig == "smooth" and name == "shift_u 2%"))
+            neg.append({"name": f"{sig} {name}", "kind": "color", "required": req,
+                        **_bad_fractions(c, tiles, CAL_TAUS)})
+    c = get_case("A", "B", None, 512, kind="normal")
+    r = c.convert()
+    sm = c.shells()
+    faults = [(f"shift_u {f:.0%}", inject_shift_u(r.tiles, f)) for f in (0.01, 0.02, 0.05)]
+    faults += [(f"flip shell {k}", inject_flip_shell(r.tiles, sm, k)) for k in range(6)]
+    faults += [("tiles swapped", inject_swap_tiles(r.tiles, 1001, 1002)),
+               ("dropout 5%", inject_dropout(r.tiles, r.coverage, 0.05))]
+    for name, tiles in faults:
+        neg.append({"name": f"normal {name}", "kind": "normal", "required": name != "shift_u 1%",
+                    **_bad_fractions(c, tiles, CAL_TAUS)})
+    c = get_case("A", "rot90", None, 512, kind="normal")
+    neg.append({"name": "normal uncorrected (normal_mode=off) rot90", "kind": "normal", "required": True,
+                **_bad_fractions(c, c.convert(normal_mode="off").tiles, CAL_TAUS)})
+    return pos, neg
+
+
+def seed_sweep(n_seeds=40, n=512, taus=(0.08, 0.10)):
+    """既定の n=512 で、シード n_seeds 通りの偽陽性率(正例)と検出率(負例)を tau ごとに調べる。"""
+    pos_rows, neg_rows = [], []
+    for name, sig, cs, src, dst in (("noise/srgb A->B", "noise", "srgb", "A", "B"),
+                                    ("noise/srgb A->scaled", "noise", "srgb", "A", "scaled"),
+                                    ("noise/srgb B->rot270_mirror", "noise", "srgb", "B", "rot270_mirror"),
+                                    ("noise/raw B->rot270_mirror", "noise", "raw", "B", "rot270_mirror"),
+                                    ("detail/srgb A->B", "detail", "srgb", "A", "B")):
+        c = probe_case(src, dst, sig, colorspace=cs)
+        tiles = c.convert().tiles
+        row = {"name": name, "seeds": n_seeds}
+        for tau in taus:
+            reps = [c.probe(tiles, n=n, seed=sd, tau=tau) for sd in range(n_seeds)]
+            fr = [r.n_bad / max(r.n_valid, 1) for r in reps]
+            row[tau] = {"fails": sum(r.status == "fail" for r in reps), "worst_bad_pct": 100 * max(fr),
+                        "mean_bad_pct": 100 * float(np.mean(fr))}
+        pos_rows.append(row)
+    for name, sig, make in (("smooth shift_u 3%", "smooth", lambda r, c: inject_shift_u(r.tiles, 0.03)),
+                            ("detail shift_u 2%", "detail", lambda r, c: inject_shift_u(r.tiles, 0.02)),
+                            ("noise shift_u 2%", "noise", lambda r, c: inject_shift_u(r.tiles, 0.02)),
+                            ("smooth dropout 2%", "smooth", lambda r, c: inject_dropout(r.tiles, r.coverage, 0.02)),
+                            ("detail dropout 2%", "detail", lambda r, c: inject_dropout(r.tiles, r.coverage, 0.02)),
+                            ("noise dropout 2%", "noise", lambda r, c: inject_dropout(r.tiles, r.coverage, 0.02)),
+                            ("smooth flip shell 2", "smooth", lambda r, c: inject_flip_shell(r.tiles, c.shells(), 2))):
+        c = probe_case("A", "B", sig)
+        tiles = make(c.convert(), c)
+        row = {"name": name, "seeds": n_seeds}
+        for tau in taus:
+            reps = [c.probe(tiles, n=n, seed=sd, tau=tau) for sd in range(n_seeds)]
+            fr = [r.n_bad / max(r.n_valid, 1) for r in reps]
+            row[tau] = {"detected": sum(r.status == "fail" for r in reps), "min_bad_pct": 100 * min(fr),
+                        "mean_bad_pct": 100 * float(np.mean(fr))}
+        neg_rows.append(row)
+    return pos_rows, neg_rows
+
+
+def resolution_sweep():
+    """解像度(= 縮小係数 s)とノイズ粒度で、窓方式 lattice / centered の偽陽性を比べる。A->B, raw, n=2000。"""
+    rows = []
+    for res in (256, 512, 1024, 2048):
+        for k in (1, 2, 4):
+            cell = k * 6.67 / res            # k テクセル相当の3Dセル幅
+            c = Case(LAYOUT_A, LAYOUT_B, cell, res)
+            tiles = c.convert().tiles
+            row = {"res": res, "s": max(1, res // 256), "k": k}
+            for fp in ("lattice", "centered"):
+                rep = c.probe(tiles, n=CAL_N, footprint=fp)
+                row[fp] = rep.n_bad / max(rep.n_valid, 1)
+            rows.append(row)
+    return rows
+
+
+def _fmt_table(rows, kind):
+    keys = list(CAL_ANGLES if kind == "normal" else CAL_TAUS)
+    unit = "deg" if kind == "normal" else "tau"
+    head = f"| scenario | n_valid | max_err | mean_err | " + " | ".join(f"bad@{unit}={k:g}" for k in keys) + " |"
+    lines = [head, "|" + "---|" * (4 + len(keys))]
+    for r in rows:
+        lines.append(f"| {r['name']} | {r['n_valid']} | {r['max_err']:.3f} | {r['mean_err']:.4f} | "
+                     + " | ".join(f"{100 * r['bad'][k]:.1f}%" for k in keys) + " |")
+    return "\n".join(lines)
+
+
+def _calibration_main(argv):
+    t0 = time.time()
+    pos, neg = calibration_data()
+    out = []
+    for title, rows in (("Positives (correct conversions; bad% must stay below 2%)", pos),
+                        ("Negatives (injected defects; bad% must exceed 2%)", neg)):
+        for kind in ("color", "normal"):
+            sub = [r for r in rows if r["kind"] == kind]
+            if sub:
+                out.append(f"\n### {title} - {kind}\n\n{_fmt_table(sub, kind)}")
+    summary = ["\n### Threshold sweep summary (worst case over all scenarios)\n",
+               "Required negatives only (1% shifts, and 2% shifts of the smooth texture, are sensitivity info).\n",
+               "| threshold | worst positive bad% | FP margin (2% / worst) | weakest required negative bad% | detection margin (weakest / 2%) |",
+               "|---|---|---|---|---|"]
+    for kind, keys in (("color", CAL_TAUS), ("normal", CAL_ANGLES)):
+        for k in keys:
+            p = [r for r in pos if r["kind"] == kind]
+            n = [r for r in neg if r["kind"] == kind and r.get("required", True)]
+            wp = max(p, key=lambda r: r["bad"][k])
+            wn = min(n, key=lambda r: r["bad"][k])
+            fpm = "inf" if wp["bad"][k] == 0 else f"{0.02 / wp['bad'][k]:.1f}x"
+            summary.append(f"| {kind} {'deg' if kind == 'normal' else 'tau'}={k:g} | "
+                           f"{100 * wp['bad'][k]:.2f}% ({wp['name']}) | {fpm} | "
+                           f"{100 * wn['bad'][k]:.1f}% ({wn['name']}) | {wn['bad'][k] / 0.02:.1f}x |")
+    out.append("\n".join(summary))
+    pos_s, neg_s = seed_sweep()
+    ss = ["\n### False-alarm rate of correct conversions, default n=512, 40 seeds\n",
+          "| scenario | fail@tau=0.08 | worst bad% | mean bad% | fail@tau=0.10 | worst bad% | mean bad% |",
+          "|---|---|---|---|---|---|---|"]
+    for r in pos_s:
+        a8, a10 = r[0.08], r[0.10]
+        ss.append(f"| {r['name']} | {a8['fails']} / {r['seeds']} | {a8['worst_bad_pct']:.2f}% | {a8['mean_bad_pct']:.2f}% | "
+                  f"{a10['fails']} / {r['seeds']} | {a10['worst_bad_pct']:.2f}% | {a10['mean_bad_pct']:.2f}% |")
+    out.append("\n".join(ss))
+    ds = ["\n### Detection rate of injected defects, default n=512, 40 seeds\n",
+          "| defect | detected@tau=0.08 | min bad% | mean bad% | detected@tau=0.10 | min bad% | mean bad% |",
+          "|---|---|---|---|---|---|---|"]
+    for r in neg_s:
+        a8, a10 = r[0.08], r[0.10]
+        ds.append(f"| {r['name']} | {a8['detected']} / {r['seeds']} | {a8['min_bad_pct']:.2f}% | {a8['mean_bad_pct']:.2f}% | "
+                  f"{a10['detected']} / {r['seeds']} | {a10['min_bad_pct']:.2f}% | {a10['mean_bad_pct']:.2f}% |")
+    out.append("\n".join(ds))
+    rs = ["\n### Window method vs resolution (raw, A->B, noise whose correlation length is k texels; bad%)\n",
+          "| res | s | k (texels) | lattice (contract wording) | centered (default) |", "|---|---|---|---|---|"]
+    for r in resolution_sweep():
+        rs.append(f"| {r['res']} | {r['s']} | {r['k']} | {100 * r['lattice']:.1f}% | {100 * r['centered']:.1f}% |")
+    out.append("\n".join(rs))
+    out.append(f"\n(measured in {time.time() - t0:.0f} s, n={CAL_N} probe points per scenario unless noted, seed 0)")
+    print("\n".join(out))
+    if "--json" in argv:
+        path = argv[argv.index("--json") + 1]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"positives": pos, "negatives": neg}, fh, indent=1, default=float)
+
+
+if __name__ == "__main__":
+    if "--calibrate" in sys.argv:
+        _calibration_main(sys.argv)
+    else:
+        raise SystemExit(pytest.main([__file__, "-q"] + sys.argv[1:]))

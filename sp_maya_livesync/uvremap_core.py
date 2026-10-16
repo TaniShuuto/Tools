@@ -49,7 +49,8 @@ __all__ = [
 SCHEMA = 1
 
 # 3Dプローブ検証の既定しきい値(CONTRACT §3.1。根拠は docs/uvremap/PROBE_CALIBRATION.md)
-PROBE_TAU = 0.08               # color/scalar: チャンネル最大の絶対差
+PROBE_TAU = 0.10               # color/scalar: チャンネル最大の絶対差。契約の既定は 0.08 だが 0.10 に調整した
+                               # (sRGB の白色ノイズで 0.08 では 40 シード中 2 回が偽陽性。PROBE_CALIBRATION.md)
 PROBE_NORMAL_DEG = 8.0         # normal: 角度[deg]
 PROBE_MAX_BAD_FRACTION = 0.02  # n_bad / n_valid がこれを超えたら fail
 PROBE_MIN_VALID = 64           # n_valid がこれ未満なら inconclusive
@@ -1261,12 +1262,14 @@ def _dilate_bool(mask: np.ndarray, k: int) -> np.ndarray:
 
 
 def _box_mean_at(img: np.ndarray, cx: np.ndarray, cy: np.ndarray,
-                 wx: np.ndarray, wy: np.ndarray, chunk: int = 256) -> np.ndarray:
+                 wx: np.ndarray, wy: np.ndarray, chunk: int = 256,
+                 pre=None, post=None) -> np.ndarray:
     """連続ピクセル座標 (cx, cy)(テクセルの縁が整数)を中心とする wx x wy の箱型平均。
 
     窓は小数幅でよく、縁のテクセルは重なり面積で重み付けする(画像の外は端の値で延長)。
     格子に固定した縮小画像と違い、窓が常にプローブ点を中心にするので、旧/新で格子の位相が
-    ずれても同じ領域を平均する。(N,C) を返す。
+    ずれても同じ領域を平均する。pre/post は平均の前後に掛ける変換(sRGB の線形化と再符号化)。
+    (N,C) を返す。
     """
     H, W, C = img.shape
     out = np.empty((len(cx), C), dtype=np.float32)
@@ -1281,17 +1284,36 @@ def _box_mean_at(img: np.ndarray, cx: np.ndarray, cy: np.ndarray,
         wxs = np.clip(np.minimum(ix + 1, x_hi[:, None]) - np.maximum(ix, x_lo[:, None]), 0, None)
         wys = np.clip(np.minimum(iy + 1, y_hi[:, None]) - np.maximum(iy, y_lo[:, None]), 0, None)
         block = img[np.clip(iy, 0, H - 1)[:, :, None], np.clip(ix, 0, W - 1)[:, None, :]]
+        if pre is not None:
+            block = pre(block)
         acc = np.einsum("nyxc,ny,nx->nc", block, wys.astype(np.float32), wxs.astype(np.float32))
-        out[sl] = acc / (wxs.sum(1) * wys.sum(1))[:, None].astype(np.float32)
+        mean = acc / (wxs.sum(1) * wys.sum(1))[:, None].astype(np.float32)
+        out[sl] = post(mean) if post is not None else mean
+    return out
+
+
+def _srgb_decode(a: np.ndarray) -> np.ndarray:
+    """RGB(A)/L(A) の色チャンネルだけを線形化する(アルファは生値)。最後の軸がチャンネル。"""
+    out = np.array(a, dtype=np.float32, copy=True)
+    ch = _color_channels(out.shape[-1])
+    out[..., ch] = srgb_to_linear(out[..., ch])
+    return out
+
+
+def _srgb_encode(a: np.ndarray) -> np.ndarray:
+    out = np.array(a, dtype=np.float32, copy=True)
+    ch = _color_channels(out.shape[-1])
+    out[..., ch] = linear_to_srgb(out[..., ch])
     return out
 
 
 class _ProbeSide:
     """プローブ側の1レイアウト(旧または新): 縮小画像と境界/重なりマスクをタイルごとに遅延生成する。"""
 
-    def __init__(self, tiles: Mapping[int, np.ndarray], layout: _Layout):
+    def __init__(self, tiles: Mapping[int, np.ndarray], layout: _Layout, srgb: bool = False):
         self.tiles = tiles
         self.layout = layout
+        self.srgb = srgb          # True: 窓平均を線形光で取り、符号化し直して返す
         self._ds: dict[int, tuple] = {}
         self._maps: dict[int, tuple] = {}
 
@@ -1310,7 +1332,8 @@ class _ProbeSide:
             img = self.tiles[key]
             H, W = img.shape[:2]
             s = _ds_factor(H, W)
-            self._ds[key] = (_box_down(img, s), s, W, H)
+            small = _box_down(_srgb_decode(img) if self.srgb else img, s)
+            self._ds[key] = (small, s, W, H)
         return self._ds[key]
 
     def maps(self, key: int):
@@ -1330,14 +1353,17 @@ class _ProbeSide:
         small, s, W, H = self.ds(key)
         x = u_local * W / s - 0.5
         y = (1.0 - v_local) * H / s - 0.5
-        return _bilinear_xy(small, x, y)
+        out = _bilinear_xy(small, x, y)
+        return _srgb_encode(out) if self.srgb else out
 
     def sample_centered(self, key: int, u_local: np.ndarray, v_local: np.ndarray,
                         size: np.ndarray) -> np.ndarray:
         """点を中心とする size テクセル四方の箱型平均(footprint="centered")。"""
         img = self.tiles[key]
         H, W = img.shape[:2]
-        return _box_mean_at(img, u_local * W, (1.0 - v_local) * H, size, size)
+        return _box_mean_at(img, u_local * W, (1.0 - v_local) * H, size, size,
+                            pre=_srgb_decode if self.srgb else None,
+                            post=_srgb_encode if self.srgb else None)
 
     def lookup(self, key: int, which: int, u_local: np.ndarray, v_local: np.ndarray) -> np.ndarray:
         """maps()[which] を点の位置で引く。"""
@@ -1388,7 +1414,8 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
 
     TSのフェース上から面積比例で n 点(固定シード)を選び、各点の旧UV位置と新UV位置を
     同じ三角形・同じ重心座標から求める。旧テクスチャを旧UVで、新テクスチャを新UVで読み、
-    縮小(箱型, s = max(1, min(W,H)//256))してから比較する。箱型の窓は既定ではプローブ点を
+    縮小(箱型, s = max(1, min(W,H)//256))してから比較する。sRGB のカラーは窓平均を線形光で
+    取り、符号化し直した値で比較する(変換が線形光で補間するため)。箱型の窓は既定ではプローブ点を
     中心に置く(footprint="centered")。格子固定の縮小(footprint="lattice")は新旧の格子の位相差で
     細部テクスチャを誤検出するため既定にしていない。
 
@@ -1445,8 +1472,9 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
     # layout は候補のみで作るので、点の三角形を候補内インデックスに直す
     remap = np.cumsum(cand) - 1
     ti_c = remap[ti]
-    old_side = _ProbeSide(old_src, old_layout)
-    new_side = _ProbeSide(new_src, new_layout)
+    linear_avg = spec.colorspace == "srgb" and not is_normal
+    old_side = _ProbeSide(old_src, old_layout, linear_avg)
+    new_side = _ProbeSide(new_src, new_layout, linear_avg)
 
     valid = np.ones(n, dtype=bool)
     force_bad = np.zeros(n, dtype=bool)
@@ -1564,6 +1592,6 @@ def probe_verify(old_tiles, new_tiles, baseline: Snapshot, current: Snapshot, ts
         notes.append(f"low_resolution_probe: s={s_min} (<4); texel-level detail can raise false alarms")
     params = {"tau": tau, "max_angle_deg": max_angle, "max_bad_fraction": max_bad_frac,
               "min_valid": min_valid, "footprint": footprint, "match_density": bool(match_density),
-              "seed": int(seed), "n": int(n)}
+              "seed": int(seed), "n": int(n), "linear_light_average": bool(linear_avg)}
     return ProbeReport(status, int(n), n_valid, n_bad, max_err, mean_err, bad_points,
                        excluded, notes, params)
