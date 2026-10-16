@@ -119,3 +119,76 @@ pid 生存確認は D2b か別作業。
 mayapy バッチで立方体+ファイルノード+合成 PNG を作り、
 `record_baseline` → UV 移動 → `convert_now` → `poll` → 切替確認 → `revert_to_original`、
 および mayapy 子プロセス起動(R4)を見る。このクラウド環境に Maya は無い。
+
+## D2c. 実行制御の修正で決めたこと・未確認
+
+契約や他ファイルは変えていない。ワーカーの `_requested_generation` を読んで合わせた。
+
+### D2c-1. `latest_generation_path` の場所と中身
+
+ワーカーは `job.json` の `latest_generation_path` を開き、
+- 先頭が `{` なら JSON の `generation`
+- それ以外なら整数1行
+を読む。壊れていれば警告して無視する。この読み方に合わせて書いた。
+
+パスは `<root>/latest_generation/<ts>.json`。中身は
+`{"schema":1,"generation":N,"ts_name":"..."}`。
+原子的に書く(`write_json_atomic`)。
+
+**常に書く。** 実行中ジョブが無い初回も、このファイルと `job.json` のパスを付ける。
+ワーカーは開始時にパスを `self.job` に持ち、中身だけを都度読む。
+初回ジョブにパスが無いと、後から `job.json` を書き換えても動いているワーカーは見ない。
+2本目以降は同じパスへ新しい世代を書き、新旧の `job.json` がそのパスを指すようにする。
+古いプロセスは殺さない。
+
+形式をワーカー以外の新しい約束にはしていない。読めない場合の独自形式は決めていない。
+
+### D2c-2. TS名をファイル名にするとき
+
+Windows で使えない文字 `<>:"/\|?*` と制御文字は `_` に置換する。
+末尾の空白と `.` は落とす。空・`.`・`..`・予約名(CON 等)は `ts_` を付ける。
+80文字を超えたら切る。置換や予約名で元と違うときは、元の UTF-8 の sha1 先頭8桁を
+`__` のあとに付け、`mat/2` と `mat_2` が同じファイルにならないようにした。
+この規則は実機の TS 名では未確認。極端に長い名前や合成文字は未確認。
+
+### D2c-3. 切り替え対象が無いとき
+
+`exit_code == 0` で `switched` が空なら、イベントに
+`"warning":"no_file_nodes_switched"` を付け、`status.json` を `ORIGINAL`、
+メッセージは「変換は完了しましたが、切り替え対象のファイルノードが見つかりません」。
+イベントの `state` も `ORIGINAL`。ワーカーが書いた `CONVERTED_OK` は上書きする。
+`files` が空のときも同じ。
+
+欠けているファイルが理由で1つも切り替わらないときは、警告は
+`"converted_file_missing"`(より具体)を優先し、状態とメッセージは上と同じ
+(`ORIGINAL` + 上記メッセージ)。部分的に切り替わったときは `CONVERTED_OK` のまま、
+警告と `missing`(`{suffix, name}`)だけを付ける。
+この優先は指示に両方あるため、こちらで決めた。指揮役の確認が欲しい。
+
+### D2c-4. 変換後ファイルの存在確認
+
+`exists_fn`(既定 `os.path.isfile`)で、`files` の `name` を `output_dir` の下で見る。
+UDIM は `<UDIM>` トークンではなく、`files` に載った実タイル名を見る。
+1つでも欠けている suffix のノードは切り替えない。
+`exists_fn` が例外を出したら、そのファイルは無いものとして扱う。
+色空間はまだ触っていない(R5のまま)。
+
+### D2c-5. `uvremapTsName`
+
+切替時に文字列属性 `uvremapTsName` を付ける。戻すときは、属性があれば完全一致、
+無ければ従来の `<ts>_` 前方一致。戻したら属性も消す。
+`uvremapOriginalPath` / `uvremapOriginalTiling` は名前も意味も変えていない。
+実機の `addAttr(dt="string")` は R11 どおり未確認。
+
+### D2c-6. CONVERTING の書き込み順
+
+`Popen` の前に `CONVERTING` を書く。`Popen` が失敗したら従来どおり `FAILED`。
+起動が極端に速い場合の上書きは、この変更で防げる想定。実機未確認。
+
+### D2c-7. 未実行(実機必須)
+
+- `verify_runtime.py`(一時フォルダ削除を含む一周)
+- `verify_runtime_gui.py`(Maya GUI の Script Editor から mayapy 起動)
+- Maya GUI の `sys.executable` の隣に `mayapy.exe` があること(R4/R11のまま)
+
+このクラウド環境に Maya は無い。`verify_runtime_gui.py` は書いて未実行。

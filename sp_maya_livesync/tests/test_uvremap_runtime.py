@@ -150,7 +150,14 @@ def _collect_holder(arrays, info):
     return collect
 
 
-def _make_runtime(tmp_path, *, enabled=True, cmds=None, popen=None, collect=None, mayapy=None):
+def _yes_exists(_path):
+    return True
+
+
+def _make_runtime(
+    tmp_path, *, enabled=True, cmds=None, popen=None, collect=None, mayapy=None,
+    exists_fn=None,
+):
     root = tmp_path / "uvremap" / "proj"
     root.mkdir(parents=True, exist_ok=True)
     if cmds is None:
@@ -177,6 +184,7 @@ def _make_runtime(tmp_path, *, enabled=True, cmds=None, popen=None, collect=None
         cmds_fn=lambda: cmds,
         mayapy_path=mayapy,
         collect_arrays_fn=collect,
+        exists_fn=exists_fn,
     )
     runtime._now_box = now_box
     runtime._root_path = root
@@ -302,7 +310,7 @@ def test_switch_and_revert_roundtrip_leaves_other_nodes(tmp_path):
         {"name": "Body_Roughness.1002.png", "tile": 1002, "sha1": "c"},
     ]
     out = tmp_path / "output" / "final"
-    switched = rt.switch_ts_file_nodes(cmds, TS, files, out)
+    switched = rt.switch_ts_file_nodes(cmds, TS, files, out, exists_fn=_yes_exists)
     assert set(switched) == {"file_body", "file_body_single"}
 
     body = cmds.nodes["file_body"]
@@ -310,6 +318,7 @@ def test_switch_and_revert_roundtrip_leaves_other_nodes(tmp_path):
     assert body["uvTilingMode"] == rt.UV_TILING_OFF
     assert body["extra"][rt.ATTR_ORIGINAL_PATH] == before["file_body"]["fileTextureName"]
     assert body["extra"][rt.ATTR_ORIGINAL_TILING] == rt.UV_TILING_UDIM
+    assert body["extra"][rt.ATTR_TS_NAME] == TS
 
     single = cmds.nodes["file_body_single"]
     assert single["fileTextureName"] == str(out / "Body_Roughness.<UDIM>.png")
@@ -339,7 +348,7 @@ def test_udim_multi_to_single_and_single_to_multi(tmp_path):
     rt.switch_ts_file_nodes(
         cmds, TS,
         [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "x"}],
-        out,
+        out, exists_fn=_yes_exists,
     )
     assert cmds.nodes["file_udim"]["fileTextureName"] == str(out / "Body_BaseColor.png")
     assert cmds.nodes["file_udim"]["uvTilingMode"] == rt.UV_TILING_OFF
@@ -359,7 +368,7 @@ def test_udim_multi_to_single_and_single_to_multi(tmp_path):
             {"name": "Body_BaseColor.1001.png", "tile": 1001, "sha1": "x"},
             {"name": "Body_BaseColor.1002.png", "tile": 1002, "sha1": "y"},
         ],
-        out,
+        out, exists_fn=_yes_exists,
     )
     assert cmds.nodes["file_one"]["fileTextureName"] == str(out / "Body_BaseColor.<UDIM>.png")
     assert cmds.nodes["file_one"]["uvTilingMode"] == rt.UV_TILING_UDIM
@@ -441,6 +450,7 @@ def test_d3_reverts_when_last_good_hash_differs(tmp_path):
     out = tmp_path / "out"
     rt.switch_ts_file_nodes(
         cmds, TS, [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}], out,
+        exists_fn=_yes_exists,
     )
     assert cmds.nodes["file_body"]["extra"][rt.ATTR_ORIGINAL_PATH]
     ledger = {
@@ -488,6 +498,7 @@ def test_d3_keeps_converted_when_hash_matches(tmp_path):
     out = tmp_path / "out"
     rt.switch_ts_file_nodes(
         cmds, TS, [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}], out,
+        exists_fn=_yes_exists,
     )
     converted = cmds.nodes["file_body"]["fileTextureName"]
     ledger = {
@@ -537,6 +548,7 @@ def test_kill_switch_reverts_and_does_not_create_job(tmp_path):
     out = tmp_path / "out"
     rt.switch_ts_file_nodes(
         cmds, TS, [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}], out,
+        exists_fn=_yes_exists,
     )
     assert rt.ATTR_ORIGINAL_PATH in cmds.nodes["file_body"]["extra"]
     flag["on"] = False
@@ -638,4 +650,249 @@ def test_real_worker_switch_then_topology_fail_reverts(tmp_path):
     assert events[0]["reverted"]
     assert cmds.nodes["file_body"]["fileTextureName"] == original_body
     assert rt.ATTR_ORIGINAL_PATH not in cmds.nodes["file_body"]["extra"]
+    assert rt.ATTR_TS_NAME not in cmds.nodes["file_body"]["extra"]
     assert cmds.nodes["file_trim"]["fileTextureName"].endswith("Trim_BaseColor.png")
+
+
+# ---------------------------------------------------------------------------
+# D2c: 世代・空切替・欠損ファイル・TS名一致・CONVERTING の順序
+# ---------------------------------------------------------------------------
+def _popen_ok_with_files(files):
+    def popen_ok(args, **kwargs):
+        job_path = Path(args[3])
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        result = {
+            "schema": 1,
+            "job_id": job_path.parent.name,
+            "generation": job.get("generation", 1),
+            "status": "ok",
+            "exit_code": 0,
+            "ts_name": job.get("ts_name", TS),
+            "files": files,
+            "messages": [],
+        }
+        (job_path.parent / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        return FakeProc(0)
+
+    return popen_ok
+
+
+def test_second_job_generation_advances_and_writes_latest(tmp_path):
+    popen = CapturedPopen(code=None)
+    runtime = _make_runtime(tmp_path, popen=popen)
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    channels = [{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}]
+    job1 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
+    )
+    job2 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
+    )
+    assert job1 and job2 and job1 != job2
+    rec1 = runtime._jobs[job1]
+    rec2 = runtime._jobs[job2]
+    assert rec2["generation"] > rec1["generation"]
+    latest = rt.latest_generation_file(runtime._root_path, TS)
+    assert latest.is_file()
+    assert latest.parent.name == rt.LATEST_GENERATION_DIR
+    assert latest.name == rt.latest_generation_filename(TS)
+    data = json.loads(latest.read_text(encoding="utf-8"))
+    assert data["generation"] == rec2["generation"]
+    assert data["ts_name"] == TS
+    j1 = json.loads((runtime._root_path / "jobs" / job1 / "job.json").read_text(encoding="utf-8"))
+    j2 = json.loads((runtime._root_path / "jobs" / job2 / "job.json").read_text(encoding="utf-8"))
+    assert j1["latest_generation_path"] == str(latest)
+    assert j2["latest_generation_path"] == str(latest)
+    assert j1["generation"] == rec1["generation"]
+    assert j2["generation"] == rec2["generation"]
+
+
+def test_latest_generation_filename_sanitizes_without_collision():
+    assert rt.latest_generation_filename("Body") == "Body.json"
+    assert rt.latest_generation_filename("mat_2") == "mat_2.json"
+    slash = rt.latest_generation_filename("mat/2")
+    assert slash != "mat_2.json"
+    assert slash.endswith(".json")
+    assert "/" not in slash
+
+
+def test_poll_original_when_no_file_nodes_switched(tmp_path):
+    cmds = FakeCmds({
+        "file_other": {"fileTextureName": "/src/Other_BaseColor.png", "uvTilingMode": 0},
+    })
+    files = [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}]
+    runtime = _make_runtime(
+        tmp_path, cmds=cmds, popen=_popen_ok_with_files(files), exists_fn=_yes_exists,
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    events = runtime.poll()
+    assert len(events) == 1
+    assert events[0]["switched"] == []
+    assert events[0]["warning"] == rt.WARN_NO_FILE_NODES
+    assert events[0]["state"] == rt.STATE_ORIGINAL
+    assert events[0]["message"] == rt.MSG_NO_FILE_NODES
+    assert events[0]["updated"] == FIXED_NOW
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"][TS]["message"] == rt.MSG_NO_FILE_NODES
+    assert status["ts"][TS]["updated"] == FIXED_NOW
+    assert cmds.nodes["file_other"]["fileTextureName"] == "/src/Other_BaseColor.png"
+
+
+def test_missing_converted_file_skips_that_channel_only(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "Body_BaseColor.png").write_bytes(b"x")
+    files = [
+        {"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"},
+        {"name": "Body_Roughness.png", "tile": 1001, "sha1": "b"},
+    ]
+    cmds = FakeCmds({
+        "file_bc": {"fileTextureName": "/src/Body_BaseColor.png", "uvTilingMode": 0},
+        "file_rg": {"fileTextureName": "/src/Body_Roughness.png", "uvTilingMode": 0},
+    })
+    missing = []
+    switched = rt.switch_ts_file_nodes(cmds, TS, files, out, missing_out=missing)
+    assert switched == ["file_bc"]
+    assert cmds.nodes["file_bc"]["fileTextureName"] == str(out / "Body_BaseColor.png")
+    assert cmds.nodes["file_rg"]["fileTextureName"] == "/src/Body_Roughness.png"
+    assert {"suffix": "Roughness", "name": "Body_Roughness.png"} in missing
+
+    poll_cmds = FakeCmds({
+        "file_bc": {"fileTextureName": "/src/Body_BaseColor.png", "uvTilingMode": 0},
+        "file_rg": {"fileTextureName": "/src/Body_Roughness.png", "uvTilingMode": 0},
+    })
+    runtime = _make_runtime(
+        tmp_path, cmds=poll_cmds, popen=_popen_ok_with_files(files),
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", out,
+        channels=[
+            {"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"},
+            {"suffix": "Roughness", "colorspace": "raw", "kind": "scalar"},
+        ],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    events = runtime.poll()
+    assert events[0]["warning"] == rt.WARN_FILE_MISSING
+    assert events[0]["switched"] == ["file_bc"]
+    assert {"suffix": "Roughness", "name": "Body_Roughness.png"} in events[0]["missing"]
+    assert poll_cmds.nodes["file_bc"]["fileTextureName"] == str(out / "Body_BaseColor.png")
+    assert poll_cmds.nodes["file_rg"]["fileTextureName"] == "/src/Body_Roughness.png"
+
+
+def test_udim_missing_tile_skips_channel(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "Body_BaseColor.1001.png").write_bytes(b"x")
+    cmds = FakeCmds({
+        "file_udim": {
+            "fileTextureName": "/src/Body_BaseColor.<UDIM>.png",
+            "uvTilingMode": rt.UV_TILING_UDIM,
+        },
+    })
+    files = [
+        {"name": "Body_BaseColor.1001.png", "tile": 1001, "sha1": "a"},
+        {"name": "Body_BaseColor.1002.png", "tile": 1002, "sha1": "b"},
+    ]
+    missing = []
+    switched = rt.switch_ts_file_nodes(cmds, TS, files, out, missing_out=missing)
+    assert switched == []
+    assert cmds.nodes["file_udim"]["fileTextureName"] == "/src/Body_BaseColor.<UDIM>.png"
+    assert any(item["name"] == "Body_BaseColor.1002.png" for item in missing)
+
+
+def test_revert_mat_does_not_revert_mat_2(tmp_path):
+    out = tmp_path / "out"
+    cmds = FakeCmds({
+        "file_mat": {"fileTextureName": "/src/mat_BaseColor.png", "uvTilingMode": 0},
+        "file_mat2": {"fileTextureName": "/src/mat_2_BaseColor.png", "uvTilingMode": 0},
+    })
+    rt.switch_ts_file_nodes(
+        cmds, "mat", [{"name": "mat_BaseColor.png", "tile": 1001, "sha1": "a"}],
+        out, exists_fn=_yes_exists,
+    )
+    rt.switch_ts_file_nodes(
+        cmds, "mat_2", [{"name": "mat_2_BaseColor.png", "tile": 1001, "sha1": "b"}],
+        out, exists_fn=_yes_exists,
+    )
+    assert cmds.nodes["file_mat"]["extra"][rt.ATTR_TS_NAME] == "mat"
+    assert cmds.nodes["file_mat2"]["extra"][rt.ATTR_TS_NAME] == "mat_2"
+    mat2_path = cmds.nodes["file_mat2"]["fileTextureName"]
+    reverted = rt.revert_ts_file_nodes(cmds, ts_name="mat")
+    assert reverted == ["file_mat"]
+    assert cmds.nodes["file_mat"]["fileTextureName"] == "/src/mat_BaseColor.png"
+    assert rt.ATTR_TS_NAME not in cmds.nodes["file_mat"]["extra"]
+    assert rt.ATTR_ORIGINAL_PATH not in cmds.nodes["file_mat"]["extra"]
+    assert cmds.nodes["file_mat2"]["fileTextureName"] == mat2_path
+    assert cmds.nodes["file_mat2"]["extra"][rt.ATTR_TS_NAME] == "mat_2"
+
+
+def test_revert_legacy_prefix_without_ts_attr():
+    cmds = FakeCmds({
+        "file_old": {
+            "fileTextureName": "/out/mat_BaseColor.png",
+            "uvTilingMode": 0,
+            "extra": {
+                rt.ATTR_ORIGINAL_PATH: "/src/mat_BaseColor.png",
+                rt.ATTR_ORIGINAL_TILING: 0,
+            },
+        },
+        "file_old2": {
+            "fileTextureName": "/out/mat_2_BaseColor.png",
+            "uvTilingMode": 0,
+            "extra": {
+                rt.ATTR_ORIGINAL_PATH: "/src/mat_2_BaseColor.png",
+                rt.ATTR_ORIGINAL_TILING: 0,
+            },
+        },
+        "file_plain": {
+            "fileTextureName": "/out/Trim_BaseColor.png",
+            "uvTilingMode": 0,
+            "extra": {
+                rt.ATTR_ORIGINAL_PATH: "/src/Trim_BaseColor.png",
+                rt.ATTR_ORIGINAL_TILING: 0,
+            },
+        },
+    })
+    reverted = rt.revert_ts_file_nodes(cmds, ts_name="mat")
+    assert "file_old" in reverted
+    assert "file_old2" in reverted
+    assert "file_plain" not in reverted
+    assert cmds.nodes["file_old"]["fileTextureName"] == "/src/mat_BaseColor.png"
+    assert cmds.nodes["file_old2"]["fileTextureName"] == "/src/mat_2_BaseColor.png"
+    assert cmds.nodes["file_plain"]["fileTextureName"] == "/out/Trim_BaseColor.png"
+
+
+def test_converting_written_before_popen(tmp_path):
+    seen = {}
+    box = {}
+
+    def popen_fn(args, **kwargs):
+        path = box["rt"]._root_path / "status.json"
+        seen["status"] = json.loads(path.read_text(encoding="utf-8"))
+        return FakeProc(None)
+
+    runtime = _make_runtime(tmp_path, popen=popen_fn)
+    box["rt"] = runtime
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], tmp_path / "src", tmp_path / "out",
+        channels=[{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}],
+        udim=False, timeout_s=30,
+    )
+    assert job_id
+    assert seen["status"]["ts"][TS]["state"] == rt.STATE_CONVERTING
+    assert seen["status"]["ts"][TS]["updated"] == FIXED_NOW
+    assert seen["status"]["ts"][TS]["generation"] == 1

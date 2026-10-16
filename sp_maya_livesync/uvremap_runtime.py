@@ -8,6 +8,7 @@ Maya の import は関数の中だけ。cmds / Popen / 配列収集は差し替�
 from __future__ import annotations
 
 import datetime
+import hashlib
 import os
 import re
 import subprocess
@@ -21,6 +22,7 @@ from uvremap_worker import read_json, write_json_atomic
 SCHEMA = 1
 ATTR_ORIGINAL_PATH = "uvremapOriginalPath"
 ATTR_ORIGINAL_TILING = "uvremapOriginalTiling"
+ATTR_TS_NAME = "uvremapTsName"
 UV_TILING_OFF = 0
 UV_TILING_UDIM = 3
 STATE_ORIGINAL = "ORIGINAL"
@@ -33,11 +35,21 @@ MSG_KILLSWITCH = "キルスイッチがオフのため原本を表示します"
 MSG_NO_MAYAPY = (
     "mayapy が見つかりません。Maya の mayapy のパスを mayapy_path で指定してください"
 )
+MSG_NO_FILE_NODES = "変換は完了しましたが、切り替え対象のファイルノードが見つかりません"
+WARN_NO_FILE_NODES = "no_file_nodes_switched"
+WARN_FILE_MISSING = "converted_file_missing"
 WORKER_SCRIPT = Path(__file__).resolve().parent / "uvremap_worker.py"
 ACTIVE_BASELINE_NAME = "active.json"
+LATEST_GENERATION_DIR = "latest_generation"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 FAIL_EXIT_CODES = (11, 12, 13)
 _TILE_STEM_RE = re.compile(r"^(.+)\.(\d{4})$")
+_UNSAFE_TS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WIN_RESERVED = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM{0}".format(i) for i in range(1, 10)]
+    + ["LPT{0}".format(i) for i in range(1, 10)]
+)
 _STRIP_ENV = (
     "PYTHONHOME",
     "PYTHONPATH",
@@ -179,6 +191,72 @@ def _filename_matches_ts(filename: str, ts_name: str) -> bool:
     return _basename(filename).startswith("{0}_".format(ts_name))
 
 
+def latest_generation_filename(ts_name: str) -> str:
+    """TS名を ``latest_generation/<name>.json`` 用のファイル名にする。
+
+    使えない文字は ``_`` に置き、置き換えや予約名で元と違うときは
+    元の UTF-8 の sha1 先頭8桁を付けて衝突を避ける。
+    """
+    raw = "" if ts_name is None else str(ts_name)
+    safe = _UNSAFE_TS_RE.sub("_", raw).rstrip(" .")
+    reserved = safe.split(".")[0].upper() if safe else ""
+    changed = safe != raw
+    if not safe or safe in (".", "..") or reserved in _WIN_RESERVED:
+        safe = "ts_{0}".format(safe) if safe and safe not in (".", "..") else "ts"
+        changed = True
+    if len(safe) > 80:
+        safe = safe[:80].rstrip(" .") or "ts"
+        changed = True
+    if changed:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+        safe = "{0}__{1}".format(safe, digest)
+    return safe + ".json"
+
+
+def latest_generation_file(root, ts_name: str) -> Path:
+    """``<root>/latest_generation/<safe_ts>.json``。"""
+    return Path(root) / LATEST_GENERATION_DIR / latest_generation_filename(ts_name)
+
+
+def _ledger_generation(ledger, ts_name: str) -> int:
+    if not isinstance(ledger, dict):
+        return 0
+    table = ledger.get("ts")
+    if not isinstance(table, dict):
+        return 0
+    entry = table.get(ts_name)
+    if not isinstance(entry, dict):
+        return 0
+    gen = entry.get("generation")
+    if isinstance(gen, bool) or not isinstance(gen, int):
+        return 0
+    return gen
+
+
+def missing_converted_targets(ts_name, files, output_dir, exists_fn) -> list:
+    """result.json の files のうち、出力先に無いものを {suffix, name} で返す。"""
+    dest = Path(output_dir)
+    missing = []
+    for entry in files or []:
+        if not isinstance(entry, dict):
+            continue
+        parsed = parse_output_name(ts_name, entry.get("name") or "")
+        if parsed is None:
+            continue
+        suffix, _tile, _ext = parsed
+        name = _basename(entry.get("name") or "")
+        if not name:
+            continue
+        path = dest / name
+        try:
+            present = bool(exists_fn(os.fspath(path)))
+        except Exception:
+            present = False
+        if not present:
+            missing.append({"suffix": suffix, "name": name})
+    return missing
+
+
 def _plug(node: str, attr: str) -> str:
     return "{0}.{1}".format(node, attr)
 
@@ -287,20 +365,29 @@ def _record_original(cmds, node: str) -> None:
         _set_int(cmds, node, ATTR_ORIGINAL_TILING, tiling_i)
 
 
-def switch_ts_file_nodes(cmds, ts_name: str, files, output_dir) -> list:
+def switch_ts_file_nodes(
+    cmds, ts_name: str, files, output_dir, exists_fn=None, missing_out=None,
+) -> list:
     """当該 TS のファイルノードだけを変換後パスへ切り替える。
 
     属性名 ``uvremapOriginalPath`` / ``uvremapOriginalTiling`` は後続作業が
     依存するため変更しない。既に属性があるノードは元パスを上書きしない。
+    切替時に ``uvremapTsName`` へ TS 名を書く。変換後ファイルが1つでも欠けている
+    チャンネルのノードは切り替えない。
     """
     grouped = suffixes_from_files(ts_name, files)
     if not grouped:
         return []
+    checker = exists_fn if exists_fn is not None else os.path.isfile
+    missing = missing_converted_targets(ts_name, files, output_dir, checker)
+    if missing_out is not None:
+        missing_out.extend(missing)
+    skip = {item["suffix"] for item in missing}
     dest_dir = Path(output_dir)
     switched = []
     for node in _cmds_ls_files(cmds):
         suffix = _match_suffix(cmds, node, ts_name, grouped)
-        if suffix is None:
+        if suffix is None or suffix in skip:
             continue
         info = grouped[suffix]
         n_tiles = len(info["tiles"])
@@ -308,6 +395,8 @@ def switch_ts_file_nodes(cmds, ts_name: str, files, output_dir) -> list:
         new_path = str(dest_dir / name)
         tiling = UV_TILING_OFF if n_tiles <= 1 else UV_TILING_UDIM
         _record_original(cmds, node)
+        _ensure_string_attr(cmds, node, ATTR_TS_NAME)
+        _set_string(cmds, node, ATTR_TS_NAME, str(ts_name))
         _set_file_texture(cmds, node, new_path)
         _set_int(cmds, node, "uvTilingMode", tiling)
         switched.append(node)
@@ -315,7 +404,11 @@ def switch_ts_file_nodes(cmds, ts_name: str, files, output_dir) -> list:
 
 
 def revert_ts_file_nodes(cmds, ts_name=None) -> list:
-    """属性があるノードだけを原本へ戻し、属性を削除する。属性が無いノードは触らない。"""
+    """属性があるノードだけを原本へ戻し、属性を削除する。属性が無いノードは触らない。
+
+    ``uvremapTsName`` があるノードは TS 名の完全一致。無い(D2a 当時の)ノードだけ
+    ファイル名の ``<ts>_`` 前方一致を使う。
+    """
     reverted = []
     for node in _cmds_ls_files(cmds):
         if not _has_attr(cmds, node, ATTR_ORIGINAL_PATH) and not _has_attr(
@@ -323,7 +416,13 @@ def revert_ts_file_nodes(cmds, ts_name=None) -> list:
         ):
             continue
         if ts_name:
-            if not any(_filename_matches_ts(path, ts_name) for path in _node_path_candidates(cmds, node)):
+            if _has_attr(cmds, node, ATTR_TS_NAME):
+                tagged = _get_attr(cmds, node, ATTR_TS_NAME, "")
+                if str(tagged) != str(ts_name):
+                    continue
+            elif not any(
+                _filename_matches_ts(path, ts_name) for path in _node_path_candidates(cmds, node)
+            ):
                 continue
         original = _get_attr(cmds, node, ATTR_ORIGINAL_PATH, None)
         tiling = _get_attr(cmds, node, ATTR_ORIGINAL_TILING, UV_TILING_OFF)
@@ -336,6 +435,7 @@ def revert_ts_file_nodes(cmds, ts_name=None) -> list:
         _set_int(cmds, node, "uvTilingMode", tiling_i)
         _delete_attr(cmds, node, ATTR_ORIGINAL_PATH)
         _delete_attr(cmds, node, ATTR_ORIGINAL_TILING)
+        _delete_attr(cmds, node, ATTR_TS_NAME)
         reverted.append(node)
     return reverted
 
@@ -423,6 +523,7 @@ class UVRemapRuntime:
         mayapy_path=None,
         collect_arrays_fn=None,
         worker_script=None,
+        exists_fn=None,
     ):
         if get_enabled is None or not callable(get_enabled):
             raise RuntimeControlError("get_enabled がありません")
@@ -436,6 +537,7 @@ class UVRemapRuntime:
         self.mayapy_path = mayapy_path
         self.collect_arrays_fn = collect_arrays_fn or _default_collect
         self.worker_script = Path(worker_script) if worker_script else WORKER_SCRIPT
+        self.exists_fn = exists_fn if exists_fn is not None else os.path.isfile
         self._seq = 0
         self._jobs = {}
         self._seen_roots = {}
@@ -461,6 +563,38 @@ class UVRemapRuntime:
     def _collect(self, shape_paths, ts_names, uv_set=None):
         arrays, info = self.collect_arrays_fn(shape_paths, ts_names, uv_set)
         return arrays, info
+
+    def _max_inflight_generation(self, ts_name: str) -> int:
+        found = 0
+        for rec in self._jobs.values():
+            if rec.get("ts_name") != ts_name:
+                continue
+            gen = rec.get("generation")
+            if isinstance(gen, int) and not isinstance(gen, bool) and gen > found:
+                found = gen
+        return found
+
+    def _write_latest_generation(self, path: Path, ts_name: str, generation: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, {
+            "schema": SCHEMA,
+            "generation": int(generation),
+            "ts_name": str(ts_name),
+        })
+
+    def _point_inflight_jobs_at_latest(self, ts_name: str, latest_path: Path) -> None:
+        dest = str(latest_path)
+        for rec in self._jobs.values():
+            if rec.get("ts_name") != ts_name:
+                continue
+            job_file = Path(rec["root"]) / "jobs" / rec["job_id"] / "job.json"
+            data = read_json(job_file, None)
+            if not isinstance(data, dict):
+                continue
+            if data.get("latest_generation_path") == dest:
+                continue
+            data["latest_generation_path"] = dest
+            br.write_job(data, job_file)
 
     def _set_status(self, root: Path, ts_name: str, state: str, generation: int, message: str, iso: str):
         br.update_status_entry(
@@ -587,7 +721,8 @@ class UVRemapRuntime:
         )
         uv_hash = br.current_uv_hash(current, ts_name)
         ledger = _load_ledger(root)
-        generation = br.next_generation(ledger, ts_name)
+        generation = max(_ledger_generation(ledger, ts_name), self._max_inflight_generation(ts_name)) + 1
+        latest_path = latest_generation_file(root, ts_name)
         job_id = self._next_id("", iso)
         current_dir = br.save_current(current, root, job_id)
 
@@ -631,7 +766,10 @@ class UVRemapRuntime:
             uv_hash=uv_hash,
             baseline_id=baseline_id,
             lock_timeout_s=opts.get("lock_timeout_s", 60),
+            latest_generation_path=str(latest_path),
         )
+        self._write_latest_generation(latest_path, ts_name, generation)
+        self._point_inflight_jobs_at_latest(ts_name, latest_path)
         job_dir = root / "jobs" / job_id
         job_path = br.write_job(job, job_dir / "job.json")
         log_path = job_dir / "worker.log"
@@ -644,6 +782,7 @@ class UVRemapRuntime:
         }
         if os.name == "nt":
             popen_kwargs["creationflags"] = CREATE_NO_WINDOW
+        self._set_status(root, ts_name, STATE_CONVERTING, generation, "", iso)
         try:
             proc = self.popen_fn(cmd, **popen_kwargs)
         except Exception as exc:
@@ -655,7 +794,6 @@ class UVRemapRuntime:
             )
             return ""
 
-        self._set_status(root, ts_name, STATE_CONVERTING, generation, "", iso)
         self._jobs[job_id] = {
             "job_id": job_id,
             "project_key": project_key,
@@ -716,10 +854,16 @@ class UVRemapRuntime:
                     break
         switched = []
         reverted = []
+        missing = []
         state = STATE_FAILED
         cmds = self._cmds()
+        attempted_switch = False
         if exit_code == 0:
-            switched = switch_ts_file_nodes(cmds, ts_name, files, rec["output_dir"])
+            attempted_switch = True
+            switched = switch_ts_file_nodes(
+                cmds, ts_name, files, rec["output_dir"],
+                exists_fn=self.exists_fn, missing_out=missing,
+            )
             state = STATE_CONVERTED_OK
         elif exit_code == 10:
             state = str((read_json(root / "status.json", {}) or {}).get("ts", {}).get(ts_name, {}).get("state") or STATE_CONVERTING)
@@ -739,7 +883,7 @@ class UVRemapRuntime:
             state = STATE_CONVERTED_OK
         elif status in ("failed", "retry_exhausted"):
             state = STATE_FAILED
-        return {
+        event = {
             "job_id": rec["job_id"],
             "project_key": rec.get("project_key"),
             "ts_name": ts_name,
@@ -750,3 +894,16 @@ class UVRemapRuntime:
             "reverted": reverted,
             "updated": iso,
         }
+        if attempted_switch and missing:
+            event["warning"] = WARN_FILE_MISSING
+            event["missing"] = missing
+        if attempted_switch and not switched:
+            if "warning" not in event:
+                event["warning"] = WARN_NO_FILE_NODES
+            event["message"] = MSG_NO_FILE_NODES
+            event["state"] = STATE_ORIGINAL
+            gen = rec.get("generation", 0)
+            if not isinstance(gen, int) or isinstance(gen, bool):
+                gen = 0
+            self._set_status(root, ts_name, STATE_ORIGINAL, gen, MSG_NO_FILE_NODES, iso)
+        return event
