@@ -147,6 +147,7 @@ def test_warning_message_prefers_status_text_except_missing():
     assert integ.warning_message({"warning": "scene_changed", "message": integ.MSG_SCENE_CHANGED}) == integ.MSG_SCENE_CHANGED
     assert integ.warning_message({"warning": "no_file_nodes_switched", "message": integ.MSG_NO_FILE_NODES}) == integ.MSG_NO_FILE_NODES
     assert integ.warning_message({"warning": "converted_file_missing", "message": "ok"}) == integ.MSG_FILE_MISSING
+    assert integ.warning_message({"warning": integ.WARN_DISABLED, "message": ""}) == integ.MSG_DISABLED_SKIP
     assert integ.warning_message({"state": "ORIGINAL"}) == ""
 
 
@@ -159,9 +160,12 @@ class FakeRuntime:
         self.convert_calls = []
         self.revert_calls = []
         self.record_calls = []
+        self.recover_calls = []
+        self.recover_result = []
         self.poll_events = []
         self.fail_convert = False
         self.fail_record = False
+        self.empty_job = False
 
     def record_baseline(self, project_key, ts_names, shape_paths, **kwargs):
         if self.fail_record:
@@ -181,7 +185,13 @@ class FakeRuntime:
             "timeout_s": kwargs.get("timeout_s"),
             "quality": kwargs.get("quality"),
         })
+        if self.empty_job:
+            return ""
         return "job-{0}".format(ts_name)
+
+    def recover_orphaned(self, project_key):
+        self.recover_calls.append(project_key)
+        return list(self.recover_result)
 
     def revert_to_original(self, ts_name=None):
         self.revert_calls.append(ts_name)
@@ -396,12 +406,104 @@ def test_methods_do_not_raise(tmp_path):
         ctrl.revert(),
         ctrl.poll(),
         ctrl.status_path(),
+        ctrl.recover_orphaned(),
     ]
-    for result in results:
+    for result in results[:-1]:
         assert isinstance(result, dict)
         assert "ok" in result
         assert "message" in result
+    assert results[-1] == []
     assert ctrl.has_baseline() is False
+
+
+def test_convert_now_empty_jobs_returns_not_started(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    ctrl._runtime.empty_job = True
+    result = ctrl.convert_now()
+    assert result["ok"] is False
+    assert result["message"] == integ.MSG_NOT_STARTED
+    assert result["message"] != integ.MSG_NO_BASELINE
+    assert result["job_ids"] == []
+    assert ctrl._runtime.convert_calls
+
+
+def test_controller_recover_orphaned_writes_history(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ctrl._runtime.recover_result = ["Trim"]
+    names = ctrl.recover_orphaned()
+    assert names == ["Trim"]
+    assert ctrl._runtime.recover_calls == [PROJECT]
+    assert ctrl._history == [("uvremap", integ.MSG_INTERRUPTED)]
+
+
+def test_controller_recover_orphaned_no_project(tmp_path):
+    ctrl = _make_controller(tmp_path, project=None)
+    assert ctrl.recover_orphaned() == []
+    assert ctrl._runtime.recover_calls == []
+    assert ctrl._history == []
+
+
+def test_controller_recover_orphaned_swallows(tmp_path):
+    ctrl = _make_controller(tmp_path, raise_project=True)
+    assert ctrl.recover_orphaned() == []
+
+
+def test_start_poll_after_recover_runs_before_timer():
+    order = []
+    messages = []
+
+    class Ctrl:
+        def recover_orphaned(self):
+            order.append("recover")
+            return ["Body"]
+
+    class Timer:
+        def start(self):
+            order.append("start")
+
+    names = integ.start_poll_after_recover(Ctrl(), Timer(), messages.append)
+    assert order == ["recover", "start"]
+    assert names == ["Body"]
+    assert messages == [integ.MSG_INTERRUPTED]
+
+
+def test_start_poll_after_recover_swallows_and_starts():
+    class Ctrl:
+        def recover_orphaned(self):
+            raise RuntimeError("boom")
+
+    class Timer:
+        def __init__(self):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    timer = Timer()
+    assert integ.start_poll_after_recover(Ctrl(), timer) == []
+    assert timer.started is True
+
+
+def test_on_scene_changed_recovers_orphaned(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ctrl._runtime.recover_result = ["Trim"]
+
+    class Label:
+        def __init__(self):
+            self.text = ""
+
+        def setText(self, text):
+            self.text = text
+
+    label = Label()
+    handle = integ.UVRemapAttachment(None, ctrl, message_label=label)
+    handle.on_scene_changed()
+    assert label.text == integ.MSG_INTERRUPTED
+    assert ctrl._runtime.recover_calls == [PROJECT]
+    assert ctrl._history == [("uvremap", integ.MSG_INTERRUPTED)]
 
 
 def test_poll_writes_warning_to_history(tmp_path):
@@ -543,6 +645,7 @@ def test_attach_timer_starts_and_shutdown_stops(qapp, tmp_path):
     try:
         qapp.processEvents()
         assert handle.timer_is_active() is True
+        assert ctrl._runtime.recover_calls == [PROJECT]
         group = win.findChild(QtWidgets.QGroupBox, "uvremap_group")
         assert group is not None
         assert group.isChecked() is False

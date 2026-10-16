@@ -24,6 +24,11 @@ MSG_NO_FINAL = (
 MSG_NO_TARGETS = "対象のテクスチャセットがありません"
 MSG_DISABLED = "UV変換は無効のため、変換は行いません"
 MSG_NO_BASELINE = "基準UVが未記録です。Painterへ送った時点で記録してください"
+MSG_NOT_STARTED = "変換を開始できませんでした。下の状態表示の理由を確認してください"
+MSG_INTERRUPTED = (
+    "前回の変換は途中で中断されました。もう一度『今すぐ変換』を押してください"
+)
+MSG_DISABLED_SKIP = "UV変換が無効のため、変換結果の切り替えを見送りました"
 MSG_BASELINE_EXISTS = (
     "基準は記録済みです。作り直すには、作業フォルダの baseline を消してから"
     "再度「基準UVを記録」を押してください"
@@ -44,11 +49,13 @@ MSG_SCENE_CHANGED = (
 WARN_NO_FILE_NODES = "no_file_nodes_switched"
 WARN_FILE_MISSING = "converted_file_missing"
 WARN_SCENE_CHANGED = "scene_changed"
+WARN_DISABLED = "uvremap_disabled"
 
 WARN_MESSAGES = {
     WARN_NO_FILE_NODES: MSG_NO_FILE_NODES,
     WARN_FILE_MISSING: MSG_FILE_MISSING,
     WARN_SCENE_CHANGED: MSG_SCENE_CHANGED,
+    WARN_DISABLED: MSG_DISABLED_SKIP,
 }
 
 
@@ -424,7 +431,7 @@ class UVRemapController:
                 if job_id:
                     job_ids.append(job_id)
             if not job_ids:
-                return {"ok": False, "message": MSG_NO_BASELINE, "job_ids": []}
+                return {"ok": False, "message": MSG_NOT_STARTED, "job_ids": []}
             message = "変換を開始しました"
             if resolved.get("missing"):
                 message = "{0}。シーンに無いテクスチャセット: {1}".format(
@@ -449,6 +456,20 @@ class UVRemapController:
             }
         except Exception:
             return {"ok": False, "message": "原本への復帰に失敗しました"}
+
+    def recover_orphaned(self):
+        """status.json に残った孤立 CONVERTING を ORIGINAL へ戻す。例外は出さない。"""
+        try:
+            key = self._project_key()
+            if not key:
+                return []
+            names = self.runtime.recover_orphaned(key)
+            recovered = [str(n) for n in list(names or []) if n]
+            if recovered:
+                self._write_history(MSG_INTERRUPTED)
+            return recovered
+        except Exception:
+            return []
 
     def poll(self):
         try:
@@ -547,11 +568,18 @@ class UVRemapAttachment:
 
     def on_scene_changed(self):
         """表示先(project_key と status.json のパス)だけ更新する。原本へは戻さない。"""
+        recovered = []
+        try:
+            recovered = list(self.controller.recover_orphaned() or [])
+        except Exception:
+            recovered = []
         try:
             result = self.controller.status_path()
         except Exception:
             result = {"ok": False, "message": MSG_NO_PROJECT, "path": None}
-        if not result.get("ok"):
+        if recovered:
+            self.set_message(MSG_INTERRUPTED)
+        elif not result.get("ok"):
             self.set_message(result.get("message") or MSG_NO_PROJECT)
         self._refresh_panel()
 
@@ -616,6 +644,22 @@ def _controller_from_window(window, history_fn=None):
         list_texture_sets_fn=list_texture_sets_fn,
         history_fn=history_fn,
     )
+
+
+def start_poll_after_recover(controller, timer, set_message_fn=None):
+    """孤立 CONVERTING を回収してから poll タイマーを開始する。回収の例外は出さない。"""
+    names = []
+    try:
+        names = list(controller.recover_orphaned() or [])
+    except Exception:
+        names = []
+    if names and set_message_fn is not None:
+        try:
+            set_message_fn(MSG_INTERRUPTED)
+        except Exception:
+            pass
+    timer.start()
+    return names
 
 
 def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=None):
@@ -775,5 +819,5 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         handle._refresh_panel()
 
     timer.timeout.connect(on_tick)
-    timer.start()
+    start_poll_after_recover(controller, timer, handle.set_message)
     return handle
