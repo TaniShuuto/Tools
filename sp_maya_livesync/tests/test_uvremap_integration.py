@@ -1447,3 +1447,136 @@ def test_poll_tick_calls_follow_tick_after_poll(tmp_path):
     assert result["message"] == _done("Body")
     assert "refresh" in seen
     assert ctrl._runtime.convert_calls == []
+
+
+def _arm_follow_counts(ctrl, monkeypatch):
+    """``list_texture_sets_fn`` と ``source_signature`` の呼び出し回数を数える。"""
+    counts = {"list": 0, "sig": 0}
+    orig_list = ctrl.list_texture_sets_fn
+
+    def list_fn():
+        counts["list"] += 1
+        return orig_list()
+
+    ctrl.list_texture_sets_fn = list_fn
+    real_sig = integ.source_signature
+
+    def sig_fn(*args, **kwargs):
+        counts["sig"] += 1
+        return real_sig(*args, **kwargs)
+
+    monkeypatch.setattr(integ, "source_signature", sig_fn)
+    return counts
+
+
+def _match_flag_to_record(ctrl, final):
+    """印の mtime を follow.json の記録に揃え、未処理の書き出しが無い状態にする。"""
+    recorded = follow.load_follow(ctrl._work)["flag_mtime_ns"]
+    _touch_ns(final / "_sync_complete.flag", b"done", recorded)
+    return recorded
+
+
+def test_follow_tick_unchanged_flag_scans_once(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    _match_flag_to_record(ctrl, final)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 30 * FOLLOW_NS
+    for step in range(10):
+        result = ctrl.follow_tick(start + step * FOLLOW_NS)
+        assert result["ok"] is True
+        assert result["message"] == ""
+    assert counts == {"list": 1, "sig": 1}
+    assert ctrl._runtime.convert_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+
+def test_follow_tick_flag_update_runs_heavy_then_once_after_settle(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    _match_flag_to_record(ctrl, final)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 30 * FOLLOW_NS
+    ctrl.follow_tick(start)
+    for step in range(1, 4):
+        ctrl.follow_tick(start + step * FOLLOW_NS)
+    assert counts == {"list": 1, "sig": 1}
+    assert ctrl._runtime.convert_calls == []
+
+    _touch_ns(final / "_sync_complete.flag", b"new", 80)
+    changed_at = start + 4 * FOLLOW_NS
+    before = ctrl.follow_tick(changed_at)
+    assert before["ok"] is True
+    assert before["message"] == ""
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.convert_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+    still = ctrl.follow_tick(changed_at + FOLLOW_NS)
+    assert still["message"] == ""
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.convert_calls == []
+
+    settled = ctrl.follow_tick(changed_at + 2 * FOLLOW_NS)
+    assert settled["ok"] is True
+    assert settled["message"] == follow.MSG_PAINTER_START_FMT.format(ts="Body")
+    assert counts == {"list": 3, "sig": 3}
+    assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["auto"]
+    assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 80
+
+    ctrl.follow_tick(changed_at + 3 * FOLLOW_NS)
+    ctrl.follow_tick(changed_at + 4 * FOLLOW_NS)
+    assert counts == {"list": 3, "sig": 3}
+    assert len(ctrl._runtime.convert_calls) == 1
+
+
+def test_follow_tick_toggle_and_killswitch_run_heavy_once(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    _match_flag_to_record(ctrl, final)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 40 * FOLLOW_NS
+    for step in range(3):
+        ctrl.follow_tick(start + step * FOLLOW_NS)
+    assert counts == {"list": 1, "sig": 1}
+
+    same = ctrl.set_auto_follow(True)
+    assert same["ok"] is True
+    ctrl.follow_tick(start + 3 * FOLLOW_NS)
+    assert counts == {"list": 1, "sig": 1}
+
+    off = ctrl.set_auto_follow(False)
+    assert off["ok"] is True
+    assert off["auto_follow"] is False
+    toggled = ctrl.follow_tick(start + 4 * FOLLOW_NS)
+    assert toggled["ok"] is True
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+    ctrl.follow_tick(start + 5 * FOLLOW_NS)
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+
+    disabled = ctrl.set_enabled(False)
+    assert disabled["ok"] is True
+    ctrl.follow_tick(start + 6 * FOLLOW_NS)
+    assert counts == {"list": 2, "sig": 2}
+
+    enabled = ctrl.set_enabled(True)
+    assert enabled["ok"] is True
+    ctrl.follow_tick(start + 7 * FOLLOW_NS)
+    assert counts == {"list": 3, "sig": 3}
+    ctrl.follow_tick(start + 8 * FOLLOW_NS)
+    assert counts == {"list": 3, "sig": 3}
+    assert len(ctrl._runtime.stale_calls) == 2
+
+
+def test_follow_tick_auto_off_stale_only_on_heavy_pass(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, auto_follow=False, flag_mtime_ns=50)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 10 * FOLLOW_NS
+    for step in range(10):
+        result = ctrl.follow_tick(start + step * FOLLOW_NS)
+        assert result["ok"] is True
+        assert result["message"] == ""
+    assert counts == {"list": 1, "sig": 1}
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10

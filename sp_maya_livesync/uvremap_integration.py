@@ -17,6 +17,8 @@ from uvremap_follow import (
     MSG_PAINTER_START_FMT,
     MSG_PEND_FMT,
     MSG_QUEUE_FMT,
+    _flag_is_newer,
+    _settled_ns,
     decide_follow,
     fold_status_label_p2,
     input_stale,
@@ -453,6 +455,14 @@ class UVRemapController:
         self.history_fn = history_fn
         self._follow_last_flag_mtime_ns = None
         self._follow_last_change_seen_ns = None
+        # 重い段階を最後まで済ませた印。落ち着き待ちでは更新しない。
+        self._follow_done_mtime_ns = None
+        self._follow_pending_settle = False
+        self._follow_pending_settle_mtime_ns = None
+        self._follow_pending_settle_s = None
+        self._follow_open_pass_done = False
+        self._follow_force_heavy = False
+        self._follow_enabled_seen = None
         self._auto_input_as_is_emitted = False
         if runtime is None:
             import uvremap_runtime as _rt
@@ -585,10 +595,13 @@ class UVRemapController:
     def set_enabled(self, enabled):
         try:
             enabled = bool(enabled)
+            was_enabled = self._enabled_from_config()
             cfg = self._safe_config()
             if isinstance(cfg, dict):
                 cfg["uvremap_enabled"] = enabled
             self.save_config_fn({"uvremap_enabled": enabled})
+            if enabled and not was_enabled:
+                self._follow_force_heavy = True
             if not enabled:
                 message = self._message_after_disable()
             else:
@@ -601,10 +614,13 @@ class UVRemapController:
         """``uvremap_auto_follow`` を部分マージで保存する。初回オンで既知の制約を 1 度出す。"""
         try:
             enabled = bool(enabled)
+            was_auto = self._auto_follow_from_config()
             cfg = self._safe_config()
             if isinstance(cfg, dict):
                 cfg["uvremap_auto_follow"] = enabled
             self.save_config_fn({"uvremap_auto_follow": enabled})
+            if enabled != was_auto:
+                self._follow_force_heavy = True
             message = ""
             if enabled and not self._auto_input_as_is_emitted:
                 message = MSG_AUTO_INPUT_AS_IS
@@ -776,8 +792,68 @@ class UVRemapController:
             return False
         return enabled is True and auto_follow is True and has_baseline is True
 
+    def _probe_follow_flag_mtime(self):
+        """軽い段階。プロジェクトのキーと Final フォルダから印の mtime だけ取る。
+
+        シーン走査、follow.json、status.json、``source_signature`` はここではしない。
+        印が無い、または場所が取れないときは None。
+        """
+        key = self._project_key()
+        if not key:
+            return None
+        try:
+            final_dir = self._call(self.final_dir_fn, key)
+        except Exception:
+            final_dir = None
+        if not final_dir:
+            return None
+        flag_path = Path(final_dir) / "_sync_complete.flag"
+        try:
+            return int(flag_path.stat().st_mtime_ns)
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def _follow_heavy_due(self, now_ns, flag_mtime_ns):
+        """重い段階が必要なときだけ True。
+
+        窓を開いた直後、追従チェックかキルスイッチ ON の直後、
+        印の mtime が最後に重い段階を済ませたときと違うとき、
+        落ち着き待ちの settle が過ぎたとき。
+        """
+        if not self._follow_open_pass_done or self._follow_force_heavy:
+            return True
+        pending_same = (
+            self._follow_pending_settle
+            and self._follow_pending_settle_mtime_ns == flag_mtime_ns
+        )
+        if self._follow_done_mtime_ns != flag_mtime_ns and not pending_same:
+            return True
+        if pending_same and _settled_ns(
+            now_ns, self._follow_last_change_seen_ns, self._follow_pending_settle_s,
+        ):
+            return True
+        return False
+
+    def _remember_heavy_flag(self, flag_mtime_ns, waiting, settle_s):
+        """重い段階を最後まで済ませた印を覚える。落ち着き待ちでは覚えず、再判定の材料だけ残す。"""
+        self._follow_open_pass_done = True
+        self._follow_force_heavy = False
+        if waiting:
+            self._follow_pending_settle = True
+            self._follow_pending_settle_mtime_ns = flag_mtime_ns
+            self._follow_pending_settle_s = settle_s
+            return
+        self._follow_pending_settle = False
+        self._follow_pending_settle_mtime_ns = None
+        self._follow_pending_settle_s = None
+        self._follow_done_mtime_ns = flag_mtime_ns
+
     def follow_tick(self, now_ns):
-        """Painter の印を見て、自動変換または入力側 STALE を進める。例外は出さない。"""
+        """Painter の印を見て、自動変換または入力側 STALE を進める。例外は出さない。
+
+        毎秒はキルスイッチ、プロジェクトのキー、Final フォルダ、印の mtime だけを見る。
+        入力側 STALE を含む重い判定は、必要なときだけ行う。
+        """
         try:
             return self._follow_tick_impl(now_ns)
         except Exception:
@@ -786,7 +862,19 @@ class UVRemapController:
     def _follow_tick_impl(self, now_ns):
         enabled = bool(self._enabled_from_config())
         if not enabled:
+            self._follow_enabled_seen = False
             return {"ok": True, "message": ""}
+        if self._follow_enabled_seen is False:
+            self._follow_force_heavy = True
+        self._follow_enabled_seen = True
+        flag_mtime_ns = self._probe_follow_flag_mtime()
+        if flag_mtime_ns is None:
+            return {"ok": True, "message": ""}
+        if not self._follow_heavy_due(now_ns, flag_mtime_ns):
+            return {"ok": True, "message": ""}
+        return self._follow_tick_heavy(now_ns, flag_mtime_ns)
+
+    def _follow_tick_heavy(self, now_ns, flag_mtime_ns):
         resolved = self._resolve_context()
         if not isinstance(resolved, dict) or not resolved.get("ok"):
             return {"ok": True, "message": ""}
@@ -794,11 +882,6 @@ class UVRemapController:
         root = resolved.get("root")
         project_key = resolved.get("project_key")
         if not final_dir or not root or not project_key:
-            return {"ok": True, "message": ""}
-        flag_path = Path(final_dir) / "_sync_complete.flag"
-        try:
-            flag_mtime_ns = int(flag_path.stat().st_mtime_ns)
-        except OSError:
             return {"ok": True, "message": ""}
         self._note_flag_mtime(flag_mtime_ns, now_ns)
         settings = self._follow_settings_from_config()
@@ -829,6 +912,7 @@ class UVRemapController:
                             marker(project_key, ts_name, MSG_INPUT_STALE)
                         except Exception:
                             pass
+            self._remember_heavy_flag(flag_mtime_ns, False, None)
             return {"ok": True, "message": ""}
         decision = decide_follow(
             now_ns,
@@ -870,6 +954,10 @@ class UVRemapController:
                 self._update_follow_flag_mtime(root, flag_mtime_ns)
             except Exception:
                 pass
+        waiting = decision.ready is False and _flag_is_newer(flag_mtime_ns, last_flag_ns)
+        self._remember_heavy_flag(
+            flag_mtime_ns, waiting, settings["uvremap_follow_settle_s"],
+        )
         return {"ok": True, "message": messages[-1] if messages else ""}
 
     def revert(self):
