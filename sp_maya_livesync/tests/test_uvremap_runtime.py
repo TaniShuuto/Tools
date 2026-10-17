@@ -171,7 +171,7 @@ def _yes_exists(_path):
 
 def _make_runtime(
     tmp_path, *, enabled=True, cmds=None, popen=None, collect=None, mayapy=None,
-    exists_fn=None, scene_id_fn=None,
+    exists_fn=None, scene_id_fn=None, max_parallel_fn=None, time_fn=None, mtime_fn=None,
 ):
     root = tmp_path / "uvremap" / "proj"
     root.mkdir(parents=True, exist_ok=True)
@@ -201,6 +201,9 @@ def _make_runtime(
         collect_arrays_fn=collect,
         exists_fn=exists_fn,
         scene_id_fn=scene_id_fn,
+        max_parallel_fn=max_parallel_fn,
+        time_fn=time_fn,
+        mtime_fn=mtime_fn,
     )
     runtime._now_box = now_box
     runtime._root_path = root
@@ -1456,3 +1459,426 @@ def test_msg_no_mayapy_does_not_name_a_hidden_setting():
 def test_msg_killswitch_uses_enable_switch_name():
     assert rt.MSG_KILLSWITCH == "UV変換が無効のため原本を表示します"
     assert "キルスイッチ" not in rt.MSG_KILLSWITCH
+
+
+# ---------------------------------------------------------------------------
+# P2-b: 待ち行列・同時実行上限・保留・引き継ぎ
+# ---------------------------------------------------------------------------
+_CH_BC = [{"suffix": "BaseColor", "colorspace": "srgb", "kind": "color"}]
+
+
+def _collect_named(*names):
+    arrays, info = plane_arrays(nx=4, ny=4)
+    arrays = dict(arrays)
+    info = dict(info)
+    names = [str(n) for n in names]
+    info["ts_names"] = names
+    for i in range(1, len(names)):
+        arrays["ts_faces__{0}".format(i)] = np.array(arrays["ts_faces__0"], dtype=np.int32)
+    return _collect_holder(arrays, info)
+
+
+def _counting_collect(inner):
+    state = {"n": 0}
+
+    def collect(shape_paths, ts_names, uv_set=None):
+        state["n"] += 1
+        return inner(shape_paths, ts_names, uv_set)
+
+    collect.state = inner.state
+    collect.calls = state
+    return collect
+
+
+def _write_orphan_job(
+    root, job_id, ts_name, output_dir, *,
+    result=None, corrupt_job=False, scene_id="sceneA.ma", timeout_s=300,
+    missing_job=False, uv_hash="hash-1", generation=1,
+):
+    job_dir = root / "jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job = {
+        "schema": 1,
+        "job_id": job_id,
+        "generation": generation,
+        "ts_name": ts_name,
+        "quality": "final",
+        "baseline_dir": str(root / "baseline" / "dummy"),
+        "current_snapshot_dir": str(job_dir / "current"),
+        "source_dir": str(root / "src"),
+        "output_dir": str(output_dir),
+        "uvremap_root": str(root),
+        "timeout_s": timeout_s,
+        "scene_id": scene_id,
+        "uv_hash": uv_hash,
+        "channels": list(_CH_BC),
+        "udim": False,
+        "copy_retries": 1,
+    }
+    if missing_job:
+        pass
+    elif corrupt_job:
+        (job_dir / "job.json").write_text("{not-json", encoding="utf-8")
+    else:
+        (job_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+    if result is not None:
+        (job_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    _write_status_ts(root, {
+        ts_name: {
+            "state": rt.STATE_CONVERTING,
+            "generation": generation,
+            "updated": FIXED_NOW,
+            "message": "",
+            "job_id": job_id,
+        },
+    })
+    return job
+
+
+def test_max_parallel_clamp_queue_and_promote(tmp_path):
+    box = {"n": 2}
+    popen = CapturedPopen(code=None)
+    inner = _collect_named(TS, "Trim", "Hat")
+    collect = _counting_collect(inner)
+    runtime = _make_runtime(
+        tmp_path, popen=popen, collect=collect, max_parallel_fn=lambda: box["n"],
+    )
+    assert runtime._max_parallel() == 2
+    box["n"] = 1
+    assert runtime._max_parallel() == 1
+    box["n"] = 5
+    assert runtime._max_parallel() == 4
+    box["n"] = "nope"
+    assert runtime._max_parallel() == 2
+    box["n"] = None
+    assert runtime._max_parallel() == 2
+    box["n"] = True
+    assert runtime._max_parallel() == 2
+    box["n"] = 2.5
+    assert runtime._max_parallel() == 2
+    box["n"] = 0
+    assert runtime._max_parallel() == 1
+    box["n"] = 2
+
+    runtime.record_baseline("proj", [TS, "Trim", "Hat"], ["mesh"])
+    after_baseline = collect.calls["n"]
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    job_trim = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    after_two = collect.calls["n"]
+    job_hat = runtime.convert_now(
+        "proj", "Hat", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    assert job_body and job_trim
+    assert job_hat.startswith("queued:")
+    assert len(popen.calls) == 2
+    assert collect.calls["n"] == after_two
+    assert after_two > after_baseline
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"]["Hat"]["state"] == rt.STATE_CONVERTING
+    assert status["ts"]["Hat"]["message"] == rt.MSG_QUEUED
+    assert status["ts"]["Hat"]["queued"] is True
+    assert "generation" in status["ts"]["Hat"]
+    assert "updated" in status["ts"]["Hat"]
+    runtime._jobs[job_body]["proc"]._code = 10
+    runtime.poll()
+    assert len(popen.calls) == 3
+    assert collect.calls["n"] == after_two + 1
+    hat_status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert hat_status["ts"]["Hat"]["state"] == rt.STATE_CONVERTING
+    assert hat_status["ts"]["Hat"].get("queued") is not True
+    running_names = {rec["ts_name"] for rec in runtime._jobs.values()}
+    assert "Hat" in running_names
+    assert "Trim" in running_names
+
+
+def test_manual_origin_starts_before_auto(tmp_path):
+    popen = CapturedPopen(code=None)
+    collect = _collect_named(TS, "Trim", "Hat")
+    runtime = _make_runtime(
+        tmp_path, popen=popen, collect=collect, max_parallel_fn=lambda: 1,
+    )
+    runtime.record_baseline("proj", [TS, "Trim", "Hat"], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    q_auto = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    q_man = runtime.convert_now(
+        "proj", "Hat", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="manual",
+    )
+    assert job_body
+    assert q_auto.startswith("queued:") and q_man.startswith("queued:")
+    assert runtime._queue[0]["ts_name"] == "Hat"
+    assert runtime._queue[0]["origin"] == rt.ORIGIN_MANUAL
+    assert runtime._queue[1]["ts_name"] == "Trim"
+    runtime._jobs[job_body]["proc"]._code = 10
+    runtime.poll()
+    running_names = {rec["ts_name"] for rec in runtime._jobs.values()}
+    assert running_names == {"Hat"}
+    assert runtime._queue[0]["ts_name"] == "Trim"
+
+
+def test_auto_pending_coalesces_manual_still_rejected(tmp_path):
+    popen = CapturedPopen(code=None)
+    collect = _collect_named(TS)
+    runtime = _make_runtime(
+        tmp_path, popen=popen, collect=collect, max_parallel_fn=lambda: 2,
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    job1 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    r1 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    r2 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    r3 = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    rejected = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="manual",
+    )
+    assert job1
+    assert r1.startswith("queued:")
+    assert r1 == r2 == r3
+    assert rejected == ""
+    assert runtime.has_running_job_for_ts(TS) is True
+    assert len(runtime._pending) == 1
+    assert len(popen.calls) == 1
+    runtime._jobs[job1]["proc"]._code = 10
+    runtime.poll()
+    assert len(popen.calls) == 2
+    running_names = {rec["ts_name"] for rec in runtime._jobs.values()}
+    assert running_names == {TS}
+    assert runtime._pending == {}
+    assert runtime._queue == []
+
+
+def test_killswitch_discards_queue_and_pending(tmp_path):
+    flag = {"on": True}
+    popen = CapturedPopen(code=None)
+    collect = _collect_named(TS, "Trim")
+    runtime = _make_runtime(
+        tmp_path, enabled=lambda: flag["on"], popen=popen, collect=collect,
+        max_parallel_fn=lambda: 1,
+    )
+    runtime.record_baseline("proj", [TS, "Trim"], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    queued = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    pending = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    assert job_body and queued.startswith("queued:") and pending.startswith("queued:")
+    assert runtime._queue and runtime._pending
+    flag["on"] = False
+    runtime.poll()
+    assert runtime._queue == []
+    assert runtime._pending == {}
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"]["Trim"]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"]["Trim"]["message"] == rt.MSG_KILLSWITCH
+    assert job_body in runtime._jobs
+
+
+def test_queue_launch_skips_when_scene_changed(tmp_path):
+    scene = {"id": "sceneA.ma"}
+    popen = CapturedPopen(code=None)
+    collect = _collect_named(TS, "Trim")
+    runtime = _make_runtime(
+        tmp_path, popen=popen, collect=collect, max_parallel_fn=lambda: 1,
+        scene_id_fn=lambda: scene["id"],
+    )
+    runtime.record_baseline("proj", [TS, "Trim"], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    queued = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    assert job_body and queued.startswith("queued:")
+    scene["id"] = "sceneB.ma"
+    runtime._jobs[job_body]["proc"]._code = 10
+    runtime.poll()
+    assert len(popen.calls) == 1
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"]["Trim"]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"]["Trim"]["message"] == rt.MSG_SCENE_CHANGED
+    assert runtime._queue == []
+    assert not runtime.has_running_job_for_ts("Trim")
+
+
+def _adopt_runtime(tmp_path, *, enabled=True, scene_id="sceneA.ma", time_now=1000.0, mtime=1000.0):
+    cmds = FakeCmds({
+        "file_body": {"fileTextureName": "/src/Final/Body_BaseColor.png", "uvTilingMode": 0},
+    })
+    clock = {"now": time_now, "mtime": mtime, "scene": scene_id}
+
+    def scene_id_fn():
+        return clock["scene"]
+
+    runtime = _make_runtime(
+        tmp_path, enabled=enabled, cmds=cmds,
+        exists_fn=_yes_exists, scene_id_fn=scene_id_fn,
+        time_fn=lambda: clock["now"],
+        mtime_fn=lambda _p: clock["mtime"],
+    )
+    runtime._clock = clock
+    runtime._cmds_obj = cmds
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    return runtime
+
+
+def _ok_result(job_id, output_dir):
+    return {
+        "schema": 1,
+        "job_id": job_id,
+        "generation": 1,
+        "status": "ok",
+        "exit_code": 0,
+        "ts_name": TS,
+        "files": [{"name": "Body_BaseColor.png", "tile": 1001, "sha1": "a"}],
+        "messages": [],
+    }
+
+
+def test_recover_orphaned_result_ok_switches(tmp_path):
+    runtime = _adopt_runtime(tmp_path, scene_id="sceneA.ma")
+    out = tmp_path / "out"
+    job_id = "adopt-ok"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out,
+        result=_ok_result(job_id, out), scene_id="sceneA.ma",
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == []
+    assert runtime.adopted_ts() == []
+    assert runtime._cmds_obj.nodes["file_body"]["fileTextureName"] == str(out / "Body_BaseColor.png")
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] in (rt.STATE_CONVERTED_OK, rt.STATE_ORIGINAL)
+
+
+def test_recover_orphaned_result_ok_skips_switch_on_other_scene(tmp_path):
+    runtime = _adopt_runtime(tmp_path, scene_id="sceneB.ma")
+    out = tmp_path / "out"
+    original = runtime._cmds_obj.nodes["file_body"]["fileTextureName"]
+    job_id = "adopt-scene"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out,
+        result=_ok_result(job_id, out), scene_id="sceneA.ma",
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == []
+    assert runtime._cmds_obj.nodes["file_body"]["fileTextureName"] == original
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"][TS]["message"] == rt.MSG_SCENE_CHANGED
+
+
+def test_recover_orphaned_waits_then_finishes_on_result(tmp_path):
+    runtime = _adopt_runtime(tmp_path, time_now=1000.0, mtime=1000.0)
+    out = tmp_path / "out"
+    job_id = "adopt-wait"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out, result=None, scene_id="sceneA.ma",
+        timeout_s=300,
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == []
+    assert runtime.adopted_ts() == [TS]
+    assert job_id in runtime._jobs
+    assert runtime._jobs[job_id].get("proc") is None
+    runtime.poll()
+    assert runtime.adopted_ts() == [TS]
+    (runtime._root_path / "jobs" / job_id / "result.json").write_text(
+        json.dumps(_ok_result(job_id, out)), encoding="utf-8",
+    )
+    events = runtime.poll()
+    assert events
+    assert runtime.adopted_ts() == []
+    assert runtime._cmds_obj.nodes["file_body"]["fileTextureName"] == str(out / "Body_BaseColor.png")
+
+
+def test_recover_orphaned_timeout_is_interrupted(tmp_path):
+    runtime = _adopt_runtime(tmp_path, time_now=2000.0, mtime=1000.0)
+    out = tmp_path / "out"
+    job_id = "adopt-timeout"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out, result=None, timeout_s=300,
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == [TS]
+    assert runtime.adopted_ts() == []
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"][TS]["message"] == rt.MSG_INTERRUPTED
+
+
+def test_recover_orphaned_corrupt_job_is_interrupted(tmp_path):
+    runtime = _adopt_runtime(tmp_path)
+    out = tmp_path / "out"
+    job_id = "adopt-corrupt"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out, result=None, corrupt_job=True,
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == [TS]
+    assert runtime.adopted_ts() == []
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"][TS]["message"] == rt.MSG_INTERRUPTED
+
+
+def test_recover_orphaned_killswitch_off_does_not_switch(tmp_path):
+    runtime = _adopt_runtime(tmp_path, enabled=False, scene_id="sceneA.ma")
+    out = tmp_path / "out"
+    original = runtime._cmds_obj.nodes["file_body"]["fileTextureName"]
+    job_id = "adopt-kill"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out,
+        result=_ok_result(job_id, out), scene_id="sceneA.ma",
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == []
+    assert runtime._cmds_obj.nodes["file_body"]["fileTextureName"] == original
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_ORIGINAL
+    assert status["ts"][TS]["message"] == rt.MSG_KILLSWITCH
+
+
+def test_msg_queued_constant():
+    assert rt.MSG_QUEUED == "順番待ち"

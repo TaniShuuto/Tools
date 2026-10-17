@@ -14,11 +14,14 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import uvremap_bridge as br
 import uvremap_core as core
 from uvremap_worker import (
+    FileLock,
+    STATUS_LOCK_TIMEOUT_S,
     is_windows_reserved_name,
     read_json,
     write_json_atomic,
@@ -48,7 +51,20 @@ MSG_INTERRUPTED = (
     "前回の変換は途中で中断されました。もう一度『今すぐ変換』を押してください"
 )
 MSG_ALREADY_RUNNING = "このテクスチャセットは変換中です"
+MSG_QUEUED = "順番待ち"
 MSG_WORKER_CRASH = "ワーカーが異常終了しました(終了コード {0})"
+ORIGIN_MANUAL = "manual"
+ORIGIN_AUTO = "auto"
+MAX_PARALLEL_DEFAULT = 2
+MAX_PARALLEL_MIN = 1
+MAX_PARALLEL_MAX = 4
+_STATUS_TO_EXIT = {
+    "ok": 0,
+    "superseded": 10,
+    "blocked": 11,
+    "failed": 12,
+    "retry_exhausted": 13,
+}
 WARN_NO_FILE_NODES = "no_file_nodes_switched"
 WARN_FILE_MISSING = "converted_file_missing"
 WARN_SCENE_CHANGED = "scene_changed"
@@ -565,6 +581,36 @@ def _should_revert_d3(root: Path, ts_name: str, current_hash) -> bool:
     return last != str(current_hash)
 
 
+def _clamp_max_parallel(value) -> int:
+    """同時実行の上限を 1〜4 に丸める。型が違う値は既定 2。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return MAX_PARALLEL_DEFAULT
+    if value < MAX_PARALLEL_MIN:
+        return MAX_PARALLEL_MIN
+    if value > MAX_PARALLEL_MAX:
+        return MAX_PARALLEL_MAX
+    return value
+
+
+def _exit_code_from_result(result):
+    """result.json から終了コードを取る。読めなければ None(異常終了扱い)。"""
+    if not isinstance(result, dict):
+        return None
+    code = result.get("exit_code")
+    if isinstance(code, int) and not isinstance(code, bool):
+        return int(code)
+    status = str(result.get("status") or "")
+    if status in _STATUS_TO_EXIT:
+        return _STATUS_TO_EXIT[status]
+    return None
+
+
+def _normalize_origin(origin) -> str:
+    if origin == ORIGIN_AUTO:
+        return ORIGIN_AUTO
+    return ORIGIN_MANUAL
+
+
 class UVRemapRuntime:
     """基準UVの記録・ワーカー起動・ファイルノード切替・原本復帰。"""
 
@@ -580,6 +626,9 @@ class UVRemapRuntime:
         worker_script=None,
         exists_fn=None,
         scene_id_fn=None,
+        max_parallel_fn=None,
+        time_fn=None,
+        mtime_fn=None,
     ):
         if get_enabled is None or not callable(get_enabled):
             raise RuntimeControlError("get_enabled がありません")
@@ -595,8 +644,14 @@ class UVRemapRuntime:
         self.worker_script = Path(worker_script) if worker_script else WORKER_SCRIPT
         self.exists_fn = exists_fn if exists_fn is not None else os.path.isfile
         self.scene_id_fn = scene_id_fn if scene_id_fn is not None else _default_scene_id
+        self.max_parallel_fn = max_parallel_fn
+        self.time_fn = time_fn if time_fn is not None else time.time
+        self.mtime_fn = mtime_fn if mtime_fn is not None else os.path.getmtime
         self._seq = 0
+        self._queue_seq = 0
         self._jobs = {}
+        self._queue = []
+        self._pending = {}
         self._seen_roots = {}
 
     def _now(self) -> str:
@@ -669,7 +724,64 @@ class UVRemapRuntime:
             data["latest_generation_path"] = dest
             br.write_job(data, job_file)
 
-    def _set_status(self, root: Path, ts_name: str, state: str, generation: int, message: str, iso: str):
+    def _max_parallel(self) -> int:
+        """起動判定のたびに呼び、1〜4 に丸める。例外・型違いは既定 2。"""
+        fn = self.max_parallel_fn
+        if fn is None or not callable(fn):
+            return MAX_PARALLEL_DEFAULT
+        try:
+            raw = fn()
+        except Exception:
+            return MAX_PARALLEL_DEFAULT
+        return _clamp_max_parallel(raw)
+
+    def _running_worker_count(self) -> int:
+        return len(self._jobs)
+
+    def _next_queue_id(self) -> str:
+        self._queue_seq += 1
+        return "queued:{0}".format(self._queue_seq)
+
+    def _status_generation(self, root: Path, ts_name: str) -> int:
+        entry = self._status_row(root, ts_name)
+        if entry is None:
+            return 0
+        gen = entry.get("generation", 0)
+        if not isinstance(gen, int) or isinstance(gen, bool):
+            return 0
+        return gen
+
+    def _set_status(self, root: Path, ts_name: str, state: str, generation: int, message: str, iso: str, queued=None):
+        dest = Path(root)
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            with FileLock(dest / "status.lock", STATUS_LOCK_TIMEOUT_S, label="status"):
+                data = read_json(dest / "status.json", None)
+                if not isinstance(data, dict):
+                    data = {"schema": SCHEMA, "ts": {}}
+                data.setdefault("schema", SCHEMA)
+                table = data.setdefault("ts", {})
+                if not isinstance(table, dict):
+                    table = data["ts"] = {}
+                prev = table.get(ts_name) if isinstance(table.get(ts_name), dict) else {}
+                row = dict(prev)
+                row.update({
+                    "state": str(state),
+                    "generation": int(generation),
+                    "updated": iso,
+                    "message": "" if message is None else str(message),
+                })
+                if state != STATE_CONVERTING:
+                    row.pop("queued", None)
+                elif queued is True:
+                    row["queued"] = True
+                elif queued is False:
+                    row.pop("queued", None)
+                table[ts_name] = row
+                write_json_atomic(dest / "status.json", data)
+                return
+        except Exception:
+            pass
         br.update_status_entry(
             root, ts_name, state, generation, message, now_fn=lambda: iso,
         )
@@ -727,7 +839,7 @@ class UVRemapRuntime:
         return list(self._jobs)
 
     def has_running_job_for_ts(self, ts_name: str) -> bool:
-        """同じ TS のジョブが ``_jobs`` にあれば True。"""
+        """同じ TS のジョブが ``_jobs`` にあれば True。待ち行列は含めない。"""
         want = str(ts_name) if ts_name is not None else ""
         if not want:
             return False
@@ -736,11 +848,228 @@ class UVRemapRuntime:
                 return True
         return False
 
-    def recover_orphaned(self, project_key) -> list:
-        """status.json の CONVERTING のうち、この runtime の _jobs に無い TS を ORIGINAL へ戻す。
+    def _job_id_for_ts(self, ts_name: str):
+        want = str(ts_name) if ts_name is not None else ""
+        if not want:
+            return None
+        for job_id, rec in self._jobs.items():
+            if rec.get("ts_name") == want:
+                return job_id
+        return None
 
-        窓を閉じてタイマーが止まったあとに残った行を、次の窓で回収する。
-        実行中(_jobs にある)の TS は触らない。例外は外へ出さない。
+    def adopted_ts(self) -> list:
+        """引き継ぎ中(プロセスを持たず result.json を待っている)TS 名の一覧。"""
+        names = []
+        for rec in self._jobs.values():
+            if rec.get("adopted") and rec.get("ts_name"):
+                names.append(str(rec["ts_name"]))
+        return names
+
+    def _queue_item_for_ts(self, ts_name: str):
+        want = str(ts_name)
+        for item in self._queue:
+            if item.get("ts_name") == want:
+                return item
+        return None
+
+    def _origin_rank(self, origin) -> int:
+        return 1 if origin == ORIGIN_MANUAL else 0
+
+    def _insert_queue(self, item: dict) -> None:
+        rank = self._origin_rank(item.get("origin"))
+        idx = len(self._queue)
+        for i, other in enumerate(self._queue):
+            if rank > self._origin_rank(other.get("origin")):
+                idx = i
+                break
+        self._queue.insert(idx, item)
+
+    def _make_request(
+        self, project_key, ts_name, shape_paths, source_dir, output_dir,
+        quality, channels, origin, opts,
+    ) -> dict:
+        paths = list(shape_paths) if shape_paths is not None else []
+        return {
+            "project_key": project_key,
+            "ts_name": str(ts_name),
+            "shape_paths": paths,
+            "source_dir": source_dir,
+            "output_dir": output_dir,
+            "quality": quality,
+            "channels": channels,
+            "origin": origin,
+            "opts": dict(opts or {}),
+            "scene_id": self._scene_id(),
+        }
+
+    def _merge_request(self, dest: dict, src: dict) -> None:
+        upgraded = (
+            src.get("origin") == ORIGIN_MANUAL and dest.get("origin") != ORIGIN_MANUAL
+        )
+        if src.get("origin") == ORIGIN_MANUAL:
+            dest["origin"] = ORIGIN_MANUAL
+        for key in (
+            "project_key", "shape_paths", "source_dir", "output_dir",
+            "quality", "channels", "opts", "scene_id",
+        ):
+            if key in src:
+                dest[key] = src[key]
+        if upgraded and dest in self._queue:
+            self._queue.remove(dest)
+            self._insert_queue(dest)
+
+    def _enqueue(self, request: dict) -> str:
+        existing = self._queue_item_for_ts(request["ts_name"])
+        if existing is not None:
+            self._merge_request(existing, request)
+            return existing["queue_id"]
+        if not request.get("queue_id"):
+            request["queue_id"] = self._next_queue_id()
+        self._insert_queue(request)
+        iso = self._now()
+        root = self._root(request["project_key"])
+        gen = self._status_generation(root, request["ts_name"])
+        self._set_status(
+            root, request["ts_name"], STATE_CONVERTING, gen, MSG_QUEUED, iso,
+            queued=True,
+        )
+        return request["queue_id"]
+
+    def _set_pending(self, request: dict) -> str:
+        ts_name = request["ts_name"]
+        current = self._pending.get(ts_name)
+        if current is not None:
+            self._merge_request(current, request)
+            return current["queue_id"]
+        request = dict(request)
+        request["queue_id"] = self._next_queue_id()
+        self._pending[ts_name] = request
+        return request["queue_id"]
+
+    def _discard_queue_and_pending(self, iso=None) -> None:
+        iso = iso or self._now()
+        items = list(self._queue)
+        self._queue = []
+        self._pending = {}
+        for item in items:
+            try:
+                root = self._root(item["project_key"])
+                name = item["ts_name"]
+                gen = self._status_generation(root, name)
+                self._set_status(root, name, STATE_ORIGINAL, gen, MSG_KILLSWITCH, iso)
+            except Exception:
+                pass
+
+    def _job_age_s(self, job_path: Path):
+        mtime = self.mtime_fn(os.fspath(job_path))
+        now = self.time_fn()
+        return float(now) - float(mtime)
+
+    def _timeout_s_of(self, job) -> float:
+        if not isinstance(job, dict):
+            return 300.0
+        raw = job.get("timeout_s", 300)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return 300.0
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 300.0
+        if value <= 0:
+            return 300.0
+        return value
+
+    def _adopt_rec(self, project_key, root: Path, ts_name: str, job_id: str, job: dict, entry: dict) -> dict:
+        gen = entry.get("generation", 0) if isinstance(entry, dict) else 0
+        if not isinstance(gen, int) or isinstance(gen, bool):
+            gen = 0
+        if isinstance(job, dict):
+            job_gen = job.get("generation")
+            if isinstance(job_gen, int) and not isinstance(job_gen, bool):
+                gen = job_gen
+            output_dir = job.get("output_dir")
+            current_dir = job.get("current_snapshot_dir")
+            uv_hash = job.get("uv_hash")
+            scene_id = job.get("scene_id")
+            timeout_s = self._timeout_s_of(job)
+        else:
+            output_dir = None
+            current_dir = None
+            uv_hash = None
+            scene_id = None
+            timeout_s = 300.0
+        if scene_id is None:
+            scene_id = self._scene_id()
+        if not output_dir:
+            output_dir = root / "output" / "final"
+        if not current_dir:
+            current_dir = root / "jobs" / job_id / "current"
+        return {
+            "job_id": job_id,
+            "project_key": project_key,
+            "ts_name": ts_name,
+            "root": root,
+            "output_dir": Path(output_dir),
+            "current_dir": Path(current_dir),
+            "uv_hash": uv_hash,
+            "generation": gen,
+            "proc": None,
+            "log_fh": None,
+            "log_path": None,
+            "scene_id": "" if scene_id is None else str(scene_id),
+            "adopted": True,
+            "timeout_s": timeout_s,
+        }
+
+    def _interrupt_ts(self, root: Path, ts_name: str, entry: dict, iso: str) -> None:
+        gen = entry.get("generation", 0) if isinstance(entry, dict) else 0
+        if not isinstance(gen, int) or isinstance(gen, bool):
+            gen = 0
+        self._set_status(root, ts_name, STATE_ORIGINAL, gen, MSG_INTERRUPTED, iso)
+
+    def _recover_job(self, project_key, root: Path, ts_name: str, job_id: str, entry: dict, iso: str) -> str:
+        """'finished' / 'adopted' / 'interrupted'。"""
+        job_dir = root / "jobs" / job_id
+        job_path = job_dir / "job.json"
+        result_path = job_dir / "result.json"
+        try:
+            result = read_json(result_path, None)
+        except Exception:
+            result = None
+        try:
+            job = read_json(job_path, None)
+        except Exception:
+            job = None
+        job_ok = isinstance(job, dict)
+        if isinstance(result, dict):
+            rec = self._adopt_rec(project_key, root, ts_name, job_id, job if job_ok else {}, entry)
+            code = _exit_code_from_result(result)
+            if code is None:
+                code = 1
+            self._finish_job(rec, int(code))
+            return "finished"
+        if not job_ok:
+            self._interrupt_ts(root, ts_name, entry, iso)
+            return "interrupted"
+        try:
+            age = self._job_age_s(job_path)
+        except Exception:
+            self._interrupt_ts(root, ts_name, entry, iso)
+            return "interrupted"
+        timeout_s = self._timeout_s_of(job)
+        if age > timeout_s:
+            self._interrupt_ts(root, ts_name, entry, iso)
+            return "interrupted"
+        rec = self._adopt_rec(project_key, root, ts_name, job_id, job, entry)
+        self._jobs[job_id] = rec
+        return "adopted"
+
+    def recover_orphaned(self, project_key) -> list:
+        """status.json の CONVERTING のうち、この runtime の _jobs に無い TS を回収する。
+
+        job_id があり result.json があれば完了処理、timeout 以内なら引き継ぎ、
+        それ以外は ORIGINAL + MSG_INTERRUPTED。戻り値は中断扱いにした TS 名。
+        実行中・待ち行列の TS は触らない。例外は外へ出さない。
         """
         recovered = []
         try:
@@ -758,6 +1087,10 @@ class UVRemapRuntime:
                 name = rec.get("ts_name")
                 if name:
                     inflight.add(str(name))
+            for item in self._queue:
+                name = item.get("ts_name")
+                if name:
+                    inflight.add(str(name))
             iso = self._now()
             for ts_name, entry in list(table.items()):
                 if not isinstance(entry, dict):
@@ -767,10 +1100,15 @@ class UVRemapRuntime:
                 name = str(ts_name)
                 if name in inflight:
                     continue
-                gen = entry.get("generation", 0)
-                if not isinstance(gen, int) or isinstance(gen, bool):
-                    gen = 0
-                self._set_status(root, name, STATE_ORIGINAL, gen, MSG_INTERRUPTED, iso)
+                job_id = entry.get("job_id")
+                if job_id:
+                    action = self._recover_job(
+                        project_key, root, name, str(job_id), entry, iso,
+                    )
+                    if action == "interrupted":
+                        recovered.append(name)
+                    continue
+                self._interrupt_ts(root, name, entry, iso)
                 recovered.append(name)
         except Exception:
             return recovered
@@ -797,6 +1135,8 @@ class UVRemapRuntime:
 
     def revert_to_original(self, ts_name=None) -> list:
         """指定 TS(省略時は全部)の、属性付きファイルノードを原本へ戻す。"""
+        if not self._enabled_now():
+            self._discard_queue_and_pending()
         cmds = self._cmds()
         reverted = revert_ts_file_nodes(cmds, ts_name=ts_name)
         iso = self._now()
@@ -816,12 +1156,19 @@ class UVRemapRuntime:
         output_dir,
         quality="final",
         channels=None,
+        origin="manual",
         **opts,
     ) -> str:
-        """ジョブを作り mayapy ワーカーを非同期起動する。条件を満たさなければジョブは作らない。"""
+        """ジョブを作り mayapy ワーカーを非同期起動する。条件を満たさなければジョブは作らない。
+
+        同時実行の上限に達していれば予約 ID(``queued:<連番>``)を返す。
+        ``origin`` は ``"manual"`` / ``"auto"``。手動は自動より先に並べる。
+        """
         iso = self._now()
         root = self._root(project_key)
+        origin = _normalize_origin(origin)
         if not self.get_enabled():
+            self._discard_queue_and_pending(iso=iso)
             revert_ts_file_nodes(self._cmds(), ts_name=None)
             self._set_status_all(root, STATE_ORIGINAL, MSG_KILLSWITCH, iso, extra_ts=(ts_name,))
             return ""
@@ -829,7 +1176,48 @@ class UVRemapRuntime:
         if not ts_name:
             raise RuntimeControlError("ts_name が空です")
 
+        request = self._make_request(
+            project_key, ts_name, shape_paths, source_dir, output_dir,
+            quality, channels, origin, opts,
+        )
+
         if self.has_running_job_for_ts(ts_name):
+            if origin == ORIGIN_MANUAL:
+                return ""
+            return self._set_pending(request)
+
+        queued = self._queue_item_for_ts(str(ts_name))
+        if queued is not None:
+            self._merge_request(queued, request)
+            self._drain_queue()
+            started = self._job_id_for_ts(ts_name)
+            return started or queued["queue_id"]
+
+        if self._running_worker_count() < self._max_parallel() and not self._queue:
+            return self._launch_job(request)
+
+        qid = self._enqueue(request)
+        self._drain_queue()
+        started = self._job_id_for_ts(ts_name)
+        return started or qid
+
+    def _launch_job(self, request: dict) -> str:
+        """配列取得・スナップショット・ワーカー起動。待ち行列からの起動でも使う。"""
+        project_key = request["project_key"]
+        ts_name = request["ts_name"]
+        shape_paths = request.get("shape_paths")
+        source_dir = request["source_dir"]
+        output_dir = request["output_dir"]
+        quality = request.get("quality") or "final"
+        channels = request.get("channels")
+        opts = dict(request.get("opts") or {})
+        iso = self._now()
+        root = self._root(project_key)
+
+        if not self._enabled_now():
+            self._discard_queue_and_pending(iso=iso)
+            revert_ts_file_nodes(self._cmds(), ts_name=None)
+            self._set_status_all(root, STATE_ORIGINAL, MSG_KILLSWITCH, iso, extra_ts=(ts_name,))
             return ""
 
         baseline_id = _read_active_baseline(root)
@@ -896,6 +1284,9 @@ class UVRemapRuntime:
         else:
             timeout_s = br.choose_timeout_s(out_res, len(ch), n_tiles)
 
+        scene_id = request.get("scene_id")
+        if scene_id is None:
+            scene_id = self._scene_id()
         job = br.build_job(
             job_id=job_id,
             generation=generation,
@@ -918,6 +1309,7 @@ class UVRemapRuntime:
             baseline_id=baseline_id,
             lock_timeout_s=opts["lock_timeout_s"] if "lock_timeout_s" in opts else timeout_s,
             latest_generation_path=str(latest_path),
+            scene_id=str(scene_id),
         )
         self._write_latest_generation(latest_path, ts_name, generation)
         self._point_inflight_jobs_at_latest(ts_name, latest_path)
@@ -933,7 +1325,7 @@ class UVRemapRuntime:
         }
         if os.name == "nt":
             popen_kwargs["creationflags"] = CREATE_NO_WINDOW
-        self._set_status(root, ts_name, STATE_CONVERTING, generation, "", iso)
+        self._set_status(root, ts_name, STATE_CONVERTING, generation, "", iso, queued=False)
         try:
             proc = self.popen_fn(cmd, **popen_kwargs)
         except Exception as exc:
@@ -957,15 +1349,90 @@ class UVRemapRuntime:
             "proc": proc,
             "log_fh": log_fh,
             "log_path": log_path,
-            "scene_id": self._scene_id(),
+            "scene_id": str(scene_id),
         }
         return job_id
 
+    def _drain_queue(self) -> None:
+        """空きがあれば待ち行列の先頭から起動する。起動時にキルスイッチ・シーンを再確認する。"""
+        while self._queue and self._running_worker_count() < self._max_parallel():
+            if not self._enabled_now():
+                self._discard_queue_and_pending()
+                return
+            item = self._queue.pop(0)
+            current_scene = self._scene_id()
+            if current_scene != str(item.get("scene_id") or ""):
+                iso = self._now()
+                try:
+                    root = self._root(item["project_key"])
+                    gen = self._status_generation(root, item["ts_name"])
+                    self._set_status(
+                        root, item["ts_name"], STATE_ORIGINAL, gen, MSG_SCENE_CHANGED, iso,
+                    )
+                except Exception:
+                    pass
+                continue
+            self._launch_job(item)
+
+    def _poll_adopted(self, rec: dict):
+        """引き継ぎジョブ。result.json があれば完了、timeout 超過なら中断。待ちなら None。"""
+        root = rec["root"]
+        job_id = rec["job_id"]
+        result_path = root / "jobs" / job_id / "result.json"
+        try:
+            result = read_json(result_path, None)
+        except Exception:
+            result = None
+        if isinstance(result, dict):
+            code = _exit_code_from_result(result)
+            if code is None:
+                code = 1
+            return self._finish_job(rec, int(code))
+        job_path = root / "jobs" / job_id / "job.json"
+        timeout_s = rec.get("timeout_s", 300)
+        try:
+            timeout_s = float(timeout_s)
+        except (TypeError, ValueError):
+            timeout_s = 300.0
+        try:
+            age = self._job_age_s(job_path)
+        except Exception:
+            age = timeout_s + 1.0
+        if age > timeout_s:
+            iso = self._now()
+            ts_name = rec["ts_name"]
+            gen = rec.get("generation", 0)
+            if not isinstance(gen, int) or isinstance(gen, bool):
+                gen = 0
+            self._set_status(root, ts_name, STATE_ORIGINAL, gen, MSG_INTERRUPTED, iso)
+            return {
+                "job_id": job_id,
+                "project_key": rec.get("project_key"),
+                "ts_name": ts_name,
+                "exit_code": None,
+                "state": STATE_ORIGINAL,
+                "message": MSG_INTERRUPTED,
+                "switched": [],
+                "reverted": [],
+                "updated": iso,
+            }
+        return None
+
     def poll(self) -> list:
-        """実行中ジョブを調べ、終わったものがあれば切替/D-3 を行いイベントを返す。"""
+        """実行中ジョブを調べ、終わったものがあれば切替/D-3 を行いイベントを返す。
+
+        最後に空きがあれば待ち行列の先頭から起動する。
+        """
         events = []
         finished = []
         for job_id, rec in list(self._jobs.items()):
+            if rec.get("adopted"):
+                outcome = self._poll_adopted(rec)
+                if outcome is None:
+                    continue
+                events.append(outcome)
+                finished.append(job_id)
+                continue
             proc = rec.get("proc")
             code = None
             try:
@@ -976,6 +1443,7 @@ class UVRemapRuntime:
                 continue
             events.append(self._finish_job(rec, int(code)))
             finished.append(job_id)
+        pending_to_enqueue = []
         for job_id in finished:
             rec = self._jobs.pop(job_id, None)
             if rec is None:
@@ -986,6 +1454,15 @@ class UVRemapRuntime:
                     fh.close()
                 except Exception:
                     pass
+            ts_name = rec.get("ts_name")
+            if ts_name and ts_name in self._pending:
+                pending_to_enqueue.append(self._pending.pop(ts_name))
+        if not self._enabled_now():
+            self._discard_queue_and_pending()
+        else:
+            for request in pending_to_enqueue:
+                self._enqueue(request)
+            self._drain_queue()
         for key in list(self._seen_roots):
             self.recover_orphaned(key)
         return events
@@ -1118,4 +1595,9 @@ class UVRemapRuntime:
             if not isinstance(gen, int) or isinstance(gen, bool):
                 gen = 0
             self._set_status(root, ts_name, STATE_ORIGINAL, gen, MSG_NO_FILE_NODES, iso)
+        elif state in TERMINAL_STATES:
+            existing = self._status_row(root, ts_name)
+            cur_state = str((existing or {}).get("state") or "")
+            if existing is None or cur_state == STATE_CONVERTING:
+                self._set_status(root, ts_name, state, gen, message, iso)
         return event
