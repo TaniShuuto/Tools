@@ -84,6 +84,7 @@ LABEL_REVERT = "原本に戻す"
 LABEL_REFRESH = "更新"
 LABEL_DISABLED = "UV変換は無効(従来のLive Syncの動作)"
 LABEL_NO_INFO = "情報なし"
+LABEL_NO_PROJECT = "プロジェクト未設定"
 LABEL_OVERALL_PREFIX = "全体"
 
 REFRESH_INTERVAL_MS = 2000
@@ -129,6 +130,28 @@ class StatusView:
 def color_for_state(state: str) -> str:
     """既知の状態は規約色。未知の状態名は取り違え防止のため注意色。"""
     return STATE_COLORS.get(state, COLOR_ATTENTION)
+
+
+def empty_rows_label(status_path) -> str:
+    """行が無いときの空欄。status パスが None ならプロジェクト未設定。"""
+    if status_path is None:
+        return LABEL_NO_PROJECT
+    return LABEL_NO_INFO
+
+
+def overall_status_label(enabled: bool, view: StatusView, status_path) -> tuple[str, str]:
+    """全体ラベルの(文言, 色)。Qt 無しで決められる。
+
+    キルスイッチ ON かつ status パスが None のときだけプロジェクト未設定。
+    パスはあるが読めないときは情報なし。OFF のときは従来の無効表示。
+    """
+    if not enabled:
+        return LABEL_DISABLED, COLOR_MUTED
+    if status_path is None:
+        return f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}", COLOR_MUTED
+    if not view.available:
+        return f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_INFO}", COLOR_MUTED
+    return f"{LABEL_OVERALL_PREFIX}: {view.worst_state}", view.worst_color
 
 
 def _parse_updated(value: object) -> datetime | None:
@@ -412,12 +435,13 @@ def _uvremap_panel_class():
         def refresh(self) -> None:
             enabled = self._read_enabled()
             self._apply_enabled(enabled)
+            status_path = self._read_status_path()
             view = StatusModel(
-                self._read_status_path(),
+                status_path,
                 converting_stale_s=self._converting_stale_s,
                 now_fn=self._now_fn,
             ).load()
-            self._render(view, enabled)
+            self._render(view, enabled, status_path)
 
         def _read_enabled(self) -> bool:
             if self._get_enabled is None:
@@ -459,22 +483,16 @@ def _uvremap_panel_class():
             if self._on_revert is not None:
                 self._on_revert()
 
-        def _render(self, view: StatusView, enabled: bool) -> None:
-            if not enabled:
-                overall_text = LABEL_DISABLED
-                overall_color = COLOR_MUTED
-            elif not view.available:
-                overall_text = f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_INFO}"
-                overall_color = COLOR_MUTED
-            else:
-                overall_text = f"{LABEL_OVERALL_PREFIX}: {view.worst_state}"
-                overall_color = view.worst_color
+        def _render(self, view: StatusView, enabled: bool, status_path=None) -> None:
+            overall_text, overall_color = overall_status_label(
+                enabled, view, status_path,
+            )
             self._overall.setText(overall_text)
             self._apply_state_style(self._overall, overall_color)
 
             self._clear_rows()
             if not view.rows:
-                self._empty_label.setText(LABEL_NO_INFO)
+                self._empty_label.setText(empty_rows_label(status_path))
                 self._empty_label.show()
                 return
             self._empty_label.hide()

@@ -36,9 +36,9 @@ STATE_CONVERTED_OK = "CONVERTED_OK"
 STATE_FAILED = "FAILED"
 STATE_BLOCKED = "BLOCKED"
 MSG_NO_BASELINE = "基準UVが未記録です。Painterへ送った時点で記録してください"
-MSG_KILLSWITCH = "キルスイッチがオフのため原本を表示します"
+MSG_KILLSWITCH = "UV変換が無効のため原本を表示します"
 MSG_NO_MAYAPY = (
-    "mayapy が見つかりません。Maya の mayapy のパスを mayapy_path で指定してください"
+    "変換用の mayapy が見つかりません。Maya のインストール先の bin フォルダに mayapy.exe があるか確認してください"
 )
 MSG_NO_FILE_NODES = "変換は完了しましたが、切り替え対象のファイルノードが見つかりません"
 MSG_SCENE_CHANGED = (
