@@ -25,9 +25,13 @@ from uvremap_panel import (  # noqa: E402
     COLOR_WARN,
     LABEL_DISABLED,
     LABEL_NO_INFO,
+    LABEL_NO_PROJECT,
+    LABEL_OVERALL_PREFIX,
     STALLED_MESSAGE,
     StatusModel,
+    StatusView,
     color_for_state,
+    overall_status_label,
 )
 
 
@@ -203,6 +207,31 @@ class TestStatusModel:
         view = StatusModel(None).load()
         assert view.available is False
         assert view.worst_state == ""
+
+
+def test_overall_label_no_project_when_enabled_and_path_is_none():
+    view = StatusView(rows=(), worst_state="", available=False)
+    text, color = overall_status_label(True, view, None)
+    assert text == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}"
+    assert text == "全体: プロジェクト未設定"
+    assert color == COLOR_MUTED
+
+
+def test_overall_label_missing_file_stays_no_info():
+    view = StatusView(rows=(), worst_state="", available=False)
+    text, color = overall_status_label(True, view, "status.json")
+    assert text == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_INFO}"
+    assert LABEL_NO_PROJECT not in text
+    assert color == COLOR_MUTED
+
+
+def test_overall_label_kill_switch_off_is_unchanged():
+    view = StatusView(rows=(), worst_state="", available=False)
+    text, color = overall_status_label(False, view, None)
+    assert text == LABEL_DISABLED
+    assert color == COLOR_MUTED
+    ready = StatusView(rows=(), worst_state="FAILED", available=True)
+    assert overall_status_label(False, ready, "status.json")[0] == LABEL_DISABLED
 
 
 @pytest.fixture(scope="module")
@@ -427,12 +456,29 @@ class TestUVRemapPanel:
             panel.hide()
             panel.close()
 
-    def test_no_info_label_when_status_missing(self, qapp):
-        panel = _make_panel(qapp, get_enabled=lambda: True, get_status_path=lambda: None)
+    def test_no_info_label_when_status_missing(self, qapp, tmp_path):
+        missing = tmp_path / "missing.json"
+        panel = _make_panel(
+            qapp, get_enabled=lambda: True, get_status_path=lambda: missing,
+        )
         try:
             overall = panel.findChild(type(panel._overall), "overall_status")
             assert LABEL_NO_INFO in overall.text()
+            assert LABEL_NO_PROJECT not in overall.text()
             assert COLOR_MUTED in overall.styleSheet()
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_no_project_label_when_status_path_is_none(self, qapp):
+        panel = _make_panel(qapp, get_enabled=lambda: True, get_status_path=lambda: None)
+        try:
+            overall = panel.findChild(type(panel._overall), "overall_status")
+            assert overall.text() == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}"
+            assert COLOR_MUTED in overall.styleSheet()
+            panel.refresh()
+            qapp.processEvents()
+            assert overall.text() == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}"
         finally:
             panel.hide()
             panel.close()

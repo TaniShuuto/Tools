@@ -167,6 +167,8 @@ class FakeRuntime:
         self.fail_record = False
         self.empty_job = False
         self.already_running = set()
+        self.revert_result = ["file1"]
+        self.revert_raises = False
 
     def record_baseline(self, project_key, ts_names, shape_paths, **kwargs):
         if self.fail_record:
@@ -201,7 +203,9 @@ class FakeRuntime:
 
     def revert_to_original(self, ts_name=None):
         self.revert_calls.append(ts_name)
-        return ["file1"]
+        if self.revert_raises:
+            raise RuntimeError("revert boom")
+        return self.revert_result
 
     def poll(self):
         return list(self.poll_events)
@@ -544,15 +548,217 @@ def test_poll_writes_warning_to_history(tmp_path):
     ctrl = _make_controller(tmp_path)
     ctrl._runtime.poll_events = [
         {"warning": "scene_changed", "message": integ.MSG_SCENE_CHANGED, "state": "ORIGINAL"},
-        {"warning": "converted_file_missing", "message": "ok", "state": "CONVERTED_OK"},
+        {
+            "warning": "converted_file_missing",
+            "message": "ok",
+            "state": "CONVERTED_OK",
+            "ts_name": "Body",
+        },
     ]
     result = ctrl.poll()
     assert result["ok"] is True
     assert result["message"] == integ.MSG_FILE_MISSING
     assert ctrl._history == [
         ("uvremap", integ.MSG_SCENE_CHANGED),
+        ("uvremap", integ.MSG_CONVERT_DONE_FMT.format(ts_name="Body")),
         ("uvremap", integ.MSG_FILE_MISSING),
     ]
+
+
+def _done(ts_name):
+    return integ.MSG_CONVERT_DONE_FMT.format(ts_name=ts_name)
+
+
+def test_completion_message_states():
+    assert integ.completion_message(
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 0},
+    ) == _done("Body")
+    assert integ.completion_message(
+        {"state": "FAILED", "ts_name": "Trim", "message": "プローブ不合格"},
+    ) == integ.MSG_CONVERT_FAILED_FMT.format(ts_name="Trim", message="プローブ不合格")
+    assert integ.completion_message(
+        {"state": "FAILED", "ts_name": "Trim", "message": ""},
+    ) == integ.MSG_CONVERT_FAILED_BARE_FMT.format(ts_name="Trim")
+    assert integ.completion_message(
+        {"state": "FAILED", "ts_name": "Trim"},
+    ) == integ.MSG_CONVERT_FAILED_BARE_FMT.format(ts_name="Trim")
+    assert integ.completion_message(
+        {"state": "BLOCKED", "ts_name": "Face", "message": "基準が違います"},
+    ) == integ.MSG_CONVERT_BLOCKED_FMT.format(ts_name="Face", message="基準が違います")
+    assert integ.completion_message(
+        {"state": "ORIGINAL", "ts_name": "Body", "exit_code": 0},
+    ) == ""
+    assert integ.completion_message(
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 10},
+    ) == ""
+    assert integ.completion_message({"state": "WEIRD", "ts_name": "Body"}) == ""
+    assert integ.completion_message("not-a-dict") == ""
+
+
+def test_poll_completion_and_failure_messages(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ctrl._runtime.poll_events = [
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 0, "message": ""},
+    ]
+    result = ctrl.poll()
+    assert result["message"] == _done("Body")
+    assert ctrl._history == [("uvremap", _done("Body"))]
+
+    ctrl._history.clear()
+    ctrl._runtime.poll_events = [
+        {
+            "state": "CONVERTED_OK",
+            "ts_name": "Body",
+            "exit_code": 0,
+            "warning": "converted_file_missing",
+            "message": "ok",
+        },
+    ]
+    result = ctrl.poll()
+    assert result["message"] == integ.MSG_FILE_MISSING
+    assert ctrl._history == [
+        ("uvremap", _done("Body")),
+        ("uvremap", integ.MSG_FILE_MISSING),
+    ]
+
+    ctrl._history.clear()
+    ctrl._runtime.poll_events = [
+        {"state": "FAILED", "ts_name": "Trim", "exit_code": 12, "message": "ディスク不足"},
+    ]
+    result = ctrl.poll()
+    failed = integ.MSG_CONVERT_FAILED_FMT.format(ts_name="Trim", message="ディスク不足")
+    assert result["message"] == failed
+    assert ctrl._history == [("uvremap", failed)]
+
+    ctrl._history.clear()
+    ctrl._runtime.poll_events = [
+        {"state": "FAILED", "ts_name": "Trim", "exit_code": 12, "message": "  "},
+    ]
+    bare = integ.MSG_CONVERT_FAILED_BARE_FMT.format(ts_name="Trim")
+    assert ctrl.poll()["message"] == bare
+
+    ctrl._history.clear()
+    ctrl._runtime.poll_events = [
+        {"state": "BLOCKED", "ts_name": "Face", "exit_code": 11, "message": "UVがありません"},
+    ]
+    blocked = integ.MSG_CONVERT_BLOCKED_FMT.format(ts_name="Face", message="UVがありません")
+    assert ctrl.poll()["message"] == blocked
+
+    ctrl._history.clear()
+    ctrl._runtime.poll_events = [
+        {"state": "ORIGINAL", "ts_name": "Body", "exit_code": 0},
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 10},
+    ]
+    result = ctrl.poll()
+    assert result["message"] == ""
+    assert ctrl._history == []
+
+    ctrl._history.clear()
+    ctrl._runtime.poll_events = [
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 0},
+        {"state": "FAILED", "ts_name": "Trim", "exit_code": 12, "message": "中断"},
+    ]
+    result = ctrl.poll()
+    last = integ.MSG_CONVERT_FAILED_FMT.format(ts_name="Trim", message="中断")
+    assert result["message"] == last
+    assert ctrl._history == [
+        ("uvremap", _done("Body")),
+        ("uvremap", last),
+    ]
+
+
+def test_poll_tick_sets_message_on_completion(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ctrl._runtime.poll_events = [
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 0},
+    ]
+    seen = []
+
+    class Handle:
+        def set_message(self, text):
+            seen.append(text)
+
+        def _refresh_panel(self):
+            seen.append("refresh")
+
+    result = integ.run_poll_tick(ctrl, Handle())
+    assert result["message"] == _done("Body")
+    assert seen == [_done("Body"), "refresh"]
+
+
+def test_handle_record_request_skips_confirm_when_not_ready(tmp_path):
+    ctrl = _make_controller(tmp_path, project=None)
+    confirms = []
+    informed = []
+
+    def confirm(text):
+        confirms.append(text)
+        return True
+
+    result = integ.handle_record_request(
+        ctrl, confirm, inform_fn=lambda text: informed.append(text),
+    )
+    assert result["ok"] is False
+    assert result["message"] == integ.MSG_NO_PROJECT
+    assert confirms == []
+    assert informed == [integ.MSG_NO_PROJECT]
+    assert ctrl._runtime.record_calls == []
+
+
+def test_handle_record_request_ready_still_confirms(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ready = ctrl.check_record_ready()
+    assert ready == {"ok": True, "message": ""}
+    prompts = []
+
+    def confirm(text):
+        prompts.append(text)
+        return True
+
+    result = integ.handle_record_request(ctrl, confirm)
+    assert result["ok"] is True
+    assert prompts == [integ.MSG_CONFIRM_BASELINE]
+    assert ctrl._runtime.record_calls
+
+
+def test_handle_record_request_without_check_record_ready():
+    class OldController:
+        def has_baseline(self):
+            return False
+
+        def record_baseline(self):
+            self.recorded = True
+            return {"ok": True, "message": "基準UVを記録しました"}
+
+    ctrl = OldController()
+    prompts = []
+    result = integ.handle_record_request(ctrl, lambda text: prompts.append(text) or True)
+    assert prompts == [integ.MSG_CONFIRM_BASELINE]
+    assert result["ok"] is True
+    assert ctrl.recorded is True
+
+
+def test_set_enabled_false_message_follows_revert_count(tmp_path):
+    ctrl = _make_controller(tmp_path, enabled=True)
+
+    ctrl._runtime.revert_result = []
+    empty = ctrl.set_enabled(False)
+    assert empty["ok"] is True
+    assert empty["message"] == integ.MSG_DISABLED_NO_REVERT
+
+    ctrl._runtime.revert_result = ["a", "b"]
+    two = ctrl.set_enabled(False)
+    assert two["message"] == integ.MSG_DISABLED_REVERTED_FMT.format(n=2)
+
+    ctrl._runtime.revert_result = "file1"
+    other = ctrl.set_enabled(False)
+    assert other["message"] == integ.MSG_DISABLED_REVERTED
+
+    ctrl._runtime.revert_raises = True
+    blown = ctrl.set_enabled(False)
+    assert blown["ok"] is True
+    assert blown["enabled"] is False
+    assert blown["message"] == integ.MSG_DISABLED_REVERTED
 
 
 # ---------------------------------------------------------------------------

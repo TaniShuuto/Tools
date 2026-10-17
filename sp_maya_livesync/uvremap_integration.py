@@ -50,6 +50,14 @@ MSG_FOLDER_INSIDE = (
     "書き込みを中止しました"
 )
 MSG_FILE_MISSING = "変換後のファイルが見つからないため、切り替えを見送りました"
+MSG_CONVERT_DONE_FMT = "変換が完了しました({ts_name})"
+MSG_CONVERT_FAILED_FMT = "変換に失敗し、原本に戻しました({ts_name})。{message}"
+MSG_CONVERT_FAILED_BARE_FMT = "変換に失敗し、原本に戻しました({ts_name})。"
+MSG_CONVERT_BLOCKED_FMT = "変換できませんでした({ts_name})。{message}"
+MSG_ENABLED = "UV変換を有効にしました"
+MSG_DISABLED_NO_REVERT = "UV変換を無効にしました"
+MSG_DISABLED_REVERTED = "UV変換を無効にし、原本に戻しました"
+MSG_DISABLED_REVERTED_FMT = "UV変換を無効にし、原本に戻しました({n} 件)"
 
 WARN_MESSAGES = {
     WARN_NO_FILE_NODES: MSG_NO_FILE_NODES,
@@ -190,6 +198,53 @@ def warning_message(event):
     return preset or str(warning)
 
 
+def _event_str(event, key):
+    value = event.get(key)
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def completion_message(event):
+    """警告が無い完了・失敗の文言。出さないときは空文字。
+
+    警告の優先(表示は警告文、履歴は完了文も残す)は poll が決める。
+    この関数は state から完了文だけを作る。
+    """
+    if not isinstance(event, dict):
+        return ""
+    if event.get("exit_code") == 10:
+        return ""
+    state = event.get("state")
+    ts_name = _event_str(event, "ts_name")
+    detail = _event_str(event, "message")
+    try:
+        if state == "CONVERTED_OK":
+            return MSG_CONVERT_DONE_FMT.format(ts_name=ts_name)
+        if state == "FAILED":
+            if detail:
+                return MSG_CONVERT_FAILED_FMT.format(ts_name=ts_name, message=detail)
+            return MSG_CONVERT_FAILED_BARE_FMT.format(ts_name=ts_name)
+        if state == "BLOCKED":
+            return MSG_CONVERT_BLOCKED_FMT.format(ts_name=ts_name, message=detail)
+    except (KeyError, IndexError, ValueError):
+        return ""
+    return ""
+
+
+def disable_message(reverted):
+    """キルスイッチ OFF の文言。戻したノードの件数があるときだけ件数を付ける。"""
+    if isinstance(reverted, (list, tuple)):
+        count = len(reverted)
+        if count <= 0:
+            return MSG_DISABLED_NO_REVERT
+        try:
+            return MSG_DISABLED_REVERTED_FMT.format(n=count)
+        except (KeyError, IndexError, ValueError):
+            return MSG_DISABLED_REVERTED
+    return MSG_DISABLED_REVERTED
+
+
 def lookup_project_entry(by_project, project_key):
     """known_texture_sets_by_project から、当該プロジェクト分だけを取る。"""
     if not project_key or not isinstance(by_project, dict):
@@ -203,19 +258,40 @@ def lookup_project_entry(by_project, project_key):
     return []
 
 
+def _inform(inform_fn, text):
+    if inform_fn is None:
+        return
+    try:
+        inform_fn(text)
+    except Exception:
+        pass
+
+
 def handle_record_request(controller, confirm_fn, inform_fn=None):
-    """画面側: 基準の有無で案内/確認を分け、記録は確認後だけ行う。"""
+    """画面側: 記録できる状態を先に見て、確認は準備ができてから出す。"""
+    checker = getattr(controller, "check_record_ready", None)
+    if callable(checker):
+        try:
+            ready = checker()
+        except Exception:
+            ready = {"ok": False, "message": "基準UVの記録に失敗しました"}
+        if not isinstance(ready, dict) or not ready.get("ok"):
+            text = ""
+            if isinstance(ready, dict):
+                raw = ready.get("message")
+                if isinstance(raw, str) and raw.strip():
+                    text = raw
+            if not text:
+                text = MSG_NO_PROJECT
+            _inform(inform_fn, text)
+            return {"ok": False, "message": text}
     try:
         exists = bool(controller.has_baseline())
     except Exception:
         exists = False
     kind, text = decide_baseline_prompt(exists)
     if kind == "already":
-        if inform_fn is not None:
-            try:
-                inform_fn(text)
-            except Exception:
-                pass
+        _inform(inform_fn, text)
         return {"ok": False, "message": text, "already": True}
     accepted = False
     try:
@@ -378,13 +454,36 @@ class UVRemapController:
                 cfg["uvremap_enabled"] = enabled
             self.save_config_fn({"uvremap_enabled": enabled})
             if not enabled:
-                self.runtime.revert_to_original()
-                message = "UV変換を無効にし、原本に戻しました"
+                message = self._message_after_disable()
             else:
-                message = "UV変換を有効にしました"
+                message = MSG_ENABLED
             return {"ok": True, "message": message, "enabled": enabled}
         except Exception:
             return {"ok": False, "message": "設定の更新に失敗しました"}
+
+    def _message_after_disable(self):
+        try:
+            reverted = self.runtime.revert_to_original()
+        except Exception:
+            return MSG_DISABLED_REVERTED
+        return disable_message(reverted)
+
+    def check_record_ready(self):
+        """記録の前提(_resolve_context の成否)だけを見る。記録はしない。"""
+        try:
+            resolved = self._resolve_context()
+            if not isinstance(resolved, dict) or not resolved.get("ok"):
+                message = ""
+                if isinstance(resolved, dict):
+                    raw = resolved.get("message")
+                    if isinstance(raw, str) and raw.strip():
+                        message = raw
+                if not message:
+                    message = MSG_NO_PROJECT
+                return {"ok": False, "message": message}
+            return {"ok": True, "message": ""}
+        except Exception:
+            return {"ok": False, "message": "基準UVの記録に失敗しました"}
 
     def record_baseline(self):
         try:
@@ -494,17 +593,29 @@ class UVRemapController:
     def poll(self):
         try:
             events = list(self.runtime.poll() or [])
-            warnings = []
+            shown = []
             for event in events:
-                text = warning_message(event)
-                if not text:
-                    continue
-                warnings.append(text)
-                self._write_history(text)
-            message = warnings[-1] if warnings else ""
+                text = self._consume_poll_event(event)
+                if text:
+                    shown.append(text)
+            message = shown[-1] if shown else ""
             return {"ok": True, "message": message, "events": events}
         except Exception:
             return {"ok": False, "message": "状態の確認に失敗しました", "events": []}
+
+    def _consume_poll_event(self, event):
+        """1 イベントを履歴に残し、メッセージ欄に出す文言を返す。空なら表示を変えない。"""
+        warn = warning_message(event)
+        done = completion_message(event)
+        state = event.get("state") if isinstance(event, dict) else None
+        if state == "CONVERTED_OK" and warn and done:
+            self._write_history(done)
+            self._write_history(warn)
+            return warn
+        text = warn or done
+        if text:
+            self._write_history(text)
+        return text or ""
 
     def status_path(self):
         try:
@@ -664,6 +775,32 @@ def _controller_from_window(window, history_fn=None):
         list_texture_sets_fn=list_texture_sets_fn,
         history_fn=history_fn,
     )
+
+
+def run_poll_tick(controller, handle):
+    """on_tick の本体。poll の message が空でなければ set_message する。"""
+    try:
+        result = controller.poll()
+    except Exception:
+        return None
+    text = ""
+    if isinstance(result, dict):
+        raw = result.get("message") or ""
+        text = raw if isinstance(raw, str) else ""
+    if text:
+        setter = getattr(handle, "set_message", None)
+        if callable(setter):
+            try:
+                setter(text)
+            except Exception:
+                pass
+    refresh = getattr(handle, "_refresh_panel", None)
+    if callable(refresh):
+        try:
+            refresh()
+        except Exception:
+            pass
+    return result
 
 
 def start_poll_after_recover(controller, timer, set_message_fn=None):
@@ -829,14 +966,7 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
     attachment_box["handle"] = handle
 
     def on_tick():
-        try:
-            result = controller.poll()
-        except Exception:
-            return
-        text = result.get("message") or ""
-        if text:
-            handle.set_message(text)
-        handle._refresh_panel()
+        run_poll_tick(controller, handle)
 
     timer.timeout.connect(on_tick)
     start_poll_after_recover(controller, timer, handle.set_message)
