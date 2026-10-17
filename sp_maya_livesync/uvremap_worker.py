@@ -508,6 +508,26 @@ def _core_error_kind(exc: BaseException) -> str | None:
     return None
 
 
+def match_source_name(ts_name, suffix, name, os_name=None):
+    """入力ファイル名が ``{ts}_{suffix}[.UDIM].ext`` なら ``(tile または None, ext)`` を返す。
+
+    ``_discover`` と同じ正規表現(UDIM は 4 桁、拡張子は最後のドット以降)。
+    ``os_name`` が ``None`` のときはモジュールの ``_OS_NAME``。
+    ``"nt"`` のときだけ大文字小文字を区別しない。``ext`` はドットを含まない。
+    一致しなければ ``None``。
+    """
+    if os_name is None:
+        os_name = _OS_NAME
+    flags = re.IGNORECASE if os_name == "nt" else 0
+    pat = re.compile(r"^{0}_{1}(?:\.(\d{{4}}))?\.([^.]+)$".format(
+        re.escape(ts_name), re.escape(suffix)), flags)
+    matched = pat.match(name)
+    if not matched:
+        return None
+    tile = int(matched.group(1)) if matched.group(1) else None
+    return (tile, matched.group(2))
+
+
 def _translate_core_error(exc: BaseException) -> "_Abort | None":
     """core の例外を、契約の終了コード(11 停止 / 12 失敗)に対応する ``_Abort`` へ写す。
 
@@ -859,16 +879,14 @@ class _Run:
         except OSError as exc:
             raise JobFailed("原本フォルダを読めません: {0}".format(exc))
         found: dict[str, dict] = {}
-        flags = re.IGNORECASE if _OS_NAME == "nt" else 0
         for ch in j["channels"]:
             suffix = ch["suffix"]
-            pat = re.compile(r"^{0}_{1}(?:\.(\d{{4}}))?\.([^.]+)$".format(
-                re.escape(self.ts_name), re.escape(suffix)), flags)
             cands = []  # (tile|None, ext, name, mtime_ns)
             for n in names:
-                m = pat.match(n)
-                if not m:
+                matched = match_source_name(self.ts_name, suffix, n, _OS_NAME)
+                if matched is None:
                     continue
+                tile, ext = matched
                 p = src / n
                 try:
                     st = os.stat(p)
@@ -876,7 +894,7 @@ class _Run:
                     continue
                 if not os.path.isfile(p):
                     continue
-                cands.append((int(m.group(1)) if m.group(1) else None, m.group(2), n, st.st_mtime_ns))
+                cands.append((tile, ext, n, st.st_mtime_ns))
             if not cands:
                 self.msg("info", "チャンネル {0}: 入力ファイルが無いためスキップ".format(suffix))
                 continue

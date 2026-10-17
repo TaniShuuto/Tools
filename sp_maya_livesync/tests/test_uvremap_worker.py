@@ -1726,3 +1726,31 @@ def test_namespaced_ts_name_still_rejected_as_job_failed(env, core):
     code, res = env.run("j", 1, ts_name="ns:Body")
     assert code == 12
     assert "パス区切り" in messages_text(res)
+
+
+def test_discover_delegates_matching_to_match_source_name(tmp_path, monkeypatch):
+    """照合はモジュール関数へ切り出してあり、_discover はそれを呼ぶ。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Body_BaseColor.1001.png").write_bytes(b"x")
+    (src / "BodyB_BaseColor.png").write_bytes(b"y")
+    run = W._Run(tmp_path / "job.json")
+    run.ts_name = "Body"
+    run.job = {
+        "source_dir": str(src),
+        "channels": [{"suffix": "BaseColor"}, {"suffix": "Normal"}],
+    }
+    calls = []
+    real = W.match_source_name
+
+    def spy(ts_name, suffix, name, os_name=None):
+        calls.append((ts_name, suffix, name, os_name))
+        return real(ts_name, suffix, name, os_name)
+
+    monkeypatch.setattr(W, "match_source_name", spy)
+    found = run._discover()
+    assert calls
+    assert {c[3] for c in calls} == {W._OS_NAME}
+    assert found["BaseColor"]["files"] == {1001: "Body_BaseColor.1001.png"}
+    assert found["BaseColor"]["ext"] == ".png"
+    assert "Normal" not in found
