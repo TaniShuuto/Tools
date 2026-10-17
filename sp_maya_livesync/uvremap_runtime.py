@@ -652,6 +652,7 @@ class UVRemapRuntime:
         self._jobs = {}
         self._queue = []
         self._pending = {}
+        self._recovered_events = []
         self._seen_roots = {}
 
     def _now(self) -> str:
@@ -775,6 +776,8 @@ class UVRemapRuntime:
                     row.pop("queued", None)
                 elif queued is True:
                     row["queued"] = True
+                    row.pop("job_id", None)
+                    row.pop("pid", None)
                 elif queued is False:
                     row.pop("queued", None)
                 table[ts_name] = row
@@ -925,12 +928,26 @@ class UVRemapRuntime:
             return existing["queue_id"]
         if not request.get("queue_id"):
             request["queue_id"] = self._next_queue_id()
-        self._insert_queue(request)
         iso = self._now()
         root = self._root(request["project_key"])
-        gen = self._status_generation(root, request["ts_name"])
+        ts_name = request["ts_name"]
+        entry = self._status_row(root, ts_name)
+        if isinstance(entry, dict):
+            request["prev_state"] = entry.get("state")
+            prev_gen = entry.get("generation", 0)
+            if not isinstance(prev_gen, int) or isinstance(prev_gen, bool):
+                prev_gen = 0
+            request["prev_generation"] = prev_gen
+            prev_msg = entry.get("message")
+            request["prev_message"] = "" if prev_msg is None else str(prev_msg)
+        else:
+            request["prev_state"] = None
+            request["prev_generation"] = 0
+            request["prev_message"] = ""
+        self._insert_queue(request)
+        gen = self._status_generation(root, ts_name)
         self._set_status(
-            root, request["ts_name"], STATE_CONVERTING, gen, MSG_QUEUED, iso,
+            root, ts_name, STATE_CONVERTING, gen, MSG_QUEUED, iso,
             queued=True,
         )
         return request["queue_id"]
@@ -1046,7 +1063,8 @@ class UVRemapRuntime:
             code = _exit_code_from_result(result)
             if code is None:
                 code = 1
-            self._finish_job(rec, int(code))
+            event = self._finish_job(rec, int(code))
+            self._recovered_events.append(event)
             return "finished"
         if not job_ok:
             self._interrupt_ts(root, ts_name, entry, iso)
@@ -1099,6 +1117,10 @@ class UVRemapRuntime:
                     continue
                 name = str(ts_name)
                 if name in inflight:
+                    continue
+                if entry.get("queued") is True:
+                    self._interrupt_ts(root, name, entry, iso)
+                    recovered.append(name)
                     continue
                 job_id = entry.get("job_id")
                 if job_id:
@@ -1353,6 +1375,23 @@ class UVRemapRuntime:
         }
         return job_id
 
+    def _restore_queued_after_scene_change(self, item: dict) -> None:
+        """待ち行列から起動できなかったとき、順番待ち直前の行へ戻す。"""
+        iso = self._now()
+        root = self._root(item["project_key"])
+        prev_state = item.get("prev_state")
+        gen = item.get("prev_generation", 0)
+        if not isinstance(gen, int) or isinstance(gen, bool):
+            gen = 0
+        if not prev_state:
+            self._set_status(
+                root, item["ts_name"], STATE_ORIGINAL, gen, MSG_SCENE_CHANGED, iso,
+            )
+            return
+        self._set_status(
+            root, item["ts_name"], str(prev_state), gen, MSG_SCENE_CHANGED, iso,
+        )
+
     def _drain_queue(self) -> None:
         """空きがあれば待ち行列の先頭から起動する。起動時にキルスイッチ・シーンを再確認する。"""
         while self._queue and self._running_worker_count() < self._max_parallel():
@@ -1362,13 +1401,8 @@ class UVRemapRuntime:
             item = self._queue.pop(0)
             current_scene = self._scene_id()
             if current_scene != str(item.get("scene_id") or ""):
-                iso = self._now()
                 try:
-                    root = self._root(item["project_key"])
-                    gen = self._status_generation(root, item["ts_name"])
-                    self._set_status(
-                        root, item["ts_name"], STATE_ORIGINAL, gen, MSG_SCENE_CHANGED, iso,
-                    )
+                    self._restore_queued_after_scene_change(item)
                 except Exception:
                     pass
                 continue
@@ -1422,8 +1456,10 @@ class UVRemapRuntime:
         """実行中ジョブを調べ、終わったものがあれば切替/D-3 を行いイベントを返す。
 
         最後に空きがあれば待ち行列の先頭から起動する。
+        recover_orphaned が直前に完了させたジョブのイベントを先頭に含める。
         """
-        events = []
+        events = list(self._recovered_events)
+        self._recovered_events = []
         finished = []
         for job_id, rec in list(self._jobs.items()):
             if rec.get("adopted"):

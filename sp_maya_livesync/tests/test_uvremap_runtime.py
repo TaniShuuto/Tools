@@ -1712,6 +1712,23 @@ def test_killswitch_discards_queue_and_pending(tmp_path):
     assert job_body in runtime._jobs
 
 
+def _patch_status_ts(root, ts_name, **fields):
+    path = root / "status.json"
+    if path.is_file():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {"schema": 1, "ts": {}}
+    else:
+        data = {"schema": 1, "ts": {}}
+    table = data.setdefault("ts", {})
+    if not isinstance(table, dict):
+        table = data["ts"] = {}
+    row = dict(table.get(ts_name) or {})
+    row.update(fields)
+    table[ts_name] = row
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
 def test_queue_launch_skips_when_scene_changed(tmp_path):
     scene = {"id": "sceneA.ma"}
     popen = CapturedPopen(code=None)
@@ -1882,3 +1899,117 @@ def test_recover_orphaned_killswitch_off_does_not_switch(tmp_path):
 
 def test_msg_queued_constant():
     assert rt.MSG_QUEUED == "順番待ち"
+
+
+def test_queued_status_drops_previous_job_id(tmp_path):
+    original = "/src/Final/Trim_BaseColor.png"
+    cmds = FakeCmds({
+        "file_trim": {"fileTextureName": original, "uvTilingMode": 0},
+    })
+    popen = CapturedPopen(code=None)
+    collect = _collect_named(TS, "Trim")
+    runtime = _make_runtime(
+        tmp_path, cmds=cmds, popen=popen, collect=collect,
+        max_parallel_fn=lambda: 1, exists_fn=_yes_exists,
+    )
+    runtime.record_baseline("proj", [TS, "Trim"], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    old_id = "prev-ok"
+    result = {
+        "schema": 1,
+        "job_id": old_id,
+        "generation": 3,
+        "status": "ok",
+        "exit_code": 0,
+        "ts_name": "Trim",
+        "files": [{"name": "Trim_BaseColor.png", "tile": 1001, "sha1": "a"}],
+        "messages": [],
+    }
+    _write_orphan_job(
+        runtime._root_path, old_id, "Trim", out,
+        result=result, scene_id="sceneA.ma", generation=3,
+    )
+    _patch_status_ts(
+        runtime._root_path, "Trim",
+        state=rt.STATE_CONVERTED_OK, generation=3,
+        updated=FIXED_NOW, message="", job_id=old_id, pid=4242,
+    )
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    queued = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    assert job_body and queued.startswith("queued:")
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    row = status["ts"]["Trim"]
+    assert row["state"] == rt.STATE_CONVERTING
+    assert row["queued"] is True
+    assert "job_id" not in row
+    assert "pid" not in row
+
+    other = _make_runtime(
+        tmp_path, cmds=cmds, popen=CapturedPopen(code=None), collect=collect,
+        max_parallel_fn=lambda: 1, exists_fn=_yes_exists,
+    )
+    names = other.recover_orphaned("proj")
+    assert "Trim" in names
+    assert cmds.nodes["file_trim"]["fileTextureName"] == original
+    after = json.loads(other.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert after["ts"]["Trim"]["state"] == rt.STATE_ORIGINAL
+    assert after["ts"]["Trim"]["message"] == rt.MSG_INTERRUPTED
+
+
+def test_queue_scene_change_restores_converted_ok(tmp_path):
+    scene = {"id": "sceneA.ma"}
+    popen = CapturedPopen(code=None)
+    collect = _collect_named(TS, "Trim")
+    runtime = _make_runtime(
+        tmp_path, popen=popen, collect=collect, max_parallel_fn=lambda: 1,
+        scene_id_fn=lambda: scene["id"],
+    )
+    runtime.record_baseline("proj", [TS, "Trim"], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    job_body = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    _patch_status_ts(
+        runtime._root_path, "Trim",
+        state=rt.STATE_CONVERTED_OK, generation=4,
+        updated=FIXED_NOW, message="",
+    )
+    queued = runtime.convert_now(
+        "proj", "Trim", ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    assert job_body and queued.startswith("queued:")
+    scene["id"] = "sceneB.ma"
+    runtime._jobs[job_body]["proc"]._code = 10
+    runtime.poll()
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    row = status["ts"]["Trim"]
+    assert row["state"] == rt.STATE_CONVERTED_OK
+    assert row["generation"] == 4
+    assert row["message"] == rt.MSG_SCENE_CHANGED
+    assert "queued" not in row
+
+
+def test_recover_orphaned_finish_event_on_next_poll(tmp_path):
+    runtime = _adopt_runtime(tmp_path, scene_id="sceneA.ma")
+    out = tmp_path / "out"
+    job_id = "adopt-event"
+    _write_orphan_job(
+        runtime._root_path, job_id, TS, out,
+        result=_ok_result(job_id, out), scene_id="sceneA.ma",
+    )
+    names = runtime.recover_orphaned("proj")
+    assert names == []
+    events = runtime.poll()
+    assert len(events) == 1
+    assert events[0]["job_id"] == job_id
+    assert events[0]["ts_name"] == TS
+    assert events[0]["state"] == rt.STATE_CONVERTED_OK
+    assert runtime.poll() == []
