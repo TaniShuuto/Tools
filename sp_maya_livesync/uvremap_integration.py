@@ -50,10 +50,28 @@ MSG_FOLDER_INSIDE = (
     "書き込みを中止しました"
 )
 MSG_FILE_MISSING = "変換後のファイルが見つからないため、切り替えを見送りました"
+MSG_FILE_PARTIAL = (
+    "一部のチャンネルだけ切り替えました。変換後のファイルが無いチャンネルは見送りました"
+)
 MSG_CONVERT_DONE_FMT = "変換が完了しました({ts_name})"
-MSG_CONVERT_FAILED_FMT = "変換に失敗し、原本に戻しました({ts_name})。{message}"
-MSG_CONVERT_FAILED_BARE_FMT = "変換に失敗し、原本に戻しました({ts_name})。"
+MSG_CONVERT_FAILED_FMT = "変換に失敗しました({ts_name})。{message}"
+MSG_CONVERT_FAILED_BARE_FMT = "変換に失敗しました({ts_name})。"
+MSG_CONVERT_FAILED_REVERTED_FMT = "変換に失敗し、原本に戻しました({ts_name})。{message}"
+MSG_CONVERT_FAILED_REVERTED_BARE_FMT = "変換に失敗し、原本に戻しました({ts_name})。"
 MSG_CONVERT_BLOCKED_FMT = "変換できませんでした({ts_name})。{message}"
+MSG_CONVERT_BLOCKED_BARE_FMT = "変換できませんでした({ts_name})。"
+MSG_CONVERT_BLOCKED_REVERTED_FMT = "変換できませんでした。原本に戻しました({ts_name})。{message}"
+MSG_CONVERT_BLOCKED_REVERTED_BARE_FMT = "変換できませんでした。原本に戻しました({ts_name})。"
+MSG_REVERT_NONE = "戻す対象はありませんでした"
+MSG_REVERT_OK = "原本に戻しました"
+MSG_REVERT_OK_FMT = "原本に戻しました({n} 件)"
+MSG_REVERT_FAIL = "原本への復帰に失敗しました"
+MSG_SCENE_SWITCHED = "シーンが切り替わりました"
+LABEL_FOLD_SHOW = "▶ 詳細を表示"
+LABEL_FOLD_HIDE = "▼ 詳細を隠す"
+LABEL_FOLD_OFF = "無効"
+LABEL_FOLD_ON = "有効"
+LABEL_FOLD_BUSY = "変換中"
 MSG_ENABLED = "UV変換を有効にしました"
 MSG_DISABLED_NO_REVERT = "UV変換を無効にしました"
 MSG_DISABLED_REVERTED = "UV変換を無効にし、原本に戻しました"
@@ -182,6 +200,13 @@ def decide_baseline_prompt(has_baseline):
     return "confirm", MSG_CONFIRM_BASELINE
 
 
+def _listed_count(value):
+    """list / tuple なら件数。それ以外は None。"""
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return None
+
+
 def warning_message(event):
     """poll イベントの warning を、status.json と矛盾しない日本語にする。"""
     if not isinstance(event, dict):
@@ -192,6 +217,9 @@ def warning_message(event):
     preset = WARN_MESSAGES.get(str(warning))
     text = event.get("message")
     if warning == WARN_FILE_MISSING:
+        switched = _listed_count(event.get("switched"))
+        if switched is not None and switched > 0:
+            return MSG_FILE_PARTIAL
         return preset or MSG_FILE_MISSING
     if isinstance(text, str) and text.strip():
         return text
@@ -205,11 +233,19 @@ def _event_str(event, key):
     return value.strip()
 
 
+def _with_optional_detail(bare_fmt, detail_fmt, ts_name, detail):
+    """detail が空なら続く文を付けない。句点は 1 文につき 1 つ。"""
+    if detail:
+        return detail_fmt.format(ts_name=ts_name, message=detail)
+    return bare_fmt.format(ts_name=ts_name)
+
+
 def completion_message(event):
     """警告が無い完了・失敗の文言。出さないときは空文字。
 
     警告の優先(表示は警告文、履歴は完了文も残す)は poll が決める。
-    この関数は state から完了文だけを作る。
+    この関数は state から完了文だけを作る。FAILED / BLOCKED は
+    イベントの reverted が 1 件以上のときだけ復帰の文にする。
     """
     if not isinstance(event, dict):
         return ""
@@ -218,31 +254,80 @@ def completion_message(event):
     state = event.get("state")
     ts_name = _event_str(event, "ts_name")
     detail = _event_str(event, "message")
+    reverted = _listed_count(event.get("reverted"))
+    did_revert = reverted is not None and reverted > 0
     try:
         if state == "CONVERTED_OK":
             return MSG_CONVERT_DONE_FMT.format(ts_name=ts_name)
         if state == "FAILED":
-            if detail:
-                return MSG_CONVERT_FAILED_FMT.format(ts_name=ts_name, message=detail)
-            return MSG_CONVERT_FAILED_BARE_FMT.format(ts_name=ts_name)
+            if did_revert:
+                return _with_optional_detail(
+                    MSG_CONVERT_FAILED_REVERTED_BARE_FMT,
+                    MSG_CONVERT_FAILED_REVERTED_FMT,
+                    ts_name,
+                    detail,
+                )
+            return _with_optional_detail(
+                MSG_CONVERT_FAILED_BARE_FMT,
+                MSG_CONVERT_FAILED_FMT,
+                ts_name,
+                detail,
+            )
         if state == "BLOCKED":
-            return MSG_CONVERT_BLOCKED_FMT.format(ts_name=ts_name, message=detail)
+            if did_revert:
+                return _with_optional_detail(
+                    MSG_CONVERT_BLOCKED_REVERTED_BARE_FMT,
+                    MSG_CONVERT_BLOCKED_REVERTED_FMT,
+                    ts_name,
+                    detail,
+                )
+            return _with_optional_detail(
+                MSG_CONVERT_BLOCKED_BARE_FMT,
+                MSG_CONVERT_BLOCKED_FMT,
+                ts_name,
+                detail,
+            )
     except (KeyError, IndexError, ValueError):
         return ""
     return ""
 
 
+def revert_message(reverted):
+    """原本に戻すの文言。戻りが一覧のときだけ件数で分ける。"""
+    count = _listed_count(reverted)
+    if count is None:
+        return MSG_REVERT_OK
+    if count <= 0:
+        return MSG_REVERT_NONE
+    try:
+        return MSG_REVERT_OK_FMT.format(n=count)
+    except (KeyError, IndexError, ValueError):
+        return MSG_REVERT_OK
+
+
 def disable_message(reverted):
     """キルスイッチ OFF の文言。戻したノードの件数があるときだけ件数を付ける。"""
-    if isinstance(reverted, (list, tuple)):
-        count = len(reverted)
-        if count <= 0:
-            return MSG_DISABLED_NO_REVERT
-        try:
-            return MSG_DISABLED_REVERTED_FMT.format(n=count)
-        except (KeyError, IndexError, ValueError):
-            return MSG_DISABLED_REVERTED
-    return MSG_DISABLED_REVERTED
+    count = _listed_count(reverted)
+    if count is None:
+        return MSG_DISABLED_REVERTED
+    if count <= 0:
+        return MSG_DISABLED_NO_REVERT
+    try:
+        return MSG_DISABLED_REVERTED_FMT.format(n=count)
+    except (KeyError, IndexError, ValueError):
+        return MSG_DISABLED_REVERTED
+
+
+def fold_status_label(enabled, converting):
+    """折りたたみボタン横の短い状態。Qt 無し。
+
+    無効が先。有効で変換中のときだけ「変換中」。
+    """
+    if not enabled:
+        return LABEL_FOLD_OFF
+    if converting:
+        return LABEL_FOLD_BUSY
+    return LABEL_FOLD_ON
 
 
 def lookup_project_entry(by_project, project_key):
@@ -568,13 +653,17 @@ class UVRemapController:
     def revert(self):
         try:
             nodes = self.runtime.revert_to_original()
-            return {
-                "ok": True,
-                "message": "原本に戻しました",
-                "reverted": list(nodes or []),
-            }
         except Exception:
-            return {"ok": False, "message": "原本への復帰に失敗しました"}
+            return {"ok": False, "message": MSG_REVERT_FAIL}
+        if isinstance(nodes, (list, tuple)):
+            reverted = list(nodes)
+        else:
+            reverted = []
+        return {
+            "ok": True,
+            "message": revert_message(nodes),
+            "reverted": reverted,
+        }
 
     def recover_orphaned(self):
         """status.json に残った孤立 CONVERTING を ORIGINAL へ戻す。例外は出さない。"""
@@ -649,12 +738,14 @@ def _load_qt():
 class UVRemapAttachment:
     """attach() が返す、shutdown / on_scene_changed を持つオブジェクト。"""
 
-    def __init__(self, timer, controller, panel=None, message_label=None, group=None):
+    def __init__(self, timer, controller, panel=None, message_label=None, group=None,
+                 fold_refresh=None):
         self._timer = timer
         self.controller = controller
         self.panel = panel
         self.message_label = message_label
         self.group = group
+        self._fold_refresh = fold_refresh
 
     def timer_is_active(self):
         timer = self._timer
@@ -676,10 +767,19 @@ class UVRemapAttachment:
 
     def _refresh_panel(self):
         panel = self.panel
-        if panel is None:
+        if panel is not None:
+            try:
+                panel.refresh()
+            except Exception:
+                pass
+        self.refresh_fold_status()
+
+    def refresh_fold_status(self):
+        fn = self._fold_refresh
+        if not callable(fn):
             return
         try:
-            panel.refresh()
+            fn()
         except Exception:
             pass
 
@@ -699,6 +799,7 @@ class UVRemapAttachment:
 
     def on_scene_changed(self):
         """表示先(project_key と status.json のパス)だけ更新する。原本へは戻さない。"""
+        self.set_message(MSG_SCENE_SWITCHED)
         recovered = []
         try:
             recovered = list(self.controller.recover_orphaned() or [])
@@ -819,6 +920,39 @@ def start_poll_after_recover(controller, timer, set_message_fn=None):
     return names
 
 
+def _status_has_converting(status_path):
+    """status.json の行に CONVERTING があれば True。読めなければ False。"""
+    if not status_path:
+        return False
+    try:
+        from uvremap_panel import STATE_CONVERTING, StatusModel
+        view = StatusModel(status_path).load()
+    except Exception:
+        return False
+    rows = getattr(view, "rows", ()) or ()
+    return any(getattr(row, "state", None) == STATE_CONVERTING for row in rows)
+
+
+def _current_fold_status(controller):
+    """有効フラグと status から、折りたたみ横の短い文言を決める。"""
+    enabled = False
+    try:
+        enabled = bool(controller._enabled_from_config())
+    except Exception:
+        enabled = False
+    converting = False
+    if enabled:
+        path = None
+        try:
+            found = controller.status_path()
+            if isinstance(found, dict):
+                path = found.get("path")
+        except Exception:
+            path = None
+        converting = _status_has_converting(path)
+    return fold_status_label(enabled, converting)
+
+
 def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=None):
     """「UV再マップ(試験運用)」欄を parent_layout に足す。"""
     QtCore, QtWidgets = _load_qt()
@@ -827,11 +961,26 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
 
     group = QtWidgets.QGroupBox("UV再マップ(試験運用)")
     group.setObjectName("uvremap_group")
-    group.setCheckable(True)
+    group.setCheckable(False)
     group.setChecked(False)
     group_layout = QtWidgets.QVBoxLayout(group)
     group_layout.setContentsMargins(8, 8, 8, 8)
     group_layout.setSpacing(6)
+
+    fold_row = QtWidgets.QWidget(group)
+    fold_row.setObjectName("uvremap_fold_row")
+    fold_layout = QtWidgets.QHBoxLayout(fold_row)
+    fold_layout.setContentsMargins(0, 0, 0, 0)
+    fold_layout.setSpacing(8)
+    fold_btn = QtWidgets.QPushButton(LABEL_FOLD_SHOW)
+    fold_btn.setObjectName("btn_uvremap_fold")
+    fold_btn.setFlat(True)
+    fold_status = QtWidgets.QLabel(LABEL_FOLD_OFF)
+    fold_status.setObjectName("uvremap_fold_status")
+    fold_layout.addWidget(fold_btn)
+    fold_layout.addWidget(fold_status)
+    fold_layout.addStretch(1)
+    group_layout.addWidget(fold_row)
 
     detail = QtWidgets.QWidget(group)
     detail.setObjectName("uvremap_detail")
@@ -879,35 +1028,31 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
             except Exception:
                 pass
 
-    def on_toggle_enabled(checked):
-        result = controller.set_enabled(bool(checked))
-        show_message(result.get("message") or "")
+    def refresh_open_views():
         panel = attachment_box.get("panel")
         if panel is not None:
             try:
                 panel.refresh()
             except Exception:
                 pass
+        handle = attachment_box.get("handle")
+        if handle is not None:
+            handle.refresh_fold_status()
+
+    def on_toggle_enabled(checked):
+        result = controller.set_enabled(bool(checked))
+        show_message(result.get("message") or "")
+        refresh_open_views()
 
     def on_convert_now():
         result = controller.convert_now()
         show_message(result.get("message") or "")
-        panel = attachment_box.get("panel")
-        if panel is not None:
-            try:
-                panel.refresh()
-            except Exception:
-                pass
+        refresh_open_views()
 
     def on_revert():
         result = controller.revert()
         show_message(result.get("message") or "")
-        panel = attachment_box.get("panel")
-        if panel is not None:
-            try:
-                panel.refresh()
-            except Exception:
-                pass
+        refresh_open_views()
 
     panel = UVRemapPanel(
         parent=detail,
@@ -940,30 +1085,38 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
     def on_record():
         result = handle_record_request(controller, qt_confirm, qt_inform)
         show_message(result.get("message") or "")
-        try:
-            panel.refresh()
-        except Exception:
-            pass
+        refresh_open_views()
 
     record_btn.clicked.connect(on_record)
 
     group_layout.addWidget(detail)
     detail.setVisible(False)
+    fold_open = {"value": False}
 
-    def on_group_toggled(checked):
-        detail.setVisible(bool(checked))
+    def on_fold_clicked():
+        fold_open["value"] = not fold_open["value"]
+        detail.setVisible(fold_open["value"])
+        fold_btn.setText(LABEL_FOLD_HIDE if fold_open["value"] else LABEL_FOLD_SHOW)
 
-    group.toggled.connect(on_group_toggled)
+    fold_btn.clicked.connect(on_fold_clicked)
     parent_layout.addWidget(group)
 
     timer = QtCore.QTimer(group)
     timer.setObjectName("uvremap_poll_timer")
     timer.setInterval(POLL_INTERVAL_MS)
 
+    def refresh_fold_status():
+        try:
+            fold_status.setText(_current_fold_status(controller))
+        except Exception:
+            pass
+
     handle = UVRemapAttachment(
         timer, controller, panel=panel, message_label=message, group=group,
+        fold_refresh=refresh_fold_status,
     )
     attachment_box["handle"] = handle
+    refresh_fold_status()
 
     def on_tick():
         run_poll_tick(controller, handle)

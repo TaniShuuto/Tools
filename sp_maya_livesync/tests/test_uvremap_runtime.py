@@ -1444,3 +1444,15 @@ def test_switch_and_revert_disable_undo_and_restore_on_exception(tmp_path):
         out, exists_fn=_yes_exists,
     )
     assert switched == ["file_body"]
+
+
+def test_msg_no_mayapy_does_not_name_a_hidden_setting():
+    assert rt.MSG_NO_MAYAPY == (
+        "変換用の mayapy が見つかりません。Maya のインストール先の bin フォルダに mayapy.exe があるか確認してください"
+    )
+    assert "mayapy_path" not in rt.MSG_NO_MAYAPY
+
+
+def test_msg_killswitch_uses_enable_switch_name():
+    assert rt.MSG_KILLSWITCH == "UV変換が無効のため原本を表示します"
+    assert "キルスイッチ" not in rt.MSG_KILLSWITCH

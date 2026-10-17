@@ -879,6 +879,179 @@ def test_install_and_uninstall_list_optional_uvremap_files():
 
 
 # ---------------------------------------------------------------------------
+# R2-01〜R2-05
+# ---------------------------------------------------------------------------
+def test_revert_message_follows_listed_count(tmp_path):
+    ctrl = _make_controller(tmp_path)
+
+    ctrl._runtime.revert_result = []
+    empty = ctrl.revert()
+    assert empty["ok"] is True
+    assert empty["message"] == integ.MSG_REVERT_NONE
+    assert empty["message"] == "戻す対象はありませんでした"
+    assert empty["reverted"] == []
+
+    ctrl._runtime.revert_result = ["a", "b"]
+    two = ctrl.revert()
+    assert two["ok"] is True
+    assert two["message"] == integ.MSG_REVERT_OK_FMT.format(n=2)
+    assert two["message"] == "原本に戻しました(2 件)"
+    assert two["reverted"] == ["a", "b"]
+
+    ctrl._runtime.revert_result = "file1"
+    other = ctrl.revert()
+    assert other["ok"] is True
+    assert other["message"] == integ.MSG_REVERT_OK
+    assert other["message"] == "原本に戻しました"
+    assert other["reverted"] == []
+
+    ctrl._runtime.revert_raises = True
+    blown = ctrl.revert()
+    assert blown["ok"] is False
+    assert blown["message"] == integ.MSG_REVERT_FAIL
+    assert blown["message"] == "原本への復帰に失敗しました"
+
+
+def test_revert_message_one_item_uses_count():
+    assert integ.revert_message(["only"]) == "原本に戻しました(1 件)"
+    assert integ.revert_message(()) == integ.MSG_REVERT_NONE
+    assert integ.revert_message(None) == integ.MSG_REVERT_OK
+
+
+def test_warning_message_partial_when_some_channels_switched():
+    base = {"warning": "converted_file_missing", "message": "ok", "state": "CONVERTED_OK"}
+    partial = dict(base, switched=["file_base"])
+    assert integ.warning_message(partial) == integ.MSG_FILE_PARTIAL
+    assert integ.warning_message(partial) == (
+        "一部のチャンネルだけ切り替えました。変換後のファイルが無いチャンネルは見送りました"
+    )
+    assert integ.warning_message(dict(base, switched=[])) == integ.MSG_FILE_MISSING
+    missing_key = dict(base)
+    assert "switched" not in missing_key
+    assert integ.warning_message(missing_key) == integ.MSG_FILE_MISSING
+
+
+def _assert_single_periods(text):
+    assert "。。" not in text
+
+
+def test_completion_message_follows_reverted_list():
+    failed_detail = "プローブ不合格"
+    blocked_detail = "基準が違います"
+    cases = [
+        (
+            {"state": "FAILED", "ts_name": "Trim", "message": failed_detail, "reverted": ["file1"]},
+            "変換に失敗し、原本に戻しました(Trim)。プローブ不合格",
+        ),
+        (
+            {"state": "FAILED", "ts_name": "Trim", "message": "", "reverted": ["file1"]},
+            "変換に失敗し、原本に戻しました(Trim)。",
+        ),
+        (
+            {"state": "FAILED", "ts_name": "Trim", "reverted": ["file1", "file2"]},
+            "変換に失敗し、原本に戻しました(Trim)。",
+        ),
+        (
+            {"state": "FAILED", "ts_name": "Trim", "message": failed_detail, "reverted": []},
+            "変換に失敗しました(Trim)。プローブ不合格",
+        ),
+        (
+            {"state": "FAILED", "ts_name": "Trim", "message": "  ", "reverted": []},
+            "変換に失敗しました(Trim)。",
+        ),
+        (
+            {"state": "FAILED", "ts_name": "Trim", "message": failed_detail},
+            "変換に失敗しました(Trim)。プローブ不合格",
+        ),
+        (
+            {"state": "FAILED", "ts_name": "Trim"},
+            "変換に失敗しました(Trim)。",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face", "message": blocked_detail, "reverted": ["n"]},
+            "変換できませんでした。原本に戻しました(Face)。基準が違います",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face", "message": "", "reverted": ["n"]},
+            "変換できませんでした。原本に戻しました(Face)。",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face", "reverted": ["n"]},
+            "変換できませんでした。原本に戻しました(Face)。",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face", "message": blocked_detail, "reverted": []},
+            "変換できませんでした(Face)。基準が違います",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face", "message": "", "reverted": []},
+            "変換できませんでした(Face)。",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face", "message": blocked_detail},
+            "変換できませんでした(Face)。基準が違います",
+        ),
+        (
+            {"state": "BLOCKED", "ts_name": "Face"},
+            "変換できませんでした(Face)。",
+        ),
+    ]
+    for event, expected in cases:
+        text = integ.completion_message(event)
+        assert text == expected
+        _assert_single_periods(text)
+
+
+def test_fold_status_label_disabled_enabled_converting():
+    assert integ.fold_status_label(False, False) == integ.LABEL_FOLD_OFF
+    assert integ.fold_status_label(False, False) == "無効"
+    assert integ.fold_status_label(False, True) == "無効"
+    assert integ.fold_status_label(True, False) == integ.LABEL_FOLD_ON
+    assert integ.fold_status_label(True, False) == "有効"
+    assert integ.fold_status_label(True, True) == integ.LABEL_FOLD_BUSY
+    assert integ.fold_status_label(True, True) == "変換中"
+
+
+class _RecordingLabel:
+    def __init__(self, text=""):
+        self.text = text
+        self.history = []
+
+    def setText(self, text):
+        self.text = text
+        self.history.append(text)
+
+
+def test_on_scene_changed_replaces_previous_message(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    label = _RecordingLabel("変換を開始しました")
+    handle = integ.UVRemapAttachment(None, ctrl, message_label=label)
+    handle.on_scene_changed()
+    assert label.history == [integ.MSG_SCENE_SWITCHED]
+    assert label.text == "シーンが切り替わりました"
+
+
+def test_on_scene_changed_orphan_overwrites_scene_message(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ctrl._runtime.recover_result = ["Trim"]
+    label = _RecordingLabel("変換が完了しました")
+    handle = integ.UVRemapAttachment(None, ctrl, message_label=label)
+    handle.on_scene_changed()
+    assert label.history[0] == integ.MSG_SCENE_SWITCHED
+    assert label.text == integ.MSG_INTERRUPTED
+    assert ctrl._history == [("uvremap", integ.MSG_INTERRUPTED)]
+
+
+def test_on_scene_changed_status_failure_overwrites_scene_message(tmp_path):
+    ctrl = _make_controller(tmp_path, project=None)
+    label = _RecordingLabel("変換が完了しました")
+    handle = integ.UVRemapAttachment(None, ctrl, message_label=label)
+    handle.on_scene_changed()
+    assert label.history[0] == "シーンが切り替わりました"
+    assert label.text == integ.MSG_NO_PROJECT
+
+
+# ---------------------------------------------------------------------------
 # Qt (任意)
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
@@ -918,3 +1091,80 @@ def test_attach_timer_starts_and_shutdown_stops(qapp, tmp_path):
     finally:
         handle.shutdown()
         win.close()
+
+
+def test_attach_fold_button_toggles_detail_and_is_not_checkable(qapp, tmp_path):
+    import json
+
+    from PySide6 import QtWidgets
+
+    ctrl = _make_controller(tmp_path, enabled=False)
+    win = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(win)
+    handle = integ.attach(
+        win, layout, controller=ctrl,
+        confirm_fn=lambda _t: False, inform_fn=lambda _t: None,
+    )
+    try:
+        win.show()
+        qapp.processEvents()
+        group = win.findChild(QtWidgets.QGroupBox, "uvremap_group")
+        detail = win.findChild(QtWidgets.QWidget, "uvremap_detail")
+        button = win.findChild(QtWidgets.QPushButton, "btn_uvremap_fold")
+        status = win.findChild(QtWidgets.QLabel, "uvremap_fold_status")
+        kill = win.findChild(QtWidgets.QCheckBox, "kill_switch")
+        assert group is not None and group.isCheckable() is False
+        assert button is not None and button.isFlat() is True
+        assert button.text() == integ.LABEL_FOLD_SHOW
+        assert detail is not None and detail.isVisible() is False
+        assert status is not None and status.text() == "無効"
+        assert kill is not None
+
+        button.click()
+        qapp.processEvents()
+        assert detail.isVisible() is True
+        assert button.text() == integ.LABEL_FOLD_HIDE
+        assert group.isCheckable() is False
+
+        button.click()
+        qapp.processEvents()
+        assert detail.isVisible() is False
+        assert button.text() == integ.LABEL_FOLD_SHOW
+    finally:
+        handle.shutdown()
+        win.close()
+
+    busy = _make_controller(tmp_path, enabled=True)
+    payload = {
+        "schema": 1,
+        "ts": {
+            "Body": {
+                "state": "CONVERTING",
+                "generation": 1,
+                "updated": "2026-10-16T10:15:00",
+                "message": "",
+            },
+        },
+    }
+    (busy._work / "status.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+    )
+    win2 = QtWidgets.QWidget()
+    layout2 = QtWidgets.QVBoxLayout(win2)
+    handle2 = integ.attach(
+        win2, layout2, controller=busy,
+        confirm_fn=lambda _t: False, inform_fn=lambda _t: None,
+    )
+    try:
+        win2.show()
+        qapp.processEvents()
+        status2 = win2.findChild(QtWidgets.QLabel, "uvremap_fold_status")
+        assert status2 is not None
+        assert status2.text() == "変換中"
+        (busy._work / "status.json").unlink()
+        handle2.refresh_fold_status()
+        qapp.processEvents()
+        assert status2.text() == "有効"
+    finally:
+        handle2.shutdown()
+        win2.close()

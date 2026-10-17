@@ -132,6 +132,13 @@ def color_for_state(state: str) -> str:
     return STATE_COLORS.get(state, COLOR_ATTENTION)
 
 
+def empty_rows_label(status_path) -> str:
+    """行が無いときの空欄。status パスが None ならプロジェクト未設定。"""
+    if status_path is None:
+        return LABEL_NO_PROJECT
+    return LABEL_NO_INFO
+
+
 def overall_status_label(enabled: bool, view: StatusView, status_path) -> tuple[str, str]:
     """全体ラベルの(文言, 色)。Qt 無しで決められる。
 
@@ -485,7 +492,7 @@ def _uvremap_panel_class():
 
             self._clear_rows()
             if not view.rows:
-                self._empty_label.setText(LABEL_NO_INFO)
+                self._empty_label.setText(empty_rows_label(status_path))
                 self._empty_label.show()
                 return
             self._empty_label.hide()

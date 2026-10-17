@@ -31,6 +31,7 @@ from uvremap_panel import (  # noqa: E402
     StatusModel,
     StatusView,
     color_for_state,
+    empty_rows_label,
     overall_status_label,
 )
 
@@ -223,6 +224,13 @@ def test_overall_label_missing_file_stays_no_info():
     assert text == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_INFO}"
     assert LABEL_NO_PROJECT not in text
     assert color == COLOR_MUTED
+
+
+def test_empty_rows_label_uses_no_project_when_path_is_none():
+    assert empty_rows_label(None) == LABEL_NO_PROJECT
+    assert empty_rows_label(None) == "プロジェクト未設定"
+    assert empty_rows_label("status.json") == LABEL_NO_INFO
+    assert empty_rows_label("") == LABEL_NO_INFO
 
 
 def test_overall_label_kill_switch_off_is_unchanged():
@@ -463,8 +471,10 @@ class TestUVRemapPanel:
         )
         try:
             overall = panel.findChild(type(panel._overall), "overall_status")
+            empty = panel.findChild(type(panel._overall), "ts_empty")
             assert LABEL_NO_INFO in overall.text()
             assert LABEL_NO_PROJECT not in overall.text()
+            assert empty is not None and empty.text() == LABEL_NO_INFO
             assert COLOR_MUTED in overall.styleSheet()
         finally:
             panel.hide()
@@ -474,11 +484,14 @@ class TestUVRemapPanel:
         panel = _make_panel(qapp, get_enabled=lambda: True, get_status_path=lambda: None)
         try:
             overall = panel.findChild(type(panel._overall), "overall_status")
+            empty = panel.findChild(type(panel._overall), "ts_empty")
             assert overall.text() == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}"
+            assert empty is not None and empty.text() == LABEL_NO_PROJECT
             assert COLOR_MUTED in overall.styleSheet()
             panel.refresh()
             qapp.processEvents()
             assert overall.text() == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}"
+            assert empty.text() == LABEL_NO_PROJECT
         finally:
             panel.hide()
             panel.close()
