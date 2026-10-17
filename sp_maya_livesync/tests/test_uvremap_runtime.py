@@ -1789,7 +1789,7 @@ def test_recover_orphaned_result_ok_switches(tmp_path):
     assert runtime.adopted_ts() == []
     assert runtime._cmds_obj.nodes["file_body"]["fileTextureName"] == str(out / "Body_BaseColor.png")
     status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
-    assert status["ts"][TS]["state"] in (rt.STATE_CONVERTED_OK, rt.STATE_ORIGINAL)
+    assert status["ts"][TS]["state"] == rt.STATE_CONVERTED_OK
 
 
 def test_recover_orphaned_result_ok_skips_switch_on_other_scene(tmp_path):
