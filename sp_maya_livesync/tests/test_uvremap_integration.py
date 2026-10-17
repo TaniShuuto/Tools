@@ -771,6 +771,8 @@ ALLOWED_UVREMAP_FUNCS = {
     "LiveSyncWatcher.reload_textures",
     "LiveSyncWatcher.reload_final_textures",
     "LiveSyncWatcher.switch_texture_quality",
+    # D2h: 飛ばした件数の注記。Maya 非依存の純関数。
+    "_uvremap_skip_note",
 }
 
 
@@ -831,7 +833,7 @@ def test_maya_live_sync_has_new_config_keys_and_version():
                         for key in node.value.keys:
                             if isinstance(key, ast.Constant):
                                 keys.append(key.value)
-    assert version == "1.7.0"
+    assert version == "1.7.1"
     assert "uvremap_enabled" in keys
     assert "uvremap_root_dir" in keys
     assert "uvremap_mayapy_path" in keys
