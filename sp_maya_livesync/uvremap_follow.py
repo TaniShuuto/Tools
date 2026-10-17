@@ -86,9 +86,9 @@ _AUTO_OK_STATES = (STATE_CONVERTED_OK, STATE_STALE)
 MSG_PAINTER_START_FMT = "Painter の書き出しを検知しました。変換を開始します({ts})"
 MSG_PEND_FMT = "変換中のため、完了後にもう一度変換します({ts})"
 MSG_QUEUE_FMT = "順番待ちです({ts})"
-MSG_NO_CHANGE = "変更はありません"
-MSG_INPUT_STALE = "Painter の書き出しが新しくなりました。『反映する』を押してください"
-MSG_UV_STALE = "UV が変更されました。『反映する』を押してください"
+MSG_NO_CHANGE = "変更はありません({ts})"
+MSG_INPUT_STALE = "Painter の書き出しが新しくなりました。『変更を反映する』を押してください"
+MSG_UV_STALE = "UV が変更されました。『変更を反映する』を押してください"
 MSG_AUTO_INPUT_AS_IS = "自動変換の入力は Painter の書き出し結果をそのまま使います"
 
 LABEL_FOLD_OFF = "無効"
@@ -315,9 +315,7 @@ def _settled_ns(now_ns, last_change_seen_ns, settle_s) -> bool:
 
 
 def _scene_matches(same_scene, ts_name: str) -> bool:
-    """``same_scene`` は TS 名 → bool、または全 TS 共通の bool。"""
-    if isinstance(same_scene, bool):
-        return same_scene
+    """``same_scene`` は TS 名 → bool の dict だけ(QUESTIONS_phase2.md Q5)。"""
     if isinstance(same_scene, dict):
         return same_scene.get(ts_name) is True
     return False

@@ -7,6 +7,7 @@ Qt は PySide6 があるときだけ QT_QPA_PLATFORM=offscreen で実行する�
 from __future__ import annotations
 
 import ast
+import json
 import os
 import py_compile
 import sys
@@ -21,6 +22,7 @@ for _p in (str(_PKG), str(_TESTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import uvremap_follow as follow  # noqa: E402
 import uvremap_integration as integ  # noqa: E402
 
 
@@ -167,6 +169,9 @@ class FakeRuntime:
         self.fail_record = False
         self.empty_job = False
         self.already_running = set()
+        self.queue_ts = set()
+        self.stale_calls = []
+        self.scene_id = "scene.ma"
         self.revert_result = ["file1"]
         self.revert_raises = False
 
@@ -187,15 +192,23 @@ class FakeRuntime:
             "output_dir": os.path.normpath(str(output_dir)),
             "timeout_s": kwargs.get("timeout_s"),
             "quality": kwargs.get("quality"),
+            "origin": kwargs.get("origin", "manual"),
         })
         if self.empty_job:
             return ""
-        if ts_name in self.already_running:
-            return ""
+        if ts_name in self.already_running or ts_name in self.queue_ts:
+            return "queued:{0}".format(ts_name)
         return "job-{0}".format(ts_name)
 
     def has_running_job_for_ts(self, ts_name):
         return ts_name in self.already_running
+
+    def mark_stale(self, project_key, ts_name, message):
+        self.stale_calls.append((project_key, ts_name, message))
+        return True
+
+    def _scene_id(self):
+        return self.scene_id
 
     def recover_orphaned(self, project_key):
         self.recover_calls.append(project_key)
@@ -411,10 +424,12 @@ def test_methods_do_not_raise(tmp_path):
     )
     results = [
         ctrl.set_enabled(True),
+        ctrl.set_auto_follow(True),
         ctrl.record_baseline(),
         ctrl.convert_now(),
         ctrl.revert(),
         ctrl.poll(),
+        ctrl.follow_tick(0),
         ctrl.status_path(),
         ctrl.recover_orphaned(),
     ]
@@ -426,7 +441,7 @@ def test_methods_do_not_raise(tmp_path):
     assert ctrl.has_baseline() is False
 
 
-def test_convert_now_already_running_returns_japanese_message(tmp_path):
+def test_convert_now_already_running_returns_pending_message(tmp_path):
     ctrl = _make_controller(tmp_path)
     dest = ctrl._work / "baseline" / "bl-old"
     dest.mkdir(parents=True)
@@ -434,24 +449,27 @@ def test_convert_now_already_running_returns_japanese_message(tmp_path):
     ctrl._runtime.already_running = {"Body"}
     result = ctrl.convert_now()
     assert result["ok"] is True
-    assert integ.MSG_ALREADY_RUNNING in result["message"]
+    assert integ.MSG_PEND_FMT.format(ts="Body") in result["message"]
+    assert "変換を開始しました" in result["message"]
     names = [call["ts_name"] for call in ctrl._runtime.convert_calls]
     assert names == ["Body", "Trim"]
-    assert result["job_ids"] == ["job-Trim"]
-    assert result["already_running"] == ["Body"]
+    assert result["job_ids"] == ["queued:Body", "job-Trim"]
+    assert result["pending"] == ["Body"]
 
 
-def test_convert_now_all_already_running_is_not_started_message(tmp_path):
+def test_convert_now_all_reserved_does_not_say_started(tmp_path):
     ctrl = _make_controller(tmp_path)
     dest = ctrl._work / "baseline" / "bl-old"
     dest.mkdir(parents=True)
     (dest / "mesh.npz").write_bytes(b"x")
     ctrl._runtime.already_running = {"Body", "Trim"}
     result = ctrl.convert_now()
-    assert result["ok"] is False
-    assert result["message"] == integ.MSG_ALREADY_RUNNING
+    assert result["ok"] is True
+    assert "変換を開始しました" not in result["message"]
+    assert integ.MSG_PEND_FMT.format(ts="Body") in result["message"]
+    assert integ.MSG_PEND_FMT.format(ts="Trim") in result["message"]
     assert result["message"] != integ.MSG_NOT_STARTED
-    assert result["job_ids"] == []
+    assert result["job_ids"] == ["queued:Body", "queued:Trim"]
 
 
 def test_convert_now_empty_jobs_returns_not_started(tmp_path):
@@ -874,6 +892,7 @@ def test_install_and_uninstall_list_optional_uvremap_files():
         "uvremap_runtime.py",
         "uvremap_panel.py",
         "uvremap_integration.py",
+        "uvremap_follow.py",
     ]
     for name in expected:
         assert name in install_src
@@ -1170,3 +1189,394 @@ def test_attach_fold_button_toggles_detail_and_is_not_checkable(qapp, tmp_path):
     finally:
         handle2.shutdown()
         win2.close()
+
+
+# ---------------------------------------------------------------------------
+# P2-c1: 設定・follow_tick・折りたたみ・予約 ID
+# ---------------------------------------------------------------------------
+FOLLOW_NS = 1_000_000_000
+
+
+def test_follow_settings_defaults_types_and_partial_save(tmp_path):
+    ctrl = _make_controller(tmp_path, cfg={
+        "uvremap_auto_follow": "yes",
+        "uvremap_max_parallel": 99,
+        "uvremap_follow_settle_s": 0.1,
+    })
+    settings = ctrl._follow_settings_from_config()
+    assert settings["uvremap_auto_follow"] is False
+    assert settings["uvremap_auto_follow_uv"] is False
+    assert settings["uvremap_max_parallel"] == 4
+    assert settings["uvremap_follow_settle_s"] == 0.5
+    assert settings["uvremap_uv_settle_s"] == 3.0
+    assert settings["uvremap_uv_poll_s"] == 2.0
+    assert ctrl._auto_follow_from_config() is False
+
+    first = ctrl.set_auto_follow(True)
+    assert first["ok"] is True
+    assert first["auto_follow"] is True
+    assert first["message"] == follow.MSG_AUTO_INPUT_AS_IS
+    assert ctrl._saved[-1] == {"uvremap_auto_follow": True}
+    assert ctrl._config["uvremap_auto_follow"] is True
+    assert ctrl._history == [("uvremap", follow.MSG_AUTO_INPUT_AS_IS)]
+
+    second = ctrl.set_auto_follow(True)
+    assert second["ok"] is True
+    assert second["message"] == ""
+    assert ctrl._history == [("uvremap", follow.MSG_AUTO_INPUT_AS_IS)]
+
+    off = ctrl.set_auto_follow(False)
+    assert off["ok"] is True
+    assert off["auto_follow"] is False
+    assert ctrl._saved[-1] == {"uvremap_auto_follow": False}
+
+
+def test_convert_launch_messages_reservation_only():
+    assert integ.convert_launch_messages(["job-1"], [], []) == "変換を開始しました"
+    assert integ.convert_launch_messages([], ["Body"], []) == follow.MSG_PEND_FMT.format(ts="Body")
+    assert integ.convert_launch_messages([], [], ["Trim"]) == follow.MSG_QUEUE_FMT.format(ts="Trim")
+    mixed = integ.convert_launch_messages(["job-1"], ["Body"], ["Trim"])
+    assert mixed.startswith("変換を開始しました")
+    assert follow.MSG_PEND_FMT.format(ts="Body") in mixed
+    assert follow.MSG_QUEUE_FMT.format(ts="Trim") in mixed
+    assert integ.is_reservation_id("queued:1") is True
+    assert integ.is_reservation_id("20261018-0001") is False
+
+
+def test_convert_now_queued_id_uses_queue_message(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    ctrl._runtime.queue_ts = {"Body", "Trim"}
+    result = ctrl.convert_now()
+    assert result["ok"] is True
+    assert "変換を開始しました" not in result["message"]
+    assert follow.MSG_QUEUE_FMT.format(ts="Body") in result["message"]
+    assert follow.MSG_QUEUE_FMT.format(ts="Trim") in result["message"]
+    assert result["queued"] == ["Body", "Trim"]
+
+
+def _touch_ns(path: Path, data: bytes, mtime_ns: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    os.utime(path, ns=(mtime_ns, mtime_ns))
+
+
+def _write_status_rows(root: Path, states: dict) -> None:
+    table = {}
+    for name, state in states.items():
+        table[name] = {
+            "state": state,
+            "generation": 1,
+            "updated": "2026-03-04T05:06:07",
+            "message": "",
+        }
+    (root / "status.json").write_text(
+        json.dumps({"schema": 1, "ts": table}, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _prepare_follow_ctrl(
+    tmp_path, *, enabled=True, auto_follow=True, states=None,
+    recorded_sig=None, scene_id="scene.ma", runtime_scene="scene.ma",
+    flag_mtime_ns=100, source_mtime_ns=200,
+):
+    ctrl = _make_controller(
+        tmp_path, enabled=enabled, cfg={"uvremap_auto_follow": auto_follow},
+    )
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    resolved = ctrl._resolve_context()
+    final = Path(resolved["final_dir"])
+    final.mkdir(parents=True, exist_ok=True)
+    if states is None:
+        states = {"Body": "CONVERTED_OK"}
+    _write_status_rows(ctrl._work, states)
+    _touch_ns(final / "Body_BaseColor.png", b"abc", source_mtime_ns)
+    recorded = recorded_sig
+    if recorded is None:
+        recorded = {"Body_BaseColor.png": [3, source_mtime_ns - 1]}
+    follow.save_follow(ctrl._work, {
+        "schema": 1,
+        "flag_mtime_ns": 10,
+        "ts": {
+            "Body": {
+                "source_sig": recorded,
+                "last_job_id": "old-job",
+                "scene_id": scene_id,
+            },
+        },
+    })
+    _touch_ns(final / "_sync_complete.flag", b"done", flag_mtime_ns)
+    ctrl._runtime.scene_id = runtime_scene
+    return ctrl, final
+
+
+def _settled_tick(ctrl, now_ns, flag_mtime_ns):
+    ctrl._follow_last_flag_mtime_ns = flag_mtime_ns
+    ctrl._follow_last_change_seen_ns = now_ns - 3 * FOLLOW_NS
+    return ctrl.follow_tick(now_ns)
+
+
+def test_follow_tick_no_flag_does_nothing(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(tmp_path)
+    (_final / "_sync_complete.flag").unlink()
+    result = ctrl.follow_tick(10 * FOLLOW_NS)
+    assert result["ok"] is True
+    assert result["message"] == ""
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == []
+    loaded = follow.load_follow(ctrl._work)
+    assert loaded["flag_mtime_ns"] == 10
+
+
+def test_follow_tick_before_settle_does_nothing(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    result = ctrl.follow_tick(10 * FOLLOW_NS)
+    assert result["ok"] is True
+    assert ctrl._runtime.convert_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+
+def test_follow_tick_settled_converted_ok_starts_auto(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    result = _settled_tick(ctrl, 10 * FOLLOW_NS, 50)
+    assert result["ok"] is True
+    assert result["message"] == follow.MSG_PAINTER_START_FMT.format(ts="Body")
+    assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["auto"]
+    assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+    assert ctrl._history == [("uvremap", follow.MSG_PAINTER_START_FMT.format(ts="Body"))]
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 50
+
+
+def test_follow_tick_original_and_failed_do_not_convert(tmp_path):
+    for state in ("ORIGINAL", "FAILED"):
+        ctrl, _final = _prepare_follow_ctrl(tmp_path, states={"Body": state}, flag_mtime_ns=50)
+        result = _settled_tick(ctrl, 10 * FOLLOW_NS, 50)
+        assert result["ok"] is True
+        assert ctrl._runtime.convert_calls == []
+        assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 50
+
+
+def test_follow_tick_converting_is_pending(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(tmp_path, states={"Body": "CONVERTING"}, flag_mtime_ns=50)
+    ctrl._runtime.already_running = {"Body"}
+    result = _settled_tick(ctrl, 10 * FOLLOW_NS, 50)
+    assert result["ok"] is True
+    assert result["message"] == follow.MSG_PEND_FMT.format(ts="Body")
+    assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["auto"]
+    assert ctrl._history == [("uvremap", follow.MSG_PEND_FMT.format(ts="Body"))]
+
+
+def test_follow_tick_other_scene_does_not_convert(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(
+        tmp_path, flag_mtime_ns=50, scene_id="scene.ma", runtime_scene="other.ma",
+    )
+    result = _settled_tick(ctrl, 10 * FOLLOW_NS, 50)
+    assert result["ok"] is True
+    assert ctrl._runtime.convert_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 50
+
+
+def test_follow_tick_auto_off_marks_stale(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(tmp_path, auto_follow=False, flag_mtime_ns=50)
+    result = ctrl.follow_tick(10 * FOLLOW_NS)
+    assert result["ok"] is True
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+
+def test_follow_tick_killswitch_off_does_nothing(tmp_path):
+    ctrl, _final = _prepare_follow_ctrl(tmp_path, enabled=False, flag_mtime_ns=50)
+    result = ctrl.follow_tick(10 * FOLLOW_NS)
+    assert result["ok"] is True
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+
+def test_follow_tick_q4_flag_mtime_rules(tmp_path):
+    ready = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)[0]
+    _settled_tick(ready, 10 * FOLLOW_NS, 50)
+    assert follow.load_follow(ready._work)["flag_mtime_ns"] == 50
+
+    settling = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=77)[0]
+    settling.follow_tick(10 * FOLLOW_NS)
+    assert follow.load_follow(settling._work)["flag_mtime_ns"] == 10
+
+    no_base = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=88)[0]
+    import shutil
+    shutil.rmtree(no_base._work / "baseline")
+    _settled_tick(no_base, 10 * FOLLOW_NS, 88)
+    assert follow.load_follow(no_base._work)["flag_mtime_ns"] == 10
+    assert no_base._runtime.convert_calls == []
+
+
+def test_current_fold_status_p2_needs_apply_and_auto(tmp_path):
+    stale = _make_controller(tmp_path, enabled=True)
+    _write_status_rows(stale._work, {"Body": "STALE"})
+    assert integ._current_fold_status(stale) == "要反映"
+
+    auto = _make_controller(tmp_path, enabled=True, cfg={"uvremap_auto_follow": True})
+    _write_status_rows(auto._work, {"Body": "CONVERTED_OK"})
+    assert integ._current_fold_status(auto) == "自動追従"
+
+    off = _make_controller(tmp_path, enabled=False, cfg={"uvremap_auto_follow": True})
+    _write_status_rows(off._work, {"Body": "STALE"})
+    assert integ._current_fold_status(off) == "無効"
+
+
+def test_poll_tick_calls_follow_tick_after_poll(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    seen = []
+
+    class Handle:
+        def set_message(self, text):
+            seen.append(text)
+
+        def _refresh_panel(self):
+            seen.append("refresh")
+
+    ctrl._runtime.poll_events = [
+        {"state": "CONVERTED_OK", "ts_name": "Body", "exit_code": 0},
+    ]
+    result = integ.run_poll_tick(ctrl, Handle(), now_ns=1)
+    assert result["message"] == _done("Body")
+    assert "refresh" in seen
+    assert ctrl._runtime.convert_calls == []
+
+
+def _arm_follow_counts(ctrl, monkeypatch):
+    """``list_texture_sets_fn`` と ``source_signature`` の呼び出し回数を数える。"""
+    counts = {"list": 0, "sig": 0}
+    orig_list = ctrl.list_texture_sets_fn
+
+    def list_fn():
+        counts["list"] += 1
+        return orig_list()
+
+    ctrl.list_texture_sets_fn = list_fn
+    real_sig = integ.source_signature
+
+    def sig_fn(*args, **kwargs):
+        counts["sig"] += 1
+        return real_sig(*args, **kwargs)
+
+    monkeypatch.setattr(integ, "source_signature", sig_fn)
+    return counts
+
+
+def _match_flag_to_record(ctrl, final):
+    """印の mtime を follow.json の記録に揃え、未処理の書き出しが無い状態にする。"""
+    recorded = follow.load_follow(ctrl._work)["flag_mtime_ns"]
+    _touch_ns(final / "_sync_complete.flag", b"done", recorded)
+    return recorded
+
+
+def test_follow_tick_unchanged_flag_scans_once(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    _match_flag_to_record(ctrl, final)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 30 * FOLLOW_NS
+    for step in range(10):
+        result = ctrl.follow_tick(start + step * FOLLOW_NS)
+        assert result["ok"] is True
+        assert result["message"] == ""
+    assert counts == {"list": 1, "sig": 1}
+    assert ctrl._runtime.convert_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+
+def test_follow_tick_flag_update_runs_heavy_then_once_after_settle(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    _match_flag_to_record(ctrl, final)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 30 * FOLLOW_NS
+    ctrl.follow_tick(start)
+    for step in range(1, 4):
+        ctrl.follow_tick(start + step * FOLLOW_NS)
+    assert counts == {"list": 1, "sig": 1}
+    assert ctrl._runtime.convert_calls == []
+
+    _touch_ns(final / "_sync_complete.flag", b"new", 80)
+    changed_at = start + 4 * FOLLOW_NS
+    before = ctrl.follow_tick(changed_at)
+    assert before["ok"] is True
+    assert before["message"] == ""
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.convert_calls == []
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+    still = ctrl.follow_tick(changed_at + FOLLOW_NS)
+    assert still["message"] == ""
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.convert_calls == []
+
+    settled = ctrl.follow_tick(changed_at + 2 * FOLLOW_NS)
+    assert settled["ok"] is True
+    assert settled["message"] == follow.MSG_PAINTER_START_FMT.format(ts="Body")
+    assert counts == {"list": 3, "sig": 3}
+    assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["auto"]
+    assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 80
+
+    ctrl.follow_tick(changed_at + 3 * FOLLOW_NS)
+    ctrl.follow_tick(changed_at + 4 * FOLLOW_NS)
+    assert counts == {"list": 3, "sig": 3}
+    assert len(ctrl._runtime.convert_calls) == 1
+
+
+def test_follow_tick_toggle_and_killswitch_run_heavy_once(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, flag_mtime_ns=50)
+    _match_flag_to_record(ctrl, final)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 40 * FOLLOW_NS
+    for step in range(3):
+        ctrl.follow_tick(start + step * FOLLOW_NS)
+    assert counts == {"list": 1, "sig": 1}
+
+    same = ctrl.set_auto_follow(True)
+    assert same["ok"] is True
+    ctrl.follow_tick(start + 3 * FOLLOW_NS)
+    assert counts == {"list": 1, "sig": 1}
+
+    off = ctrl.set_auto_follow(False)
+    assert off["ok"] is True
+    assert off["auto_follow"] is False
+    toggled = ctrl.follow_tick(start + 4 * FOLLOW_NS)
+    assert toggled["ok"] is True
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+    ctrl.follow_tick(start + 5 * FOLLOW_NS)
+    assert counts == {"list": 2, "sig": 2}
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+
+    disabled = ctrl.set_enabled(False)
+    assert disabled["ok"] is True
+    ctrl.follow_tick(start + 6 * FOLLOW_NS)
+    assert counts == {"list": 2, "sig": 2}
+
+    enabled = ctrl.set_enabled(True)
+    assert enabled["ok"] is True
+    ctrl.follow_tick(start + 7 * FOLLOW_NS)
+    assert counts == {"list": 3, "sig": 3}
+    ctrl.follow_tick(start + 8 * FOLLOW_NS)
+    assert counts == {"list": 3, "sig": 3}
+    assert len(ctrl._runtime.stale_calls) == 2
+
+
+def test_follow_tick_auto_off_stale_only_on_heavy_pass(tmp_path, monkeypatch):
+    ctrl, final = _prepare_follow_ctrl(tmp_path, auto_follow=False, flag_mtime_ns=50)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 10 * FOLLOW_NS
+    for step in range(10):
+        result = ctrl.follow_tick(start + step * FOLLOW_NS)
+        assert result["ok"] is True
+        assert result["message"] == ""
+    assert counts == {"list": 1, "sig": 1}
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
+    assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10

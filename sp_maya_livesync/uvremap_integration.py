@@ -6,9 +6,27 @@ Maya / Qt は関数の中だけ。純粋部分はどちらも無しでテスト�
 """
 from __future__ import annotations
 
+import json
 import os
+import time
 from pathlib import Path
 
+from uvremap_follow import (
+    MSG_AUTO_INPUT_AS_IS,
+    MSG_INPUT_STALE,
+    MSG_PAINTER_START_FMT,
+    MSG_PEND_FMT,
+    MSG_QUEUE_FMT,
+    _flag_is_newer,
+    _settled_ns,
+    decide_follow,
+    fold_status_label_p2,
+    input_stale,
+    load_follow,
+    normalize_follow_settings,
+    save_follow,
+    source_signature,
+)
 from uvremap_runtime import (
     MSG_ALREADY_RUNNING,
     MSG_INTERRUPTED,
@@ -20,6 +38,7 @@ from uvremap_runtime import (
     WARN_NO_FILE_NODES,
     WARN_SCENE_CHANGED,
 )
+import uvremap_bridge as br
 
 DEFAULT_UVREMAP_ROOT = "C:/SPMayaLiveSync/uvremap"
 CONVERT_TIMEOUT_S = 1200
@@ -322,12 +341,32 @@ def fold_status_label(enabled, converting):
     """折りたたみボタン横の短い状態。Qt 無し。
 
     無効が先。有効で変換中のときだけ「変換中」。
+    P2-c1 の閉じた欄は ``fold_status_label_p2``(``_current_fold_status``)を使う。
     """
     if not enabled:
         return LABEL_FOLD_OFF
     if converting:
         return LABEL_FOLD_BUSY
     return LABEL_FOLD_ON
+
+
+def is_reservation_id(job_id):
+    """ランタイムの予約 ID(``queued:<連番>``)なら True。"""
+    return isinstance(job_id, str) and job_id.startswith("queued:")
+
+
+def convert_launch_messages(started_ids, pending_names, queued_names, missing=None):
+    """今すぐ変換の結果文言。予約だけのときは開始文を付けない。"""
+    parts = []
+    if started_ids:
+        parts.append("変換を開始しました")
+    for ts_name in pending_names:
+        parts.append(MSG_PEND_FMT.format(ts=ts_name))
+    for ts_name in queued_names:
+        parts.append(MSG_QUEUE_FMT.format(ts=ts_name))
+    if missing:
+        parts.append("シーンに無いテクスチャセット: {0}".format("、".join(missing)))
+    return "。".join(parts)
 
 
 def lookup_project_entry(by_project, project_key):
@@ -414,6 +453,17 @@ class UVRemapController:
         self.final_subfolder_fn = final_subfolder_fn
         self.list_texture_sets_fn = list_texture_sets_fn
         self.history_fn = history_fn
+        self._follow_last_flag_mtime_ns = None
+        self._follow_last_change_seen_ns = None
+        # 重い段階を最後まで済ませた印。落ち着き待ちでは更新しない。
+        self._follow_done_mtime_ns = None
+        self._follow_pending_settle = False
+        self._follow_pending_settle_mtime_ns = None
+        self._follow_pending_settle_s = None
+        self._follow_open_pass_done = False
+        self._follow_force_heavy = False
+        self._follow_enabled_seen = None
+        self._auto_input_as_is_emitted = False
         if runtime is None:
             import uvremap_runtime as _rt
             cfg = self._safe_config()
@@ -422,6 +472,7 @@ class UVRemapController:
                 get_enabled=self._enabled_from_config,
                 get_root=self._root_for_project,
                 mayapy_path=mayapy,
+                max_parallel_fn=self._max_parallel_from_config,
             )
         else:
             self.runtime = runtime
@@ -435,6 +486,16 @@ class UVRemapController:
 
     def _enabled_from_config(self):
         return bool(self._safe_config().get("uvremap_enabled", False))
+
+    def _follow_settings_from_config(self):
+        """P2-2 の 6 キー。``normalize_follow_settings`` で丸めた値を返す。"""
+        return normalize_follow_settings(self._safe_config())
+
+    def _auto_follow_from_config(self):
+        return bool(self._follow_settings_from_config()["uvremap_auto_follow"])
+
+    def _max_parallel_from_config(self):
+        return self._follow_settings_from_config()["uvremap_max_parallel"]
 
     def _call(self, fn, *args):
         try:
@@ -534,15 +595,38 @@ class UVRemapController:
     def set_enabled(self, enabled):
         try:
             enabled = bool(enabled)
+            was_enabled = self._enabled_from_config()
             cfg = self._safe_config()
             if isinstance(cfg, dict):
                 cfg["uvremap_enabled"] = enabled
             self.save_config_fn({"uvremap_enabled": enabled})
+            if enabled and not was_enabled:
+                self._follow_force_heavy = True
             if not enabled:
                 message = self._message_after_disable()
             else:
                 message = MSG_ENABLED
             return {"ok": True, "message": message, "enabled": enabled}
+        except Exception:
+            return {"ok": False, "message": "設定の更新に失敗しました"}
+
+    def set_auto_follow(self, enabled):
+        """``uvremap_auto_follow`` を部分マージで保存する。初回オンで既知の制約を 1 度出す。"""
+        try:
+            enabled = bool(enabled)
+            was_auto = self._auto_follow_from_config()
+            cfg = self._safe_config()
+            if isinstance(cfg, dict):
+                cfg["uvremap_auto_follow"] = enabled
+            self.save_config_fn({"uvremap_auto_follow": enabled})
+            if enabled != was_auto:
+                self._follow_force_heavy = True
+            message = ""
+            if enabled and not self._auto_input_as_is_emitted:
+                message = MSG_AUTO_INPUT_AS_IS
+                self._write_history(message)
+                self._auto_input_as_is_emitted = True
+            return {"ok": True, "message": message, "auto_follow": enabled}
         except Exception:
             return {"ok": False, "message": "設定の更新に失敗しました"}
 
@@ -602,15 +686,10 @@ class UVRemapController:
                 return {"ok": False, "message": MSG_NO_BASELINE}
             out = output_dir_for_root(resolved["root"])
             job_ids = []
-            already = []
+            started = []
+            pending = []
+            queued = []
             for ts_name in resolved["ts_names"]:
-                running = False
-                checker = getattr(self.runtime, "has_running_job_for_ts", None)
-                if callable(checker):
-                    try:
-                        running = bool(checker(ts_name))
-                    except Exception:
-                        running = False
                 job_id = self.runtime.convert_now(
                     resolved["project_key"],
                     ts_name,
@@ -620,35 +699,266 @@ class UVRemapController:
                     quality="final",
                     timeout_s=CONVERT_TIMEOUT_S,
                 )
-                if job_id:
-                    job_ids.append(job_id)
-                elif running:
-                    already.append(ts_name)
+                if not job_id:
+                    continue
+                job_ids.append(job_id)
+                if is_reservation_id(job_id):
+                    if self._ts_is_running(ts_name):
+                        pending.append(ts_name)
+                    else:
+                        queued.append(ts_name)
+                else:
+                    started.append(job_id)
             if not job_ids:
-                if already:
-                    return {
-                        "ok": False,
-                        "message": MSG_ALREADY_RUNNING,
-                        "job_ids": [],
-                        "already_running": already,
-                    }
                 return {"ok": False, "message": MSG_NOT_STARTED, "job_ids": []}
-            message = "変換を開始しました"
-            if already:
-                message = "{0}。{1}".format(message, MSG_ALREADY_RUNNING)
-            if resolved.get("missing"):
-                message = "{0}。シーンに無いテクスチャセット: {1}".format(
-                    message, "、".join(resolved["missing"]),
-                )
+            message = convert_launch_messages(
+                started, pending, queued, missing=resolved.get("missing") or None,
+            )
             return {
                 "ok": True,
                 "message": message,
                 "job_ids": job_ids,
                 "missing": list(resolved.get("missing") or []),
-                "already_running": already,
+                "pending": pending,
+                "queued": queued,
             }
         except Exception:
             return {"ok": False, "message": "変換の開始に失敗しました"}
+
+    def _ts_is_running(self, ts_name):
+        checker = getattr(self.runtime, "has_running_job_for_ts", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(ts_name))
+        except Exception:
+            return False
+
+    def _follow_job_message(self, ts_name, job_id):
+        if not job_id:
+            return ""
+        if is_reservation_id(job_id):
+            if self._ts_is_running(ts_name):
+                return MSG_PEND_FMT.format(ts=ts_name)
+            return MSG_QUEUE_FMT.format(ts=ts_name)
+        return MSG_PAINTER_START_FMT.format(ts=ts_name)
+
+    def _current_scene_id(self):
+        getter = getattr(self.runtime, "_scene_id", None)
+        if not callable(getter):
+            return ""
+        try:
+            value = getter()
+        except Exception:
+            return ""
+        if value is None:
+            return ""
+        return str(value)
+
+    def _status_ts_states(self, project_key):
+        states = {}
+        try:
+            path = self.runtime.status_snapshot(project_key)
+        except Exception:
+            return states
+        if path is None:
+            return states
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            return states
+        table = data.get("ts") if isinstance(data, dict) else None
+        if not isinstance(table, dict):
+            return states
+        for name, entry in table.items():
+            if isinstance(entry, dict):
+                states[str(name)] = entry.get("state")
+        return states
+
+    def _note_flag_mtime(self, flag_mtime_ns, now_ns):
+        if self._follow_last_flag_mtime_ns != flag_mtime_ns:
+            self._follow_last_change_seen_ns = now_ns
+            self._follow_last_flag_mtime_ns = flag_mtime_ns
+
+    def _update_follow_flag_mtime(self, root, flag_mtime_ns):
+        data = load_follow(root)
+        data["flag_mtime_ns"] = int(flag_mtime_ns)
+        save_follow(root, data)
+
+    def _should_record_flag_mtime(self, decision, enabled, auto_follow, has_baseline):
+        """Q4: ready が真で条件 1・2 を通った判定のときだけ更新する。"""
+        if not getattr(decision, "ready", False):
+            return False
+        return enabled is True and auto_follow is True and has_baseline is True
+
+    def _probe_follow_flag_mtime(self):
+        """軽い段階。プロジェクトのキーと Final フォルダから印の mtime だけ取る。
+
+        シーン走査、follow.json、status.json、``source_signature`` はここではしない。
+        印が無い、または場所が取れないときは None。
+        """
+        key = self._project_key()
+        if not key:
+            return None
+        try:
+            final_dir = self._call(self.final_dir_fn, key)
+        except Exception:
+            final_dir = None
+        if not final_dir:
+            return None
+        flag_path = Path(final_dir) / "_sync_complete.flag"
+        try:
+            return int(flag_path.stat().st_mtime_ns)
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def _follow_heavy_due(self, now_ns, flag_mtime_ns):
+        """重い段階が必要なときだけ True。
+
+        窓を開いた直後、追従チェックかキルスイッチ ON の直後、
+        印の mtime が最後に重い段階を済ませたときと違うとき、
+        落ち着き待ちの settle が過ぎたとき。
+        """
+        if not self._follow_open_pass_done or self._follow_force_heavy:
+            return True
+        pending_same = (
+            self._follow_pending_settle
+            and self._follow_pending_settle_mtime_ns == flag_mtime_ns
+        )
+        if self._follow_done_mtime_ns != flag_mtime_ns and not pending_same:
+            return True
+        if pending_same and _settled_ns(
+            now_ns, self._follow_last_change_seen_ns, self._follow_pending_settle_s,
+        ):
+            return True
+        return False
+
+    def _remember_heavy_flag(self, flag_mtime_ns, waiting, settle_s):
+        """重い段階を最後まで済ませた印を覚える。落ち着き待ちでは覚えず、再判定の材料だけ残す。"""
+        self._follow_open_pass_done = True
+        self._follow_force_heavy = False
+        if waiting:
+            self._follow_pending_settle = True
+            self._follow_pending_settle_mtime_ns = flag_mtime_ns
+            self._follow_pending_settle_s = settle_s
+            return
+        self._follow_pending_settle = False
+        self._follow_pending_settle_mtime_ns = None
+        self._follow_pending_settle_s = None
+        self._follow_done_mtime_ns = flag_mtime_ns
+
+    def follow_tick(self, now_ns):
+        """Painter の印を見て、自動変換または入力側 STALE を進める。例外は出さない。
+
+        毎秒はキルスイッチ、プロジェクトのキー、Final フォルダ、印の mtime だけを見る。
+        入力側 STALE を含む重い判定は、必要なときだけ行う。
+        """
+        try:
+            return self._follow_tick_impl(now_ns)
+        except Exception:
+            return {"ok": False, "message": ""}
+
+    def _follow_tick_impl(self, now_ns):
+        enabled = bool(self._enabled_from_config())
+        if not enabled:
+            self._follow_enabled_seen = False
+            return {"ok": True, "message": ""}
+        if self._follow_enabled_seen is False:
+            self._follow_force_heavy = True
+        self._follow_enabled_seen = True
+        flag_mtime_ns = self._probe_follow_flag_mtime()
+        if flag_mtime_ns is None:
+            return {"ok": True, "message": ""}
+        if not self._follow_heavy_due(now_ns, flag_mtime_ns):
+            return {"ok": True, "message": ""}
+        return self._follow_tick_heavy(now_ns, flag_mtime_ns)
+
+    def _follow_tick_heavy(self, now_ns, flag_mtime_ns):
+        resolved = self._resolve_context()
+        if not isinstance(resolved, dict) or not resolved.get("ok"):
+            return {"ok": True, "message": ""}
+        final_dir = resolved.get("final_dir")
+        root = resolved.get("root")
+        project_key = resolved.get("project_key")
+        if not final_dir or not root or not project_key:
+            return {"ok": True, "message": ""}
+        self._note_flag_mtime(flag_mtime_ns, now_ns)
+        settings = self._follow_settings_from_config()
+        auto_follow = settings["uvremap_auto_follow"] is True
+        has_baseline = bool(baseline_exists(root))
+        follow_data = load_follow(root)
+        last_flag_ns = follow_data.get("flag_mtime_ns")
+        recorded_ts = follow_data.get("ts") if isinstance(follow_data.get("ts"), dict) else {}
+        ts_states = self._status_ts_states(project_key)
+        channels = [dict(item) for item in br.DEFAULT_CHANNELS]
+        current_scene = self._current_scene_id()
+        current_sigs = {}
+        recorded_sigs = {}
+        same_scene = {}
+        names = list(ts_states) or list(resolved.get("ts_names") or [])
+        for ts_name in names:
+            current_sigs[ts_name] = source_signature(final_dir, ts_name, channels)
+            rec = recorded_ts.get(ts_name) if isinstance(recorded_ts.get(ts_name), dict) else {}
+            recorded_sigs[ts_name] = rec.get("source_sig")
+            rec_scene = rec.get("scene_id")
+            same_scene[ts_name] = rec_scene is not None and str(rec_scene) == current_scene
+        if not auto_follow:
+            marker = getattr(self.runtime, "mark_stale", None)
+            if callable(marker):
+                for ts_name, state in ts_states.items():
+                    if input_stale(state, current_sigs.get(ts_name), recorded_sigs.get(ts_name), False):
+                        try:
+                            marker(project_key, ts_name, MSG_INPUT_STALE)
+                        except Exception:
+                            pass
+            self._remember_heavy_flag(flag_mtime_ns, False, None)
+            return {"ok": True, "message": ""}
+        decision = decide_follow(
+            now_ns,
+            flag_mtime_ns,
+            last_flag_ns,
+            self._follow_last_change_seen_ns,
+            settings["uvremap_follow_settle_s"],
+            True,
+            True,
+            has_baseline,
+            ts_states,
+            current_sigs,
+            recorded_sigs,
+            same_scene,
+        )
+        out = output_dir_for_root(root)
+        shape_paths = list(resolved.get("shape_paths") or [])
+        messages = []
+        for ts_name in list(decision.ts_to_convert) + list(decision.ts_to_pend):
+            try:
+                job_id = self.runtime.convert_now(
+                    project_key,
+                    ts_name,
+                    shape_paths,
+                    source_dir=final_dir,
+                    output_dir=out,
+                    quality="final",
+                    timeout_s=CONVERT_TIMEOUT_S,
+                    origin="auto",
+                )
+            except Exception:
+                job_id = ""
+            text = self._follow_job_message(ts_name, job_id)
+            if text:
+                messages.append(text)
+                self._write_history(text)
+        if self._should_record_flag_mtime(decision, True, True, has_baseline):
+            try:
+                self._update_follow_flag_mtime(root, flag_mtime_ns)
+            except Exception:
+                pass
+        waiting = decision.ready is False and _flag_is_newer(flag_mtime_ns, last_flag_ns)
+        self._remember_heavy_flag(
+            flag_mtime_ns, waiting, settings["uvremap_follow_settle_s"],
+        )
+        return {"ok": True, "message": messages[-1] if messages else ""}
 
     def revert(self):
         try:
@@ -878,16 +1188,31 @@ def _controller_from_window(window, history_fn=None):
     )
 
 
-def run_poll_tick(controller, handle):
-    """on_tick の本体。poll の message が空でなければ set_message する。"""
+def run_poll_tick(controller, handle, now_ns=None):
+    """on_tick の本体。poll の message が空でなければ set_message する。
+
+    poll の後に ``follow_tick`` を呼ぶ。follow の例外は外へ出さない。
+    """
     try:
         result = controller.poll()
     except Exception:
-        return None
+        result = None
     text = ""
     if isinstance(result, dict):
         raw = result.get("message") or ""
         text = raw if isinstance(raw, str) else ""
+    follow_result = None
+    try:
+        if now_ns is None:
+            now_ns = time.time_ns()
+        follow_result = controller.follow_tick(now_ns)
+    except Exception:
+        follow_result = None
+    if isinstance(follow_result, dict):
+        raw = follow_result.get("message") or ""
+        follow_text = raw if isinstance(raw, str) else ""
+        if follow_text:
+            text = follow_text
     if text:
         setter = getattr(handle, "set_message", None)
         if callable(setter):
@@ -920,17 +1245,35 @@ def start_poll_after_recover(controller, timer, set_message_fn=None):
     return names
 
 
-def _status_has_converting(status_path):
-    """status.json の行に CONVERTING があれば True。読めなければ False。"""
+def _status_has_state(status_path, state_name):
+    """status.json の行に指定状態があれば True。読めなければ False。"""
     if not status_path:
         return False
     try:
-        from uvremap_panel import STATE_CONVERTING, StatusModel
+        from uvremap_panel import StatusModel
         view = StatusModel(status_path).load()
     except Exception:
         return False
     rows = getattr(view, "rows", ()) or ()
-    return any(getattr(row, "state", None) == STATE_CONVERTING for row in rows)
+    return any(getattr(row, "state", None) == state_name for row in rows)
+
+
+def _status_has_converting(status_path):
+    """status.json の行に CONVERTING があれば True。読めなければ False。"""
+    try:
+        from uvremap_panel import STATE_CONVERTING
+    except Exception:
+        return False
+    return _status_has_state(status_path, STATE_CONVERTING)
+
+
+def _status_has_stale(status_path):
+    """status.json の行に STALE があれば True。読めなければ False。"""
+    try:
+        from uvremap_panel import STATE_STALE
+    except Exception:
+        return False
+    return _status_has_state(status_path, STATE_STALE)
 
 
 def _current_fold_status(controller):
@@ -941,6 +1284,8 @@ def _current_fold_status(controller):
     except Exception:
         enabled = False
     converting = False
+    needs_apply = False
+    auto_any = False
     if enabled:
         path = None
         try:
@@ -950,7 +1295,14 @@ def _current_fold_status(controller):
         except Exception:
             path = None
         converting = _status_has_converting(path)
-    return fold_status_label(enabled, converting)
+        needs_apply = _status_has_stale(path)
+        getter = getattr(controller, "_auto_follow_from_config", None)
+        if callable(getter):
+            try:
+                auto_any = bool(getter())
+            except Exception:
+                auto_any = False
+    return fold_status_label_p2(enabled, converting, needs_apply, auto_any)
 
 
 def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=None):
@@ -1044,6 +1396,20 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         show_message(result.get("message") or "")
         refresh_open_views()
 
+    def get_auto_follow():
+        getter = getattr(controller, "_auto_follow_from_config", None)
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+
+    def on_toggle_auto_follow(checked):
+        result = controller.set_auto_follow(bool(checked))
+        show_message(result.get("message") or "")
+        refresh_open_views()
+
     def on_convert_now():
         result = controller.convert_now()
         show_message(result.get("message") or "")
@@ -1061,6 +1427,8 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         on_revert=on_revert,
         get_enabled=get_enabled,
         get_status_path=get_status_path,
+        get_auto_follow=get_auto_follow,
+        on_toggle_auto_follow=on_toggle_auto_follow,
     )
     panel.setObjectName("uvremap_panel")
     detail_layout.addWidget(panel)

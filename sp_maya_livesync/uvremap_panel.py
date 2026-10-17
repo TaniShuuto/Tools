@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
+from uvremap_follow import LABEL_CHECK_PAINTER
+
 # --- 状態と色(契約 D-1。色だけに頼らず状態名も必ず表示する) ---------------
 
 STATE_ORIGINAL = "ORIGINAL"
@@ -285,7 +287,8 @@ class StatusModel:
         state = _as_text(entry.get("state")).strip() or STATE_ORIGINAL
         updated = _as_text(entry.get("updated")).strip()
         raw_message = _as_text(entry.get("message"))
-        stalled = self._is_stalled(state, updated, clock)
+        queued = entry.get("queued") is True
+        stalled = self._is_stalled(state, updated, clock, queued=queued)
         return StatusRow(
             ts_name=ts_name,
             state=state,
@@ -295,7 +298,9 @@ class StatusModel:
             stalled=stalled,
         )
 
-    def _is_stalled(self, state: str, updated: str, clock: datetime) -> bool:
+    def _is_stalled(self, state: str, updated: str, clock: datetime, queued: bool = False) -> bool:
+        if queued:
+            return False
         if state != STATE_CONVERTING:
             return False
         parsed = _parse_updated(updated)
@@ -339,6 +344,8 @@ def _uvremap_panel_class():
             on_revert: Callable[[], None] | None = None,
             get_enabled: Callable[[], bool] | None = None,
             get_status_path: Callable[[], str | Path | None] | None = None,
+            get_auto_follow: Callable[[], bool] | None = None,
+            on_toggle_auto_follow: Callable[[bool], None] | None = None,
             converting_stale_s: float = CONVERTING_STALE_SECONDS,
             now_fn: Callable[[], datetime] | None = None,
         ) -> None:
@@ -348,6 +355,8 @@ def _uvremap_panel_class():
             self._on_revert = on_revert
             self._get_enabled = get_enabled
             self._get_status_path = get_status_path
+            self._get_auto_follow = get_auto_follow
+            self._on_toggle_auto_follow = on_toggle_auto_follow
             self._converting_stale_s = converting_stale_s
             self._now_fn = now_fn if now_fn is not None else datetime.now
 
@@ -398,6 +407,11 @@ def _uvremap_panel_class():
             self._kill_switch.toggled.connect(self._on_kill_toggled)
             root.addWidget(self._kill_switch)
 
+            self._check_painter = QtWidgets.QCheckBox(LABEL_CHECK_PAINTER)
+            self._check_painter.setObjectName("check_painter")
+            self._check_painter.toggled.connect(self._on_auto_follow_toggled)
+            root.addWidget(self._check_painter)
+
             buttons = QtWidgets.QHBoxLayout()
             self._btn_convert = QtWidgets.QPushButton(LABEL_CONVERT)
             self._btn_convert.setObjectName("btn_convert")
@@ -434,7 +448,7 @@ def _uvremap_panel_class():
 
         def refresh(self) -> None:
             enabled = self._read_enabled()
-            self._apply_enabled(enabled)
+            self._apply_enabled(enabled, self._read_auto_follow())
             status_path = self._read_status_path()
             view = StatusModel(
                 status_path,
@@ -459,18 +473,38 @@ def _uvremap_panel_class():
             except Exception:
                 return None
 
-        def _apply_enabled(self, enabled: bool) -> None:
+        def _read_auto_follow(self) -> bool:
+            if self._get_auto_follow is None:
+                return False
+            try:
+                return bool(self._get_auto_follow())
+            except Exception:
+                return False
+
+        def _apply_enabled(self, enabled: bool, auto_follow: bool = False) -> None:
             blocked = self._kill_switch.blockSignals(True)
             self._kill_switch.setChecked(enabled)
             self._kill_switch.blockSignals(blocked)
             self._btn_convert.setEnabled(enabled)
             self._btn_revert.setEnabled(enabled)
             self._btn_refresh.setEnabled(enabled)
+            painter_blocked = self._check_painter.blockSignals(True)
+            self._check_painter.setChecked(bool(auto_follow))
+            self._check_painter.blockSignals(painter_blocked)
+            self._check_painter.setEnabled(enabled)
 
         def _on_kill_toggled(self, checked: bool) -> None:
             if self._on_toggle_enabled is not None:
                 try:
                     self._on_toggle_enabled(bool(checked))
+                except Exception:
+                    pass
+            self.refresh()
+
+        def _on_auto_follow_toggled(self, checked: bool) -> None:
+            if self._on_toggle_auto_follow is not None:
+                try:
+                    self._on_toggle_auto_follow(bool(checked))
                 except Exception:
                     pass
             self.refresh()

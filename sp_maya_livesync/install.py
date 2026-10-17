@@ -130,6 +130,7 @@ TOOL_FILES = [
     {"name": "uvremap_runtime.py", "required": False},
     {"name": "uvremap_panel.py", "required": False},
     {"name": "uvremap_integration.py", "required": False},
+    {"name": "uvremap_follow.py", "required": False},
 ]
 
 # --- シェルフアイコン画像(任意) --------------------------------------------
