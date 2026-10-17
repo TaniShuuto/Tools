@@ -19,6 +19,7 @@ from pathlib import Path
 
 import uvremap_bridge as br
 import uvremap_core as core
+import uvremap_follow as follow
 from uvremap_worker import (
     FileLock,
     STATUS_LOCK_TIMEOUT_S,
@@ -36,6 +37,7 @@ UV_TILING_UDIM = 3
 STATE_ORIGINAL = "ORIGINAL"
 STATE_CONVERTING = "CONVERTING"
 STATE_CONVERTED_OK = "CONVERTED_OK"
+STATE_STALE = "STALE"
 STATE_FAILED = "FAILED"
 STATE_BLOCKED = "BLOCKED"
 MSG_NO_BASELINE = "基準UVが未記録です。Painterへ送った時点で記録してください"
@@ -1204,8 +1206,6 @@ class UVRemapRuntime:
         )
 
         if self.has_running_job_for_ts(ts_name):
-            if origin == ORIGIN_MANUAL:
-                return ""
             return self._set_pending(request)
 
         queued = self._queue_item_for_ts(str(ts_name))
@@ -1223,6 +1223,80 @@ class UVRemapRuntime:
         started = self._job_id_for_ts(ts_name)
         return started or qid
 
+    def mark_stale(self, project_key, ts_name, message) -> bool:
+        """CONVERTED_OK のときだけ STALE にする。generation は変えない。"""
+        try:
+            root = self._root(project_key)
+            entry = self._status_row(root, ts_name)
+            if entry is None:
+                return False
+            if str(entry.get("state") or "") != STATE_CONVERTED_OK:
+                return False
+            gen = entry.get("generation", 0)
+            if not isinstance(gen, int) or isinstance(gen, bool):
+                gen = 0
+            self._set_status(
+                root, ts_name, STATE_STALE, gen,
+                "" if message is None else str(message),
+                self._now(),
+            )
+            return True
+        except Exception:
+            return False
+
+    def _source_sig_now(self, source_dir, ts_name, channels):
+        try:
+            return follow.source_signature(source_dir, ts_name, channels)
+        except Exception:
+            return {}
+
+    def _recorded_source_sig(self, root: Path, ts_name: str):
+        try:
+            data = follow.load_follow(root)
+        except Exception:
+            return None
+        table = data.get("ts") if isinstance(data, dict) else None
+        if not isinstance(table, dict):
+            return None
+        row = table.get(ts_name)
+        if not isinstance(row, dict):
+            return None
+        return row.get("source_sig")
+
+    def _should_skip_auto_launch(self, root: Path, ts_name, uv_hash, source_dir, channels) -> bool:
+        """P2-5b。自動要求で UV ハッシュと source_sig が両方一致するときだけ True。"""
+        try:
+            last = _last_good_uv_hash(root, ts_name)
+            sig_now = self._source_sig_now(source_dir, ts_name, channels)
+            sig_rec = self._recorded_source_sig(root, ts_name)
+            return follow.should_skip_auto(uv_hash, last, sig_now, sig_rec)
+        except Exception:
+            return False
+
+    def _write_follow_launch(self, root: Path, ts_name, source_dir, channels, job_id, scene_id) -> None:
+        """起動直後に follow.json へ source_sig / last_job_id / scene_id を書く。失敗は握る。"""
+        try:
+            data = follow.load_follow(root)
+            table = data.get("ts")
+            if not isinstance(table, dict):
+                table = {}
+                data["ts"] = table
+            prev = table.get(ts_name) if isinstance(table.get(ts_name), dict) else {}
+            row = dict(prev)
+            row["source_sig"] = self._source_sig_now(source_dir, ts_name, channels)
+            row["last_job_id"] = str(job_id)
+            row["scene_id"] = "" if scene_id is None else str(scene_id)
+            table[ts_name] = row
+            follow.save_follow(root, data)
+        except Exception:
+            pass
+
+    def _no_change_message(self, ts_name) -> str:
+        try:
+            return follow.MSG_NO_CHANGE.format(ts=ts_name)
+        except (KeyError, IndexError, ValueError):
+            return follow.MSG_NO_CHANGE
+
     def _launch_job(self, request: dict) -> str:
         """配列取得・スナップショット・ワーカー起動。待ち行列からの起動でも使う。"""
         project_key = request["project_key"]
@@ -1232,6 +1306,7 @@ class UVRemapRuntime:
         output_dir = request["output_dir"]
         quality = request.get("quality") or "final"
         channels = request.get("channels")
+        origin = _normalize_origin(request.get("origin"))
         opts = dict(request.get("opts") or {})
         iso = self._now()
         root = self._root(project_key)
@@ -1281,22 +1356,31 @@ class UVRemapRuntime:
             arrays, info, baseline_id=baseline_id, created=iso,
         )
         uv_hash = br.current_uv_hash(current, ts_name)
+        src = Path(source_dir)
+        ch = channels
+        if ch is None:
+            ch = [dict(item) for item in br.DEFAULT_CHANNELS]
+        if origin == ORIGIN_AUTO and self._should_skip_auto_launch(
+            root, ts_name, uv_hash, src, ch,
+        ):
+            gen = self._status_generation(root, ts_name)
+            self._set_status(
+                root, ts_name, STATE_CONVERTED_OK, gen,
+                self._no_change_message(ts_name), iso,
+            )
+            return ""
         ledger = _load_ledger(root)
         generation = max(_ledger_generation(ledger, ts_name), self._max_inflight_generation(ts_name)) + 1
         latest_path = latest_generation_file(root, ts_name)
         job_id = self._next_id("", iso)
         current_dir = br.save_current(current, root, job_id)
 
-        src = Path(source_dir)
         out = Path(output_dir)
         flag = opts.get("source_flag")
         if flag is None:
             auto_flag = src / "_sync_complete.flag"
             if auto_flag.is_file():
                 flag = auto_flag
-        ch = channels
-        if ch is None:
-            ch = [dict(item) for item in br.DEFAULT_CHANNELS]
         out_res = opts.get("out_res", None)
         n_tiles = int(opts.get("n_tiles", 1) or 1)
         if "timeout_s" in opts:
@@ -1373,6 +1457,7 @@ class UVRemapRuntime:
             "log_path": log_path,
             "scene_id": str(scene_id),
         }
+        self._write_follow_launch(root, ts_name, src, ch, job_id, scene_id)
         return job_id
 
     def _restore_queued_after_scene_change(self, item: dict) -> None:

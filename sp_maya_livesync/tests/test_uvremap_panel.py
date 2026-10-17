@@ -18,6 +18,8 @@ _MODULE_DIR = Path(__file__).resolve().parents[1]
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
+from uvremap_follow import LABEL_CHECK_PAINTER  # noqa: E402
+from uvremap_follow import fold_status_label_p2  # noqa: E402
 from uvremap_panel import (  # noqa: E402
     COLOR_ATTENTION,
     COLOR_MUTED,
@@ -492,6 +494,70 @@ class TestUVRemapPanel:
             qapp.processEvents()
             assert overall.text() == f"{LABEL_OVERALL_PREFIX}: {LABEL_NO_PROJECT}"
             assert empty.text() == LABEL_NO_PROJECT
+        finally:
+            panel.hide()
+            panel.close()
+
+
+def test_queued_converting_is_not_stalled(tmp_path):
+    updated = "2026-10-16T10:15:00"
+    entry = _entry("CONVERTING", 1, updated, "順番待ち")
+    entry["queued"] = True
+    status = _write_status(tmp_path / "status.json", {"Body": entry})
+    view = StatusModel(status, now_fn=lambda: _NOW_ELEVEN_MIN_AFTER_UPDATED).load()
+    row = view.rows[0]
+    assert row.state == "CONVERTING"
+    assert row.stalled is False
+    assert STALLED_MESSAGE not in row.message
+    assert row.color == COLOR_ATTENTION
+
+
+def test_fold_status_label_p2_used_for_closed_row():
+    assert fold_status_label_p2(True, False, True, True) == "要反映"
+    assert fold_status_label_p2(True, False, False, True) == "自動追従"
+
+
+class TestPainterFollowCheckbox:
+    def test_checkbox_added_and_grayed_when_kill_off(self, qapp):
+        enabled = {"value": False}
+        auto = {"value": True}
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: enabled["value"],
+            get_auto_follow=lambda: auto["value"],
+        )
+        try:
+            box = panel.findChild(type(panel._check_painter), "check_painter")
+            assert box is not None
+            assert box.text() == LABEL_CHECK_PAINTER
+            assert box.isEnabled() is False
+            assert box.isChecked() is True
+            enabled["value"] = True
+            panel.refresh()
+            qapp.processEvents()
+            assert box.isEnabled() is True
+            assert box.isChecked() is True
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_checkbox_calls_callback(self, qapp):
+        calls = []
+        auto = {"value": False}
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: True,
+            get_auto_follow=lambda: auto["value"],
+            on_toggle_auto_follow=lambda value: calls.append(value) or auto.update(value=value),
+        )
+        try:
+            box = panel.findChild(type(panel._check_painter), "check_painter")
+            assert box.isEnabled() is True
+            assert box.isChecked() is False
+            box.click()
+            qapp.processEvents()
+            assert calls == [True]
+            assert box.isChecked() is True
         finally:
             panel.hide()
             panel.close()

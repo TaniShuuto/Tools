@@ -105,6 +105,7 @@ TOOL_FILE_NAMES = [
     "uvremap_runtime.py",
     "uvremap_panel.py",
     "uvremap_integration.py",
+    "uvremap_follow.py",
 ]
 LIVESYNC_LABEL = "LiveSync"
 AISS_LABEL = "aiSS"

@@ -291,7 +291,8 @@ def test_decide_follow_states_and_scene_and_pending():
     other_scene = _follow(same_scene={"Body": True, "Head": False})
     assert other_scene.ts_to_convert == ("Body",) and other_scene.ts_to_pend == ()
     assert _follow(same_scene=False).ts_to_convert == ()
-    assert _follow(same_scene=True).ts_to_convert == ("Body", "Head")
+    assert _follow(same_scene=True).ts_to_convert == ()
+    assert _follow(same_scene=["Body"]).ts_to_convert == ()
 
     disabled = _follow(enabled=False, ts_states={"Body": F.STATE_CONVERTING})
     assert disabled.ts_to_pend == ()
@@ -414,9 +415,10 @@ def test_copy_constants_match_contract():
     assert F.MSG_PAINTER_START_FMT == "Painter の書き出しを検知しました。変換を開始します({ts})"
     assert F.MSG_PEND_FMT == "変換中のため、完了後にもう一度変換します({ts})"
     assert F.MSG_QUEUE_FMT == "順番待ちです({ts})"
-    assert F.MSG_NO_CHANGE == "変更はありません"
-    assert F.MSG_INPUT_STALE == "Painter の書き出しが新しくなりました。『反映する』を押してください"
-    assert F.MSG_UV_STALE == "UV が変更されました。『反映する』を押してください"
+    assert F.MSG_NO_CHANGE == "変更はありません({ts})"
+    assert F.MSG_NO_CHANGE.format(ts="Body") == "変更はありません(Body)"
+    assert F.MSG_INPUT_STALE == "Painter の書き出しが新しくなりました。『変更を反映する』を押してください"
+    assert F.MSG_UV_STALE == "UV が変更されました。『変更を反映する』を押してください"
     assert F.LABEL_NEEDS_APPLY == "要反映"
     assert F.LABEL_AUTO_FOLLOW == "自動追従"
     assert F.LABEL_APPLY == "変更を反映する"

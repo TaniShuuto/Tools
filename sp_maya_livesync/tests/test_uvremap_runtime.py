@@ -737,8 +737,9 @@ def test_same_ts_running_job_is_not_restarted(tmp_path):
     job2 = runtime.convert_now(
         "proj", TS, ["mesh"], src, out, channels=channels, udim=False, timeout_s=30,
     )
-    assert job1 and job2 == ""
+    assert job1 and job2.startswith("queued:")
     assert list(runtime._jobs) == [job1]
+    assert TS in runtime._pending
     status_after = json.loads((runtime._root_path / "status.json").read_text(encoding="utf-8"))
     assert status_after == status_before
     latest = rt.latest_generation_file(runtime._root_path, TS)
@@ -1632,7 +1633,7 @@ def test_manual_origin_starts_before_auto(tmp_path):
     assert runtime._queue[0]["ts_name"] == "Trim"
 
 
-def test_auto_pending_coalesces_manual_still_rejected(tmp_path):
+def test_auto_and_manual_pending_coalesce(tmp_path):
     popen = CapturedPopen(code=None)
     collect = _collect_named(TS)
     runtime = _make_runtime(
@@ -1657,14 +1658,15 @@ def test_auto_pending_coalesces_manual_still_rejected(tmp_path):
         "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
         origin="auto",
     )
-    rejected = runtime.convert_now(
+    reserved = runtime.convert_now(
         "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
         origin="manual",
     )
     assert job1
     assert r1.startswith("queued:")
     assert r1 == r2 == r3
-    assert rejected == ""
+    assert reserved.startswith("queued:")
+    assert reserved == r1
     assert runtime.has_running_job_for_ts(TS) is True
     assert len(runtime._pending) == 1
     assert len(popen.calls) == 1
@@ -2013,3 +2015,160 @@ def test_recover_orphaned_finish_event_on_next_poll(tmp_path):
     assert events[0]["ts_name"] == TS
     assert events[0]["state"] == rt.STATE_CONVERTED_OK
     assert runtime.poll() == []
+
+
+# ---------------------------------------------------------------------------
+# P2-c1: follow.json・P2-5b・mark_stale・手動保留
+# ---------------------------------------------------------------------------
+def _touch_src(src: Path, name="Body_BaseColor.png", data=b"abc", mtime_ns=1000):
+    path = src / name
+    path.write_bytes(data)
+    os.utime(path, ns=(mtime_ns, mtime_ns))
+    return path
+
+
+def test_launch_writes_follow_json_fields(tmp_path):
+    import uvremap_follow as follow
+
+    popen = CapturedPopen(code=None)
+    runtime = _make_runtime(
+        tmp_path, popen=popen, scene_id_fn=lambda: "sceneA.ma",
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    _touch_src(src, mtime_ns=1234)
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    assert job_id
+    data = follow.load_follow(runtime._root_path)
+    row = data["ts"][TS]
+    assert row["last_job_id"] == job_id
+    assert row["scene_id"] == "sceneA.ma"
+    assert row["source_sig"] == {"Body_BaseColor.png": [3, 1234]}
+
+
+def test_skip_auto_when_hash_and_sig_match(tmp_path):
+    import uvremap_bridge as br
+    import uvremap_follow as follow
+
+    popen = CapturedPopen(code=None)
+    arrays, info = plane_arrays(nx=4, ny=4)
+    collect = _collect_holder(arrays, info)
+    runtime = _make_runtime(tmp_path, popen=popen, collect=collect)
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    snap = br.arrays_to_snapshot(arrays, info, baseline_id="bl", created=FIXED_NOW)
+    uv_hash = br.current_uv_hash(snap, TS)
+    (runtime._root_path / "ledger.json").write_text(json.dumps({
+        "schema": 1,
+        "ts": {TS: {"generation": 1, "last_good_generation": 1, "uv_hash": uv_hash}},
+    }), encoding="utf-8")
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    _touch_src(src, mtime_ns=2000)
+    sig = follow.source_signature(src, TS, _CH_BC)
+    follow.save_follow(runtime._root_path, {
+        "schema": 1,
+        "flag_mtime_ns": 1,
+        "ts": {TS: {"source_sig": sig, "last_job_id": "old", "scene_id": "s"}},
+    })
+    _patch_status_ts(
+        runtime._root_path, TS,
+        state=rt.STATE_CONVERTED_OK, generation=3, updated=FIXED_NOW, message="ok",
+    )
+    skipped = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    assert skipped == ""
+    assert popen.calls == []
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_CONVERTED_OK
+    assert status["ts"][TS]["generation"] == 3
+    assert status["ts"][TS]["message"] == follow.MSG_NO_CHANGE.format(ts=TS)
+
+    launched = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="manual",
+    )
+    assert launched
+    assert len(popen.calls) == 1
+
+
+def test_skip_auto_requires_both_hash_and_sig(tmp_path):
+    import uvremap_bridge as br
+    import uvremap_follow as follow
+
+    arrays, info = plane_arrays(nx=4, ny=4)
+    collect = _collect_holder(arrays, info)
+    snap = br.arrays_to_snapshot(arrays, info, baseline_id="bl", created=FIXED_NOW)
+    uv_hash = br.current_uv_hash(snap, TS)
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    _touch_src(src, mtime_ns=2000)
+    sig = follow.source_signature(src, TS, _CH_BC)
+
+    popen_hash = CapturedPopen(code=None)
+    runtime_hash = _make_runtime(tmp_path, popen=popen_hash, collect=collect)
+    runtime_hash.record_baseline("proj", [TS], ["mesh"])
+    (runtime_hash._root_path / "ledger.json").write_text(json.dumps({
+        "schema": 1,
+        "ts": {TS: {"generation": 1, "uv_hash": uv_hash}},
+    }), encoding="utf-8")
+    follow.save_follow(runtime_hash._root_path, {
+        "schema": 1, "flag_mtime_ns": 1,
+        "ts": {TS: {"source_sig": {"Body_BaseColor.png": [9, 9]}}},
+    })
+    job_hash = runtime_hash.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    assert job_hash
+    assert len(popen_hash.calls) == 1
+
+    popen_sig = CapturedPopen(code=None)
+    runtime_sig = _make_runtime(tmp_path, popen=popen_sig, collect=collect)
+    runtime_sig.record_baseline("proj", [TS], ["mesh"])
+    (runtime_sig._root_path / "ledger.json").write_text(json.dumps({
+        "schema": 1,
+        "ts": {TS: {"generation": 1, "uv_hash": "other-hash"}},
+    }), encoding="utf-8")
+    follow.save_follow(runtime_sig._root_path, {
+        "schema": 1, "flag_mtime_ns": 1,
+        "ts": {TS: {"source_sig": sig}},
+    })
+    job_sig = runtime_sig.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+        origin="auto",
+    )
+    assert job_sig
+    assert len(popen_sig.calls) == 1
+
+
+def test_mark_stale_only_from_converted_ok(tmp_path):
+    runtime = _make_runtime(tmp_path)
+    _patch_status_ts(
+        runtime._root_path, TS,
+        state=rt.STATE_CONVERTED_OK, generation=4, updated=FIXED_NOW, message="ok",
+    )
+    assert runtime.mark_stale("proj", TS, "stale-now") is True
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_STALE
+    assert status["ts"][TS]["generation"] == 4
+    assert status["ts"][TS]["message"] == "stale-now"
+
+    _patch_status_ts(
+        runtime._root_path, TS,
+        state=rt.STATE_FAILED, generation=5, updated=FIXED_NOW, message="fail",
+    )
+    assert runtime.mark_stale("proj", TS, "nope") is False
+    status = json.loads(runtime.status_snapshot("proj").read_text(encoding="utf-8"))
+    assert status["ts"][TS]["state"] == rt.STATE_FAILED
+    assert status["ts"][TS]["generation"] == 5
+    assert status["ts"][TS]["message"] == "fail"
+
+    assert runtime.mark_stale("proj", "Missing", "nope") is False
