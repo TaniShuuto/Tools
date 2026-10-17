@@ -316,11 +316,29 @@ def test_uv_fingerprint_stable_and_length():
         F.uv_fingerprint([0.0, 1.0], [0.0])
 
 
+def test_uv_fingerprint_is_little_endian_f4():
+    values_u = [0.0, 1.0, 0.5]
+    values_v = [1.0, 0.0, 0.25]
+    u_be = np.array(values_u, dtype=">f4")
+    v_be = np.array(values_v, dtype=">f4")
+    u_le = np.array(values_u, dtype="<f4")
+    v_le = np.array(values_v, dtype="<f4")
+    packed = u_le.tobytes() + v_le.tobytes()
+    expected = (zlib.crc32(packed) & 0xFFFFFFFF, 3)
+    assert F.uv_fingerprint(u_be, v_be) == expected
+    assert F.uv_fingerprint(u_le, v_le) == expected
+    assert F.uv_fingerprint(np.array(values_u, dtype=np.float64), np.array(values_v)) == expected
+
+
 def _uv(**over):
     args = dict(
         now=12,
         fingerprints_now={"mesh": (2, 4), "other": (3, 4)},
-        fingerprints_recorded={"mesh": (1, 4), "other": (3, 4)},
+        fingerprints_recorded={
+            "Body": {"mesh": (1, 4)},
+            "Trim": {"mesh": (1, 4)},
+            "Head": {"other": (3, 4)},
+        },
         last_change_at=9,
         settle_s=3,
         ts_by_shape={"mesh": ["Trim", "Body"], "other": ["Head"]},
@@ -339,24 +357,24 @@ def _uv(**over):
 
 def test_decide_uv_follow_shape_settle_and_killswitch():
     before = _uv(now=11, last_change_at=9, settle_s=3)
-    assert before.ts_to_stale == ("Body", "Trim")
+    assert before.ts_to_stale == ("Body",)
     assert before.ts_to_convert == ()
     assert before.reason == F.REASON_UV_SETTLING
 
     after = _uv(now=12, last_change_at=9, settle_s=3)
-    assert after.ts_to_stale == ("Body", "Trim")
+    assert after.ts_to_stale == ("Body",)
     assert after.ts_to_convert == ("Body", "Prop")
     assert after.reason == ""
 
     off = _uv(auto_follow_uv=False)
-    assert off.ts_to_stale == ("Body", "Trim") and off.ts_to_convert == ()
+    assert off.ts_to_stale == ("Body",) and off.ts_to_convert == ()
 
     stopped = _uv(enabled=False)
     assert stopped == F.UVFollowDecision((), (), F.REASON_DISABLED)
 
     quiet = _uv(
         fingerprints_now={"mesh": (1, 4)},
-        fingerprints_recorded={"mesh": (1, 4)},
+        fingerprints_recorded={"Body": {"mesh": [1, 4]}},
         ts_by_shape={"mesh": ["Body"]},
         ts_states={"Body": F.STATE_CONVERTED_OK},
     )
@@ -372,6 +390,62 @@ def test_decide_uv_follow_shape_settle_and_killswitch():
 
     waiting = _uv(last_change_at=None)
     assert waiting.ts_to_convert == () and waiting.reason == F.REASON_UV_SETTLING
+
+
+def test_decide_uv_follow_per_ts_record_and_state_filter():
+    now = {"mesh": (9, 2), "other": (3, 2)}
+    recorded = {
+        "Body": {"mesh": (1, 2)},
+        "Trim": {"mesh": (9, 2)},
+        "Head": {"other": [3, 2]},
+        "Ghost": {"mesh": (1, 2)},
+    }
+    states = {
+        "Body": F.STATE_CONVERTED_OK,
+        "Trim": F.STATE_CONVERTED_OK,
+        "Head": F.STATE_CONVERTED_OK,
+        "Prop": F.STATE_STALE,
+        "Run": F.STATE_CONVERTING,
+        "Bad": F.STATE_FAILED,
+        "Hold": F.STATE_BLOCKED,
+        "Orig": F.STATE_ORIGINAL,
+        "Ghost": F.STATE_ORIGINAL,
+    }
+    for name, state in (
+        ("Run", F.STATE_CONVERTING),
+        ("Bad", F.STATE_FAILED),
+        ("Hold", F.STATE_BLOCKED),
+        ("Orig", F.STATE_ORIGINAL),
+    ):
+        recorded[name] = {"mesh": (1, 2)}
+        states[name] = state
+    decision = F.decide_uv_follow(
+        10, now, recorded, 10, 3,
+        {"mesh": ["Body", "Trim", "Run"]},
+        states, True, True,
+    )
+    assert decision.ts_to_stale == ("Body",)
+    assert "Trim" not in decision.ts_to_stale
+    assert "Head" not in decision.ts_to_stale
+    assert "Ghost" not in decision.ts_to_stale
+    for name in ("Run", "Bad", "Hold", "Orig"):
+        assert name not in decision.ts_to_stale
+        assert name not in decision.ts_to_convert
+    assert decision.ts_to_convert == ()
+
+    settled = F.decide_uv_follow(
+        13, now, recorded, 10, 3,
+        {}, states, True, True,
+    )
+    assert settled.ts_to_stale == ("Body",)
+    assert settled.ts_to_convert == ("Body", "Prop")
+
+    missing = F.decide_uv_follow(
+        13, now, {}, 10, 3, {"mesh": ["Body"]},
+        {"Body": F.STATE_CONVERTED_OK}, True, True,
+    )
+    assert missing.ts_to_stale == ()
+    assert missing.ts_to_convert == ()
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +477,16 @@ def test_input_stale_all_branches():
     assert F.input_stale(F.STATE_CONVERTED_OK, None, old, False) is True
 
 
+def test_apply_button_visible_only_when_stale():
+    assert F.apply_button_visible({"Body": F.STATE_STALE}) is True
+    assert F.apply_button_visible({"Body": F.STATE_STALE, "Trim": F.STATE_CONVERTED_OK}) is True
+    assert F.apply_button_visible({"Body": F.STATE_CONVERTED_OK}) is False
+    assert F.apply_button_visible({"Body": F.STATE_ORIGINAL}) is False
+    assert F.apply_button_visible({}) is False
+    assert F.apply_button_visible(None) is False
+    assert F.apply_button_visible(["STALE"]) is False
+
+
 def test_fold_status_label_p2_priority():
     assert F.fold_status_label_p2(False, True, True, True) == "無効"
     assert F.fold_status_label_p2(True, True, True, True) == "変換中"
@@ -413,6 +497,9 @@ def test_fold_status_label_p2_priority():
 
 def test_copy_constants_match_contract():
     assert F.MSG_PAINTER_START_FMT == "Painter の書き出しを検知しました。変換を開始します({ts})"
+    assert F.MSG_UV_START_FMT == "UV の変更を検知しました。変換を開始します({ts})"
+    assert F.MSG_UV_START_FMT.format(ts="Body") == "UV の変更を検知しました。変換を開始します(Body)"
+    assert F.MSG_UV_SLOW == "UV の確認に時間がかかるため、確認の間隔を 10 秒にしました"
     assert F.MSG_PEND_FMT == "変換中のため、完了後にもう一度変換します({ts})"
     assert F.MSG_QUEUE_FMT == "順番待ちです({ts})"
     assert F.MSG_NO_CHANGE == "変更はありません({ts})"

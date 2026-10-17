@@ -33,6 +33,8 @@ __all__ = (
     "STATE_FAILED",
     "STATE_BLOCKED",
     "MSG_PAINTER_START_FMT",
+    "MSG_UV_START_FMT",
+    "MSG_UV_SLOW",
     "MSG_PEND_FMT",
     "MSG_QUEUE_FMT",
     "MSG_NO_CHANGE",
@@ -64,10 +66,13 @@ __all__ = (
     "normalize_follow_settings",
     "decide_follow",
     "uv_fingerprint",
+    "fingerprint_maps_differ",
+    "uv_recorded_differs",
     "decide_uv_follow",
     "should_skip_auto",
     "input_stale",
     "fold_status_label_p2",
+    "apply_button_visible",
 )
 
 FOLLOW_SCHEMA = 1
@@ -84,6 +89,8 @@ _AUTO_OK_STATES = (STATE_CONVERTED_OK, STATE_STALE)
 
 # --- 契約 P2-5b / P2-6 / P2-6b / P2-8 / P2-9 の文言(原文のまま) ---
 MSG_PAINTER_START_FMT = "Painter の書き出しを検知しました。変換を開始します({ts})"
+MSG_UV_START_FMT = "UV の変更を検知しました。変換を開始します({ts})"
+MSG_UV_SLOW = "UV の確認に時間がかかるため、確認の間隔を 10 秒にしました"
 MSG_PEND_FMT = "変換中のため、完了後にもう一度変換します({ts})"
 MSG_QUEUE_FMT = "順番待ちです({ts})"
 MSG_NO_CHANGE = "変更はありません({ts})"
@@ -364,18 +371,78 @@ def decide_follow(
     return FollowDecision(True, tuple(convert), tuple(pend), "")
 
 
-def uv_fingerprint(u_values, v_values) -> tuple[int, int]:
-    """U・V を float32 で詰めたバイト列の ``zlib.crc32`` と UV 数。
+def _le_f4(values):
+    """値をリトルエンディアン float32 の連続配列にする。入力の endian には依存しない。"""
+    arr = np.asarray(values, dtype="<f4").reshape(-1)
+    return np.ascontiguousarray(arr)
 
-    バイト列は U の後に V(numpy の native endian、C 連続)。長さが違うときは ``ValueError``。
+
+def uv_fingerprint(u_values, v_values) -> tuple[int, int]:
+    """U・V を ``<f4`` で詰めたバイト列の ``zlib.crc32`` と UV 数。
+
+    バイト列は U の後に V。エンディアンは常にリトルエンディアン(Q12)。
+    長さが違うときは ``ValueError``。
     """
-    u_arr = np.ascontiguousarray(np.asarray(u_values, dtype=np.float32).reshape(-1))
-    v_arr = np.ascontiguousarray(np.asarray(v_values, dtype=np.float32).reshape(-1))
+    u_arr = _le_f4(u_values)
+    v_arr = _le_f4(v_values)
     if int(u_arr.shape[0]) != int(v_arr.shape[0]):
         raise ValueError("U と V の長さが違います")
-    packed = np.concatenate((u_arr, v_arr))
-    crc = zlib.crc32(packed.tobytes()) & 0xFFFFFFFF
+    crc = zlib.crc32(u_arr.tobytes() + v_arr.tobytes()) & 0xFFFFFFFF
     return (int(crc), int(u_arr.shape[0]))
+
+
+def _fingerprint_pair(value):
+    """指紋を ``(crc, UV数)`` の int 組にする。list と tuple は同じ。合わなければ None。"""
+    if isinstance(value, bool) or not isinstance(value, (list, tuple)):
+        return None
+    if len(value) != 2:
+        return None
+    crc, count = value
+    if isinstance(crc, bool) or isinstance(count, bool):
+        return None
+    if isinstance(crc, int) and isinstance(count, int):
+        return (int(crc), int(count))
+    return None
+
+
+def fingerprint_maps_differ(left, right) -> bool:
+    """二つのシェイプ名 → 指紋が違うとき True。片方にしか無いシェイプも違い。"""
+    def rows(mapping):
+        if not isinstance(mapping, dict):
+            return ()
+        out = []
+        for shape in sorted(mapping, key=str):
+            pair = _fingerprint_pair(mapping[shape])
+            if pair is not None:
+                out.append((str(shape), pair))
+        return tuple(out)
+
+    return rows(left) != rows(right)
+
+
+def uv_recorded_differs(fingerprints_now, fingerprints_recorded) -> bool:
+    """記録のある TS のシェイプが、現在の指紋と 1 つでも違うとき True。
+
+    記録が無い TS、現在の指紋が無いシェイプは数えない。状態は見ない。
+    """
+    now_map = fingerprints_now if isinstance(fingerprints_now, dict) else {}
+    recorded_map = fingerprints_recorded if isinstance(fingerprints_recorded, dict) else {}
+    current = {}
+    for shape, value in now_map.items():
+        pair = _fingerprint_pair(value)
+        if pair is not None:
+            current[str(shape)] = pair
+    for record in recorded_map.values():
+        if not isinstance(record, dict):
+            continue
+        for shape, recorded in record.items():
+            rec = _fingerprint_pair(recorded)
+            now_pair = current.get(str(shape))
+            if rec is None or now_pair is None:
+                continue
+            if now_pair != rec:
+                return True
+    return False
 
 
 def _settled_s(now, last_change_at, settle_s) -> bool:
@@ -395,39 +462,52 @@ def _settled_s(now, last_change_at, settle_s) -> bool:
     return (float(now) - float(last_change_at)) >= float(settle_s)
 
 
-def _shape_members(value) -> list[str]:
-    if isinstance(value, (list, tuple)) and not isinstance(value, str):
-        return [ts for ts in value if isinstance(ts, str)]
-    return []
-
-
 def decide_uv_follow(
     now, fingerprints_now, fingerprints_recorded, last_change_at, settle_s,
     ts_by_shape, ts_states, enabled, auto_follow_uv,
 ) -> UVFollowDecision:
-    """P2-6 / P2-6b。指紋のマップはシェイプ名 → 指紋。時刻は秒。
+    """P2-6 / P2-6b。時刻は秒。記録は ``{TS名: {シェイプ名: 指紋}}``(Q13)。
 
-    指紋が記録と違うシェイプに属する TS をすべて ``ts_to_stale`` に入れる。
+    その TS の記録にあるシェイプのうち 1 つでも現在の指紋と違えば対象にする。
+    記録が無い TS は対象にしない。現在の指紋が無いシェイプは違いに数えない。
+    ``ts_to_stale`` は状態が ``CONVERTED_OK`` の TS だけ。
+    ``ORIGINAL`` / ``CONVERTING`` / ``FAILED`` / ``BLOCKED`` は STALE にしない。
     自動変換は ``auto_follow_uv`` が真で、指紋の最終変化から ``settle_s`` 秒経ったときだけ。
-    対象は、状態が ``CONVERTED_OK`` または ``STALE`` の TS(今回 STALE にするものを含む)。
+    対象は、すでに ``STALE`` の TS と、今回 STALE にする TS。
     ``enabled`` が真でないときは何もしない。
+    ``ts_by_shape`` は呼び出し互換のため残す。対象の決定には使わない。
     """
+    del ts_by_shape  # 対象は TS ごとの記録で決める(QUESTIONS_phase2_c2.md)
     if enabled is not True:
         return UVFollowDecision((), (), REASON_DISABLED)
 
-    shapes = ts_by_shape if isinstance(ts_by_shape, dict) else {}
     states = ts_states if isinstance(ts_states, dict) else {}
     now_map = fingerprints_now if isinstance(fingerprints_now, dict) else {}
     recorded_map = fingerprints_recorded if isinstance(fingerprints_recorded, dict) else {}
+    current = {}
+    for shape, value in now_map.items():
+        pair = _fingerprint_pair(value)
+        if pair is not None:
+            current[str(shape)] = pair
     stale = []
-    for shape in sorted(shapes, key=str):
-        current = now_map.get(shape, None)
-        recorded = recorded_map.get(shape, None)
-        if current is None or recorded is None or current == recorded:
+    for ts_name in sorted((name for name in recorded_map if isinstance(name, str))):
+        if states.get(ts_name) != STATE_CONVERTED_OK:
             continue
-        for ts_name in _shape_members(shapes.get(shape)):
+        record = recorded_map.get(ts_name)
+        if not isinstance(record, dict):
+            continue
+        changed = False
+        for shape, recorded in record.items():
+            rec = _fingerprint_pair(recorded)
+            now_pair = current.get(str(shape))
+            if rec is None or now_pair is None:
+                continue
+            if now_pair != rec:
+                changed = True
+                break
+        if changed:
             stale.append(ts_name)
-    stale_names = tuple(sorted(set(stale)))
+    stale_names = tuple(stale)
 
     settled = _settled_s(now, last_change_at, settle_s)
     convert: list[str] = []
@@ -464,6 +544,13 @@ def input_stale(state, sig_now, sig_recorded, auto_follow) -> bool:
     if state != STATE_CONVERTED_OK:
         return False
     return not _sigs_equal(sig_now, sig_recorded)
+
+
+def apply_button_visible(ts_states) -> bool:
+    """いずれかの TS が ``STALE`` のとき、開閉行の「変更を反映する」を出す。"""
+    if not isinstance(ts_states, dict):
+        return False
+    return any(state == STATE_STALE for state in ts_states.values())
 
 
 def fold_status_label_p2(enabled, converting, needs_apply, auto_any) -> str:

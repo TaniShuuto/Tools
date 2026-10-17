@@ -783,6 +783,46 @@ def _read_mesh_record(om, cmds, dag, uuid, uv_set):
     }
 
 
+def uv_fingerprints(shape_paths, uv_set=None):
+    """各シェイプの UV 指紋。三角形分割と面の対応は計算しない。
+
+    ``collect_arrays`` と同じく ``MFnMesh.getUVs`` で U・V を取り、
+    ``uvremap_follow.uv_fingerprint`` で ``{シェイプのフルパス: (crc, UV数)}`` を作る。
+    取れないシェイプは結果に入れない。例外はシェイプ単位で握る。
+    Maya 自体を import できないときは例外を外へ出す(呼び出し側が変換を止めない)。
+
+    戻り値は ``(fingerprints, elapsed_s)``。``elapsed_s`` はこの呼び出し全体の秒。
+    """
+    import time
+
+    from uvremap_follow import uv_fingerprint
+
+    started = time.perf_counter()
+    fingerprints = {}
+    om, _cmds = _maya()
+    chosen_fixed = None if uv_set is None else str(uv_set)
+    for path in list(shape_paths or []):
+        try:
+            dag, _uuid = _resolve_mesh(om, path)
+            fn = om.MFnMesh(dag)
+            uv_names = list(fn.getUVSetNames())
+            if chosen_fixed is None:
+                if not uv_names:
+                    continue
+                chosen = fn.currentUVSetName()
+            else:
+                if chosen_fixed not in uv_names:
+                    continue
+                chosen = chosen_fixed
+            u_values, v_values = fn.getUVs(chosen)
+            fingerprints[dag.fullPathName()] = uv_fingerprint(
+                _as_float32(u_values), _as_float32(v_values),
+            )
+        except Exception:
+            continue
+    return fingerprints, time.perf_counter() - started
+
+
 def list_texture_sets():
     """シーン内メッシュの TS名(シェーダー名) → フェース集合。
 

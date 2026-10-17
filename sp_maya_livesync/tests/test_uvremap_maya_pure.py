@@ -329,6 +329,7 @@ def test_is_default_sg():
 
 
 def test_public_functions_exist():
+    assert callable(um.uv_fingerprints)
     assert callable(um.list_texture_sets)
     assert callable(um.collect_arrays)
     assert callable(um.group_faces_by_ts_name)
@@ -535,6 +536,61 @@ def test_concat_does_not_flip_corners():
     )
     arrays, _info = um.concat_records([rec], [])
     np.testing.assert_array_equal(arrays["tri_corner"], [[2, 1, 0]])
+
+
+def test_uv_fingerprints_source_reads_uvs_without_triangulation():
+    import inspect
+    source = inspect.getsource(um.uv_fingerprints)
+    assert "getUVs" in source
+    assert "getTriangles" not in source
+    assert "getAssignedUVs" not in source
+    assert "uv_fingerprint" in source
+
+
+def test_uv_fingerprints_skips_bad_shapes_and_reports_elapsed(monkeypatch):
+    import uvremap_follow as follow
+
+    class FakeDag:
+        def __init__(self, name):
+            self.name = name
+
+        def fullPathName(self):
+            return self.name
+
+    class FakeFn:
+        def __init__(self, dag):
+            self._dag = dag
+
+        def getUVSetNames(self):
+            if self._dag.name == "|noUV":
+                return []
+            return ["map1"]
+
+        def currentUVSetName(self):
+            return "map1"
+
+        def getUVs(self, uv_set):
+            assert uv_set == "map1"
+            return ([0.0, 1.0], [1.0, 0.0])
+
+    class FakeOm:
+        def MFnMesh(self, dag):
+            return FakeFn(dag)
+
+    def fake_resolve(om, path):
+        if path == "|bad":
+            raise RuntimeError("missing")
+        return FakeDag(path), "uuid"
+
+    monkeypatch.setattr(um, "_maya", lambda: (FakeOm(), None))
+    monkeypatch.setattr(um, "_resolve_mesh", fake_resolve)
+    fingerprints, elapsed = um.uv_fingerprints(["|meshA", "|bad", "|noUV"])
+    assert set(fingerprints) == {"|meshA"}
+    assert fingerprints["|meshA"] == follow.uv_fingerprint([0.0, 1.0], [1.0, 0.0])
+    assert isinstance(elapsed, float) and elapsed >= 0.0
+
+    missing_set, _elapsed = um.uv_fingerprints(["|meshA"], uv_set="map9")
+    assert missing_set == {}
 
 
 if __name__ == "__main__":
