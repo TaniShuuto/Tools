@@ -1364,3 +1364,613 @@ def _publish_rebase_fbx(tmp_path, final_path, replace_fn, remove_fn):
         "size": int(final_size),
         "sha1": digest,
     }
+
+
+# ---------------------------------------------------------------------------
+# 2026.10.19(RB-d): リベース用 旧 UV セット(uvOld)
+#
+# Painter は 2 番目の UV セットを名前ではなく番号 1 で参照する。
+# そのため uvOld は、元の UV セットがちょうど 1 つのときにだけ一時的に作り、
+# 書き出しの成否にかかわらず消す。シーンの UV セットの並べ替えはしない。
+# 要実機確認: FBX 上の並び、setUVs / assignUVs の見た目、Undo、履歴ノード。
+# ---------------------------------------------------------------------------
+
+UVOLD_BASE_NAME = "uvOld"
+
+UVOLD_NO_BASELINE = "uvold_no_baseline"
+UVOLD_BASELINE_UNREADABLE = "uvold_baseline_unreadable"
+UVOLD_TOPOLOGY_MISMATCH = "uvold_topology_mismatch"
+UVOLD_UUID_UNRESOLVED = "uvold_uuid_unresolved"
+UVOLD_MULTI_UV_SET = "uvold_multi_uv_set"
+UVOLD_CREATE_FAILED = "uvold_create_failed"
+UVOLD_FILL_FAILED = "uvold_fill_failed"
+UVOLD_CLEANUP_FAILED = "uvold_cleanup_failed"
+
+# 契約に無い。仮: 警告コードを画面の短い理由にする。QUESTIONS_rb_d.md。
+_UVOLD_REASON_TEXT = {
+    UVOLD_NO_BASELINE: "基準UVがありません",
+    UVOLD_BASELINE_UNREADABLE: "基準UVが読めません",
+    UVOLD_TOPOLOGY_MISMATCH: "形が基準と違います",
+    UVOLD_UUID_UNRESOLVED: "メッシュの対応が取れません",
+    UVOLD_MULTI_UV_SET: "UVセットが複数あります",
+    UVOLD_CREATE_FAILED: "UVセットを作れませんでした",
+    UVOLD_FILL_FAILED: "UVを埋められませんでした",
+    UVOLD_CLEANUP_FAILED: "一時UVセットを消せませんでした",
+}
+
+
+class _UvOldFillError(Exception):
+    """埋め込みだけが失敗した印。外には出さない。"""
+
+
+def uvold_reason_text(warnings) -> str:
+    """警告コードを、履歴に出す短い日本語にする。後始末の失敗は理由にしない。"""
+    if isinstance(warnings, str):
+        warnings = [warnings]
+    if not isinstance(warnings, (list, tuple)):
+        return "理由不明"
+    for code in warnings:
+        if code == UVOLD_CLEANUP_FAILED:
+            continue
+        text = _UVOLD_REASON_TEXT.get(code)
+        if text:
+            return text
+    return "理由不明"
+
+
+def choose_uvold_name(existing_names_by_shape, base=UVOLD_BASE_NAME) -> str:
+    """対象の全シェイプに無い最初の名前。``uvOld``、``uvOld_1``、``uvOld_2`` の順。
+
+    大文字小文字は区別する(Maya の UV セット名は区別する)。
+    """
+    taken = set()
+    mapping = existing_names_by_shape if isinstance(existing_names_by_shape, dict) else {}
+    for names in mapping.values():
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, (list, tuple)):
+            continue
+        for name in names:
+            if isinstance(name, str) and name:
+                taken.add(name)
+    if base not in taken:
+        return base
+    index = 1
+    while True:
+        candidate = "{0}_{1}".format(base, index)
+        if candidate not in taken:
+            return candidate
+        index += 1
+
+
+def corner_uv_to_uv_arrays(face_vertex_counts, corner_uv):
+    """コーナー UV を ``setUVs`` / ``assignUVs`` に渡せる配列にする。
+
+    同じ (u, v) は 1 つにまとめる。1 つでも NaN のコーナーを持つフェースは
+    ``uv_counts`` を 0 にする(そのフェースは UV 無し)。
+    ``uv_ids`` の長さは ``uv_counts`` の合計と一致する。
+
+    Returns:
+        (u, v, uv_counts, uv_ids) すべて numpy 配列。
+    """
+    counts = np.asarray(face_vertex_counts, dtype=np.int64).reshape(-1)
+    uv = np.asarray(corner_uv, dtype=np.float32)
+    if uv.ndim != 2 or uv.shape[1] != 2:
+        uv = np.reshape(uv, (-1, 2)).astype(np.float32, copy=False)
+    n_face = int(counts.size)
+    n_corner = int(counts.sum()) if n_face else 0
+    if uv.shape[0] != n_corner:
+        raise ValueError("corner_uv の長さが face_vertex_counts と合いません")
+    uv_counts = np.zeros(n_face, dtype=np.int32)
+    empty_u = np.zeros((0,), dtype=np.float32)
+    empty_v = np.zeros((0,), dtype=np.float32)
+    empty_ids = np.zeros((0,), dtype=np.int32)
+    if n_face == 0 or n_corner == 0:
+        return empty_u, empty_v, uv_counts, empty_ids
+    finite = np.isfinite(uv).all(axis=1)
+    face_of = np.repeat(np.arange(n_face, dtype=np.int64), counts)
+    bad_faces = np.zeros(n_face, dtype=bool)
+    if np.any(~finite):
+        np.logical_or.at(bad_faces, face_of[~finite], True)
+    good_faces = ~bad_faces & (counts > 0)
+    uv_counts[good_faces] = counts[good_faces].astype(np.int32)
+    good_corners = good_faces[face_of]
+    good_uv = uv[good_corners]
+    if good_uv.shape[0] == 0:
+        return empty_u, empty_v, uv_counts, empty_ids
+    unique, inverse = np.unique(good_uv, axis=0, return_inverse=True)
+    return (
+        np.ascontiguousarray(unique[:, 0], dtype=np.float32),
+        np.ascontiguousarray(unique[:, 1], dtype=np.float32),
+        uv_counts,
+        np.ascontiguousarray(inverse, dtype=np.int32),
+    )
+
+
+def _snapshot_readable(snap) -> bool:
+    if snap is None:
+        return False
+    for attr in ("face_vertex_counts", "corner_vid", "corner_uv", "face_mesh", "meta"):
+        if not hasattr(snap, attr):
+            return False
+    meta = getattr(snap, "meta", None)
+    return isinstance(meta, dict) and isinstance(meta.get("mesh_uuids"), (list, tuple))
+
+
+def _same_topology(baseline, candidate) -> bool:
+    """配列としての完全一致。指紋は頂点列の巡回に不変なので使わない。"""
+    try:
+        if list(baseline.meta.get("mesh_uuids") or []) != list(candidate.meta.get("mesh_uuids") or []):
+            return False
+        pairs = (
+            (baseline.face_vertex_counts, candidate.face_vertex_counts),
+            (baseline.corner_vid, candidate.corner_vid),
+            (baseline.face_mesh, candidate.face_mesh),
+        )
+        for left, right in pairs:
+            if not np.array_equal(np.asarray(left), np.asarray(right)):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _uuid_key(value) -> str:
+    return str(value).casefold()
+
+
+def _mesh_uv_slice(snap, mesh_index):
+    """``face_mesh == mesh_index`` のフェースを、並びの順で切り出す。"""
+    counts = np.asarray(snap.face_vertex_counts, dtype=np.int64).reshape(-1)
+    face_mesh = np.asarray(snap.face_mesh).reshape(-1)
+    uv = np.asarray(snap.corner_uv, dtype=np.float32)
+    faces = np.flatnonzero(face_mesh == mesh_index)
+    if faces.size == 0:
+        return (
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0, 2), dtype=np.float32),
+        )
+    offsets = np.zeros(counts.size, dtype=np.int64)
+    if counts.size > 1:
+        offsets[1:] = np.cumsum(counts[:-1])
+    pieces = []
+    mesh_counts = []
+    for face_index in faces.tolist():
+        start = int(offsets[face_index])
+        count = int(counts[face_index])
+        mesh_counts.append(count)
+        pieces.append(uv[start:start + count])
+    mesh_uv = np.concatenate(pieces, axis=0) if pieces else np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(mesh_counts, dtype=np.int32), mesh_uv
+
+
+def plan_uvold(baseline_snapshot, candidate_snapshot, shape_uuid_by_path):
+    """旧 UV を載せる計画か、警告コード。
+
+    トポロジーは ``mesh_uuids``(順序を含む)・``face_vertex_counts``・
+    ``corner_vid``・``face_mesh`` の完全一致。UUID の集合は大文字小文字を
+    揃えて比べる。一致したらシェイプごとに基準のコーナー UV を切り出す。
+
+    Returns:
+        (plan, None) または (None, 警告コード)。
+        plan はシェイプパス → ``{"u","v","uv_counts","uv_ids"}``。
+    """
+    if not _snapshot_readable(baseline_snapshot) or not _snapshot_readable(candidate_snapshot):
+        return None, UVOLD_BASELINE_UNREADABLE
+    if not _same_topology(baseline_snapshot, candidate_snapshot):
+        return None, UVOLD_TOPOLOGY_MISMATCH
+    if not isinstance(shape_uuid_by_path, dict):
+        return None, UVOLD_UUID_UNRESOLVED
+    by_uuid = {}
+    for path, raw_uuid in shape_uuid_by_path.items():
+        if not isinstance(raw_uuid, str) or not raw_uuid:
+            return None, UVOLD_UUID_UNRESOLVED
+        key = _uuid_key(raw_uuid)
+        if key in by_uuid:
+            return None, UVOLD_UUID_UNRESOLVED
+        by_uuid[key] = path
+    uuids = list(candidate_snapshot.meta.get("mesh_uuids") or [])
+    folded = []
+    for raw in uuids:
+        if not isinstance(raw, str) or not raw:
+            return None, UVOLD_UUID_UNRESOLVED
+        folded.append(_uuid_key(raw))
+    if len(set(folded)) != len(folded) or set(folded) != set(by_uuid):
+        return None, UVOLD_UUID_UNRESOLVED
+    plan = {}
+    for mesh_index, key in enumerate(folded):
+        path = by_uuid[key]
+        mesh_counts, mesh_uv = _mesh_uv_slice(baseline_snapshot, mesh_index)
+        u_values, v_values, uv_counts, uv_ids = corner_uv_to_uv_arrays(mesh_counts, mesh_uv)
+        plan[path] = {
+            "u": u_values,
+            "v": v_values,
+            "uv_counts": uv_counts,
+            "uv_ids": uv_ids,
+        }
+    return plan, None
+
+
+def _empty_uvold_info():
+    return {"applied": False, "name": None, "warnings": [], "shapes": []}
+
+
+def _append_warning(info, code):
+    if code and code not in info["warnings"]:
+        info["warnings"].append(code)
+
+
+def _short_shape_name(shape) -> str:
+    text = str(shape).replace("\\", "/").rstrip("/")
+    if "|" in text:
+        text = text.split("|")[-1]
+    if "/" in text:
+        text = text.split("/")[-1]
+    return text or str(shape)
+
+
+def _as_name_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        names = []
+        for item in value:
+            if isinstance(item, str) and item:
+                names.append(item)
+        return names
+    return []
+
+
+def _as_current_name(value) -> str:
+    names = _as_name_list(value)
+    return names[0] if names else ""
+
+
+def _as_uuid_text(value) -> str:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _pause_undo_recording(cmds):
+    """記録だけ止める。キューは消さない。失敗したら (None, False)。
+
+    ``uvremap_runtime._without_undo`` と同じ考え方。import はしない。
+    契約に無い。仮: ``undoInfo`` が無い・失敗するときはそのまま進める。
+    """
+    undo_info = getattr(cmds, "undoInfo", None) if cmds is not None else None
+    if not callable(undo_info):
+        return None, False
+    try:
+        prev = undo_info(query=True, stateWithoutFlush=True)
+    except Exception:
+        return None, False
+    try:
+        undo_info(stateWithoutFlush=False)
+    except Exception:
+        return None, False
+    return prev, True
+
+
+def _restore_undo_recording(cmds, prev, stopped):
+    if not stopped or cmds is None:
+        return
+    undo_info = getattr(cmds, "undoInfo", None)
+    if not callable(undo_info):
+        return
+    try:
+        undo_info(stateWithoutFlush=prev)
+    except Exception:
+        pass
+
+
+def _resolve_cmds(cmds):
+    if cmds is not None:
+        return cmds
+    try:
+        import maya.cmds as cmds_mod
+    except Exception:
+        return None
+    return cmds_mod
+
+
+def _default_shape_uuid(cmds, shape):
+    found = cmds.ls(shape, uuid=True)
+    return _as_uuid_text(found)
+
+
+def _default_fill_uvs(cmds, shape, uv_set_name, u_values, v_values, uv_counts, uv_ids):
+    """OpenMaya 2 の ``setUVs`` / ``assignUVs``。Maya が無いときは例外。
+
+    要実機確認: UV エディタで基準記録時と同じに見えること。
+    """
+    import maya.api.OpenMaya as om
+
+    selection = om.MSelectionList()
+    selection.add(str(shape))
+    dag = selection.getDagPath(0)
+    try:
+        if dag.apiType() != om.MFn.kMesh:
+            dag.extendToShape()
+    except Exception:
+        pass
+    mesh_fn = om.MFnMesh(dag)
+    u_array = om.MFloatArray()
+    v_array = om.MFloatArray()
+    for value in np.asarray(u_values, dtype=np.float64).reshape(-1):
+        u_array.append(float(value))
+    for value in np.asarray(v_values, dtype=np.float64).reshape(-1):
+        v_array.append(float(value))
+    mesh_fn.setUVs(u_array, v_array, uv_set_name)
+    counts = om.MIntArray()
+    ids = om.MIntArray()
+    for value in np.asarray(uv_counts, dtype=np.int64).reshape(-1):
+        counts.append(int(value))
+    for value in np.asarray(uv_ids, dtype=np.int64).reshape(-1):
+        ids.append(int(value))
+    mesh_fn.assignUVs(counts, ids, uv_set_name)
+
+
+def _fill_available(fill_uvs_fn) -> bool:
+    if fill_uvs_fn is not _default_fill_uvs:
+        return True
+    try:
+        import maya.api.OpenMaya  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _query_uv_state(cmds, shape):
+    names = _as_name_list(cmds.polyUVSet(shape, query=True, allUVSets=True))
+    current = _as_current_name(cmds.polyUVSet(shape, query=True, currentUVSet=True))
+    return names, current
+
+
+def _set_current_uv(cmds, shape, uv_set_name):
+    cmds.polyUVSet(shape, currentUVSet=True, uvSet=uv_set_name)
+
+
+def _cleanup_created_uvolds(cmds, created, info):
+    """作ったセットだけ消す。1 つが失敗しても他は続ける。例外は握る。"""
+    if not created or cmds is None:
+        return
+
+    def _attempt(entry):
+        shape = entry["shape"]
+        name = entry["name"]
+        current0 = entry["current0"]
+        try:
+            _set_current_uv(cmds, shape, current0)
+        except Exception:
+            pass
+        try:
+            names = _as_name_list(cmds.polyUVSet(shape, query=True, allUVSets=True))
+        except Exception:
+            names = []
+        if name in names:
+            try:
+                cmds.polyUVSet(shape, delete=True, uvSet=name)
+            except Exception:
+                pass
+        try:
+            names_now, current_now = _query_uv_state(cmds, shape)
+        except Exception:
+            return False
+        return list(names_now) == list(entry["names0"]) and current_now == current0
+
+    for entry in created:
+        ok = False
+        try:
+            ok = _attempt(entry)
+            if not ok:
+                ok = _attempt(entry)
+        except Exception:
+            ok = False
+        if not ok:
+            _append_warning(info, UVOLD_CLEANUP_FAILED)
+            short = _short_shape_name(entry["shape"])
+            if short not in info["shapes"]:
+                info["shapes"].append(short)
+
+
+def _shape_uuid_map(shape_paths, cmds, uuid_fn):
+    mapping = {}
+    for shape in shape_paths:
+        if uuid_fn is None:
+            if cmds is None:
+                return None
+            raw = _default_shape_uuid(cmds, shape)
+        else:
+            raw = _as_uuid_text(uuid_fn(shape))
+        if not raw:
+            return None
+        mapping[shape] = raw
+    return mapping
+
+
+def export_rebase_mesh_with_uvold(
+    shape_paths,
+    meshes_dir,
+    baseline_id,
+    *,
+    triangulate=False,
+    baseline_snapshot=None,
+    candidate_snapshot=None,
+    cmds=None,
+    uuid_fn=None,
+    fill_uvs_fn=None,
+    export_fn=None,
+    mel_eval=None,
+    replace_fn=None,
+    remove_fn=None,
+    tmp_style=None,
+):
+    """旧 UV セットを一時的に付けて ``export_rebase_mesh`` を呼ぶ。
+
+    戻り値は ``(mesh_dict, uvold_info)``。``uvold_info`` に絶対パスは入れない。
+    旧 UV を付けられないときも書き出しは続ける。書き出しの例外は後始末のあと再送出する。
+
+    要実機確認: ``uvOld`` が FBX の 2 番目に並ぶこと、作成で現在セットが
+    切り替わっても戻ること、Undo キューが汚れないこと。
+    """
+    if export_fn is None:
+        export_fn = export_rebase_mesh
+    if fill_uvs_fn is None:
+        fill_uvs_fn = _default_fill_uvs
+    info = _empty_uvold_info()
+    created = []
+    cmds_api = _resolve_cmds(cmds)
+    undo_prev, undo_stopped = _pause_undo_recording(cmds_api)
+    try:
+        try:
+            _attach_uvold(
+                shape_paths,
+                baseline_snapshot,
+                candidate_snapshot,
+                cmds_api,
+                uuid_fn,
+                fill_uvs_fn,
+                info,
+                created,
+            )
+        except Exception:
+            # 計画や作成の失敗は警告にして書き出しへ進む。
+            if not info["warnings"]:
+                _append_warning(info, UVOLD_CREATE_FAILED)
+            _cleanup_created_uvolds(cmds_api, created, info)
+            created.clear()
+            info["applied"] = False
+        mesh = export_fn(
+            shape_paths,
+            meshes_dir,
+            baseline_id,
+            triangulate=triangulate,
+            mel_eval=mel_eval,
+            cmds=cmds,
+            replace_fn=replace_fn,
+            remove_fn=remove_fn,
+            tmp_style=tmp_style,
+        )
+        return mesh, info
+    finally:
+        try:
+            _cleanup_created_uvolds(cmds_api, created, info)
+        except Exception:
+            _append_warning(info, UVOLD_CLEANUP_FAILED)
+        created.clear()
+        _restore_undo_recording(cmds_api, undo_prev, undo_stopped)
+
+
+def _attach_uvold(
+    shape_paths,
+    baseline_snapshot,
+    candidate_snapshot,
+    cmds,
+    uuid_fn,
+    fill_uvs_fn,
+    info,
+    created,
+):
+    """旧 UV を付ける。失敗は info に警告を残して戻る。例外は作らない。"""
+    shapes = list(shape_paths or [])
+    if baseline_snapshot is None:
+        _append_warning(info, UVOLD_NO_BASELINE)
+        return
+    if (
+        candidate_snapshot is None
+        or not _snapshot_readable(baseline_snapshot)
+        or not _snapshot_readable(candidate_snapshot)
+    ):
+        _append_warning(info, UVOLD_BASELINE_UNREADABLE)
+        return
+    if not _same_topology(baseline_snapshot, candidate_snapshot):
+        _append_warning(info, UVOLD_TOPOLOGY_MISMATCH)
+        return
+    if cmds is None and uuid_fn is None:
+        _append_warning(info, UVOLD_CREATE_FAILED)
+        return
+    try:
+        uuid_map = _shape_uuid_map(shapes, cmds, uuid_fn)
+    except Exception:
+        uuid_map = None
+    if uuid_map is None:
+        if cmds is None and uuid_fn is None:
+            _append_warning(info, UVOLD_CREATE_FAILED)
+        else:
+            _append_warning(info, UVOLD_UUID_UNRESOLVED)
+        return
+    try:
+        plan, warning = plan_uvold(baseline_snapshot, candidate_snapshot, uuid_map)
+    except Exception:
+        plan, warning = None, UVOLD_BASELINE_UNREADABLE
+    if warning or not isinstance(plan, dict):
+        _append_warning(info, warning or UVOLD_BASELINE_UNREADABLE)
+        return
+    for shape in shapes:
+        if shape not in plan:
+            _append_warning(info, UVOLD_UUID_UNRESOLVED)
+            return
+    if cmds is None or not _fill_available(fill_uvs_fn):
+        _append_warning(info, UVOLD_CREATE_FAILED)
+        return
+    states = []
+    try:
+        for shape in shapes:
+            names0, current0 = _query_uv_state(cmds, shape)
+            states.append((shape, names0, current0))
+    except Exception:
+        _append_warning(info, UVOLD_CREATE_FAILED)
+        return
+    for _shape, names0, current0 in states:
+        if len(names0) != 1 or current0 not in names0:
+            _append_warning(info, UVOLD_MULTI_UV_SET)
+            return
+    name = choose_uvold_name({shape: names0 for shape, names0, _current in states})
+    info["name"] = name
+    try:
+        for shape, names0, current0 in states:
+            # 作成したと記録してから作る。途中で落ちても後始末が追える。
+            created.append({
+                "shape": shape,
+                "name": name,
+                "names0": list(names0),
+                "current0": current0,
+            })
+            try:
+                cmds.polyUVSet(shape, create=True, uvSet=name)
+            except Exception:
+                raise
+            entry = plan[shape]
+            try:
+                fill_uvs_fn(
+                    cmds, shape, name,
+                    entry["u"], entry["v"], entry["uv_counts"], entry["uv_ids"],
+                )
+            except Exception as exc:
+                try:
+                    _set_current_uv(cmds, shape, current0)
+                except Exception:
+                    pass
+                raise _UvOldFillError(str(exc)) from exc
+            try:
+                _set_current_uv(cmds, shape, current0)
+            except Exception as exc:
+                raise _UvOldFillError(str(exc)) from exc
+    except _UvOldFillError:
+        _append_warning(info, UVOLD_FILL_FAILED)
+        _cleanup_created_uvolds(cmds, created, info)
+        created.clear()
+        info["applied"] = False
+        return
+    except Exception:
+        _append_warning(info, UVOLD_CREATE_FAILED)
+        _cleanup_created_uvolds(cmds, created, info)
+        created.clear()
+        info["applied"] = False
+        return
+    info["applied"] = True
