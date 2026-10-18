@@ -9,7 +9,7 @@ Substance 3D Painter 側プラグイン(SP Live Sync, B案:自前パイプライ
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
 #
 # 変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import os
 import re
@@ -17,6 +17,7 @@ import json
 import copy
 import stat
 import time
+import uuid
 import shutil
 import hashlib
 import tempfile
@@ -75,6 +76,40 @@ _FINAL_EXPORT_MAX_RETRIES = 6            # 最大再試行回数(初回200ms+再
 # ユーザーが手動で再保存/「今すぐ全量同期」しなくても自己回復できる
 # ようにするための猶予。値は実機テストで調整可能。
 _FINAL_EXPORT_GIVEUP_FOLLOWUP_MS = 30000
+
+# 2026.10.18(1.3.0): 書き出し結果ファイルと、読み込んだメッシュの記録。
+# 結果ファイルは _sync_complete.flag と同じフォルダへ、印より先に書く。
+# 印の条件(1件以上移動したとき)と中身(time.time() の文字列)は変えない。
+# 読み手は印の mtime だけを見ている。
+SYNC_RESULT_NAME = "_sync_result.json"
+SYNC_FLAG_NAME = "_sync_complete.flag"
+EXPORT_RESULT_SCHEMA = 1
+EXPORT_MESSAGE_MAX_CHARS = 500
+# メッシュの sha1 は 1MB 単位で読む(_file_digest と同じチャンク)。
+# この大きさを超えるファイルは sha1 を null にする(「超える」なので
+# ちょうどこの大きさは計算する)。
+_HASH_CHUNK_BYTES = 1024 * 1024
+MESH_SHA1_MAX_BYTES = 1024 * 1024 * 1024
+# ProjectEditionEntered のあと、名前付き単発タイマーでメッシュを記録する
+# までの待ち(ミリ秒)。0 はイベントループの次の回。
+# この待ちで last_imported_mesh_path() が埋まるかは要実機確認。
+_MESH_RECORD_DELAY_MS = 0
+
+_EXPORT_STATUS_TOKENS = {
+    "success": "success",
+    "warning": "warning",
+    "error": "error",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "exception": "exception",
+}
+_EXPORT_STATUS_LABELS = {
+    "success": "成功",
+    "warning": "警告",
+    "error": "エラー",
+    "cancelled": "キャンセル",
+    "exception": "例外",
+}
 
 DEFAULT_CONFIG = {
     "staging_dir": "C:/SPMayaLiveSync/staging",
@@ -136,6 +171,11 @@ DEFAULT_CONFIG = {
     # セットでprefixを取り違える不具合の対策):
     #   { project_key: { texture_set_name: prefix文字列 } }
     "texture_set_export_prefix_by_project": {},
+    # 2026.10.18(1.3.0): Painter が今読み込んでいるメッシュ(G-03)。
+    # 後続のリベース(1.4.0)が、基準メッシュと突き合わせるために使う。
+    # { project_key: {path, size, mtime_ns, sha1, recorded_at, plugin_version} }
+    # 未保存プロジェクト(__unsaved__ 系)は記録しない。
+    "painter_mesh_by_project": {},
     # Phase 3: 初回セットアップウィザードを完了したかどうか。
     "setup_wizard_completed": False,
     # 2026.07.19-03(フェーズ2): 保存連打への対策として、前回のFinal
@@ -453,6 +493,286 @@ def save_config(cfg):
         _merge_and_write_config(cfg)
 
 
+def _update_nested_config_entry(top_key, sub_key, value):
+    """2026.10.18(1.3.0): ネストした辞書の 1 エントリだけを更新する。
+
+    save_config() はトップレベルの浅いマージなので、メモリ上の古い
+    painter_mesh_by_project を丸ごと渡すと、他プロジェクトの記録を
+    消す。ロックを持ったまま「ディスクから読む → 該当キーだけ変える
+    → 書く」を行う。読めないときは _merge_and_write_config() と同じく
+    保存を中断する。
+
+    戻り値: 書き込んだネスト辞書。中断したときは None。
+    """
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    def _apply():
+        merged = {}
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    merged = json.load(f)
+            except Exception as exc:
+                _log("error", "設定ファイルの読み込みに失敗したため保存を中断しました: {0}".format(exc))
+                return None
+            if not isinstance(merged, dict):
+                _log("error", "設定ファイルの最上位がオブジェクトではないため保存を中断しました。")
+                return None
+        existing = merged.get(top_key, {})
+        if existing is None:
+            existing = {}
+        if not isinstance(existing, dict):
+            _log("error", "設定 {0} がオブジェクトではないため保存を中断しました。".format(top_key))
+            return None
+        nested = dict(existing)
+        nested[sub_key] = copy.deepcopy(value)
+        merged[top_key] = nested
+        write_json_atomic(CONFIG_PATH, merged)
+        return nested
+
+    try:
+        with _config_file_lock():
+            return _apply()
+    except _ConfigLockTimeout as exc:
+        _log("warning", "{0} ロック無しで保存を続行します。".format(exc))
+        return _apply()
+
+
+def _status_token(status_obj):
+    """ExportStatus や文字列から比較用のトークンを取り出す。取れなければ None。"""
+    if isinstance(status_obj, str):
+        token = status_obj.strip()
+    else:
+        name = getattr(status_obj, "name", None)
+        if not isinstance(name, str) or not name.strip():
+            return None
+        token = name.strip()
+    if "." in token:
+        token = token.rsplit(".", 1)[-1]
+    return token.lower()
+
+
+def _match_known_export_status(status_obj):
+    """name が無いオブジェクトを、ExportStatus の各値との一致で判定する。
+    未知、または API が無いときは error。
+    """
+    try:
+        enum_cls = export.ExportStatus
+    except Exception:
+        return "error"
+    for attr, name in (
+        ("Success", "success"),
+        ("Warning", "warning"),
+        ("Error", "error"),
+        ("Cancelled", "cancelled"),
+    ):
+        member = getattr(enum_cls, attr, None)
+        if member is None:
+            continue
+        try:
+            if status_obj is member or status_obj == member:
+                return name
+        except Exception:
+            continue
+    return "error"
+
+
+def export_status_name(status_obj):
+    """2026.10.18(1.3.0): ExportStatus を結果ファイル用の文字列にする。
+
+    Success → success、Warning → warning、Error → error、
+    Cancelled → cancelled。Python の例外は呼び出し側が "exception" を
+    渡す。将来の未知の値は error。
+    """
+    token = _status_token(status_obj)
+    if token is None:
+        return _match_known_export_status(status_obj)
+    return _EXPORT_STATUS_TOKENS.get(token, "error")
+
+
+def export_status_label(status_name):
+    """画面とログに出す状態名。未知のトークンはそのまま出す。"""
+    return _EXPORT_STATUS_LABELS.get(status_name, status_name)
+
+
+def build_export_result(
+    plugin_version,
+    export_id,
+    kind,
+    force_full,
+    status,
+    message,
+    moved_count,
+    skipped_unchanged_count,
+    texture_sets,
+    flag_written,
+    started_at,
+    finished_at,
+    request_id=None,
+):
+    """2026.10.18(1.3.0): _sync_result.json (schema 1) の辞書を組み立てる。
+
+    ok は status が success のときだけ真。warning(一部失敗)は失敗。
+    message は 500 文字で切る。無ければ空文字。
+    texture_sets は実際に 1 ファイル以上置き換えた名前を昇順で並べる。
+    request_id は 1.4.0 のリベース用。1.3.0 の呼び出し側は null。
+    """
+    status_name = export_status_name(status)
+    if message is None:
+        text = ""
+    elif isinstance(message, str):
+        text = message
+    else:
+        text = str(message)
+    if len(text) > EXPORT_MESSAGE_MAX_CHARS:
+        text = text[:EXPORT_MESSAGE_MAX_CHARS]
+    names = []
+    seen = set()
+    for name in texture_sets or []:
+        if not isinstance(name, str) or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    names.sort()
+    return {
+        "schema": EXPORT_RESULT_SCHEMA,
+        "plugin_version": plugin_version,
+        "export_id": export_id,
+        "kind": kind,
+        "force_full": bool(force_full),
+        "status": status_name,
+        "ok": status_name == "success",
+        "message": text,
+        "moved_count": int(moved_count),
+        "skipped_unchanged_count": int(skipped_unchanged_count),
+        "texture_sets": names,
+        "flag_written": bool(flag_written),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "request_id": request_id,
+    }
+
+
+def write_json_atomic(path, obj):
+    """一時ファイルへ書いてから os.replace() で原子的に置き換える。
+    失敗したときは一時ファイルを残さない。
+    """
+    tmp_path = path + ".tmp"
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def write_sync_flag(flag_path):
+    """_sync_complete.flag を書く。中身は time.time() の文字列。
+
+    2026.07.24 と同じ「一時ファイル → os.replace()」。読み手は印の
+    mtime だけを見るので、中身の形式は変えない。
+    """
+    tmp_flag_path = flag_path + ".tmp"
+    with open(tmp_flag_path, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+    os.replace(tmp_flag_path, flag_path)
+
+
+def publish_export_outputs(dest_root, result_obj, write_flag):
+    """2026.10.18(1.3.0): 結果ファイルを先に書き、その後に印を書く。
+
+    write_flag が偽のときは印を書かない(1件も移動していないとき等、
+    従来の条件のまま)。結果ファイルの失敗はログに残して書き出しを
+    止めない。印の失敗は呼び出し元へ伝える。
+    """
+    result_path = os.path.join(dest_root, SYNC_RESULT_NAME)
+    try:
+        write_json_atomic(result_path, result_obj)
+    except Exception as exc:
+        _log("error", "書き出し結果ファイルの保存に失敗しました(書き出し自体は続行します): {0}".format(exc))
+    if write_flag:
+        write_sync_flag(os.path.join(dest_root, SYNC_FLAG_NAME))
+
+
+def _hash_file_hex(path, algorithm, chunk_size=_HASH_CHUNK_BYTES):
+    """ファイルをチャンク単位で読みながらハッシュする(_file_digest と同じ作法)。"""
+    hasher = hashlib.new(algorithm)
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def build_mesh_record(path, prev_record, now, max_hash_bytes=None):
+    """2026.10.18(1.3.0): 読み込んだメッシュ 1 件分の記録を作る。
+
+    path が空、またはファイルを stat できないときは None(記録しない。
+    既存の値は呼び出し側が消さない)。
+    size と mtime_ns が前回と同じなら sha1 を計算し直さない。
+    max_hash_bytes を超えるファイルは sha1 を null にする。
+    既定の上限は 1GB。テストは引数で小さくする。
+    """
+    if max_hash_bytes is None:
+        max_hash_bytes = MESH_SHA1_MAX_BYTES
+    if not isinstance(path, str) or path == "":
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    size = int(st.st_size)
+    try:
+        mtime_ns = int(st.st_mtime_ns)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    sha1 = None
+    reused = False
+    if isinstance(prev_record, dict):
+        if (prev_record.get("size") == size
+                and prev_record.get("mtime_ns") == mtime_ns
+                and "sha1" in prev_record):
+            sha1 = prev_record.get("sha1")
+            reused = True
+    if not reused:
+        if size > int(max_hash_bytes):
+            sha1 = None
+        else:
+            try:
+                sha1 = _hash_file_hex(path, "sha1")
+            except OSError:
+                return None
+    return {
+        "path": path,
+        "size": size,
+        "mtime_ns": mtime_ns,
+        "sha1": sha1,
+        "recorded_at": now,
+        "plugin_version": __version__,
+    }
+
+
+def _is_unsaved_project_key(key):
+    """未保存プロジェクトのキー(__unsaved__ 系、テンプレート .spt)なら真。"""
+    if not isinstance(key, str) or not key:
+        return True
+    if key == "__unsaved__" or key.startswith("__unsaved__"):
+        return True
+    if key.lower().endswith(".spt"):
+        return True
+    return False
+
+
 def _current_project_key():
     """現在のプロジェクトを一意に識別するキーを返す。
     未保存プロジェクトの場合は固定文字列を使う(この場合、複数の未保存
@@ -644,6 +964,20 @@ class LiveSyncEngine(QtCore.QObject):
         # し続けてしまう(無限ループ防止のガード)。
         self._final_export_giveup_followup_pending = False
 
+        # 2026.10.18(1.3.0): 直近の書き出しで実際に置き換えたファイル数。
+        # sync_count は、この値が 1 以上の書き出しが終わったときだけ増やす。
+        self._export_moved_count = 0
+        # last_imported_mesh_path が無い環境では、プロジェクトを開くたびに
+        # 同じ警告を出さない。
+        self._mesh_api_missing_logged = False
+
+        # 2026.10.18(1.3.0): プロジェクトを開いた直後に、読み込んだメッシュを
+        # 共有設定へ記録する。名前付き単発タイマーなので shutdown() から
+        # stop() できる(匿名の singleShot は終了処理と重なっても止められない)。
+        self._mesh_record_timer = QtCore.QTimer(self)
+        self._mesh_record_timer.setSingleShot(True)
+        self._mesh_record_timer.timeout.connect(self._on_mesh_record_timer)
+
         # 2026.07.19-01: shutdown() 後に上記タイマーが万一発火しても
         # 実処理へ進ませないための最終ガード(タイマーのstop()と合わせた
         # 二重の安全策)。
@@ -692,6 +1026,10 @@ class LiveSyncEngine(QtCore.QObject):
             pass
         try:
             self._final_export_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._mesh_record_timer.stop()
         except Exception:
             pass
 
@@ -830,7 +1168,8 @@ class LiveSyncEngine(QtCore.QObject):
 
         watch_subfolder_by_project/final_subfolder_by_project/
         known_texture_sets_by_project/texture_set_export_prefix_by_project
-        の4辞書について、old_key(暫定キー)のエントリが存在すれば
+        /painter_mesh_by_project
+        の辞書について、old_key(暫定キー)のエントリが存在すれば
         new_key(実プロジェクトの.sppパス)へ付け替える(old_keyのエントリは
         削除)。書き出し済みファイルそのものはフォルダ間で移動しない
         (移動は途中失敗時の一貫性が担保できず、Maya側のポーリングとも
@@ -846,6 +1185,9 @@ class LiveSyncEngine(QtCore.QObject):
             "final_subfolder_by_project",
             "known_texture_sets_by_project",
             "texture_set_export_prefix_by_project",
+            # 2026.10.18(1.3.0): 読み込んだメッシュの記録も暫定キーから
+            # 実プロジェクトのキーへ付け替える。
+            "painter_mesh_by_project",
         )
         update = {}
         migrated_any = False
@@ -907,6 +1249,12 @@ class LiveSyncEngine(QtCore.QObject):
             self._final_export_timer.stop()
         except Exception:
             pass
+        # 2026.10.18(1.3.0): 閉じたあとにメッシュ記録が走ると、閉じて
+        # いるプロジェクトのパスを書いてしまう。
+        try:
+            self._mesh_record_timer.stop()
+        except Exception:
+            pass
         self.final_pending_changed.emit(False)
         # Phase 3: プロジェクトが閉じられたので、Maya側に「今SPで開いている
         # プロジェクトは無い」ことを伝える。
@@ -937,6 +1285,78 @@ class LiveSyncEngine(QtCore.QObject):
         if self.enabled:
             self._missing_streak = {}
             self.check_texture_set_structure()
+        # 2026.10.18(1.3.0): 編集に入った直後はメッシュパスがまだ空の
+        # ことがあるため、名前付きタイマーで遅延して記録する。
+        # 未保存キーでは _record_painter_mesh() が何もしない。
+        # 待ち時間でパスが取れるかは要実機確認。
+        self._schedule_mesh_record()
+
+    def _schedule_mesh_record(self):
+        if self._shutting_down:
+            return
+        try:
+            self._mesh_record_timer.start(_MESH_RECORD_DELAY_MS)
+        except Exception as exc:
+            _log("warning", "メッシュ記録の予約に失敗しました: {0}".format(exc))
+
+    def _on_mesh_record_timer(self):
+        if self._shutting_down:
+            return
+        try:
+            self._record_painter_mesh()
+        except Exception as exc:
+            _log("warning", "読み込んだメッシュの記録に失敗しました(既存の記録は残します): {0}".format(exc))
+
+    def _record_painter_mesh(self):
+        """2026.10.18(1.3.0): Painter が読み込んでいるメッシュを共有設定へ書く。
+
+        パスは project.last_imported_mesh_path()(12.1.5 で存在を確認済み)。
+        関数が無い・例外・空文字のときは記録しない。既存の値も消さない。
+        未保存プロジェクト(__unsaved__ 系)では記録しない。
+        要実機確認: 12.0.0 にこの関数があるか、ProjectEditionEntered の
+        遅延後にパスが空でないか。
+        """
+        try:
+            if not project.is_open():
+                return
+        except Exception:
+            return
+        key = _current_project_key()
+        if _is_unsaved_project_key(key):
+            return
+        getter = getattr(project, "last_imported_mesh_path", None)
+        if not callable(getter):
+            if not self._mesh_api_missing_logged:
+                self._mesh_api_missing_logged = True
+                _log(
+                    "warning",
+                    "project.last_imported_mesh_path が無いため、読み込んだメッシュは"
+                    "記録しません。要実機確認: Painter 12.0.0 では未提供の可能性が"
+                    "あります(12.1.5 では存在を確認済み)。",
+                )
+            return
+        try:
+            mesh_path = getter()
+        except Exception as exc:
+            _log("warning", "読み込んだメッシュのパス取得に失敗したため記録しません(既存の記録は残します): {0}".format(exc))
+            return
+        if not isinstance(mesh_path, str) or mesh_path == "":
+            _log("info", "読み込んだメッシュのパスが空のため、記録しません。")
+            return
+        by_project = self.config.get("painter_mesh_by_project")
+        prev = by_project.get(key) if isinstance(by_project, dict) else None
+        try:
+            record = build_mesh_record(mesh_path, prev, time.time())
+        except Exception as exc:
+            _log("warning", "メッシュの記録を作れなかったため、既存の記録は残します: {0}".format(exc))
+            return
+        if record is None:
+            _log("warning", "メッシュファイルを記録できなかったため、既存の記録は残します。")
+            return
+        written = _update_nested_config_entry("painter_mesh_by_project", key, record)
+        if written is None:
+            return
+        self.config["painter_mesh_by_project"] = written
 
     # -- Phase 2: テクスチャセット構造の変化検出 -----------------------------
 
@@ -1177,9 +1597,12 @@ class LiveSyncEngine(QtCore.QObject):
         self.exporting_changed.emit(True)
         t0 = time.time()
         locked_error = None
+        # 2026.10.18(1.3.0): 同期回数は開始時ではなく、1件以上置き換えた
+        # 書き出しが終わったときに増やす。早期スキップ・キャンセル・
+        # 全部スキップでは増やさない。
+        self._export_moved_count = 0
         try:
             self._do_export(preview=preview, dirty_stack_ids=dirty_ids, force_full=force_full)
-            self.stats["sync_count"] += 1
         except sp_exception.ProjectError as e:
             self.stats["error_count"] += 1
             locked_error = e
@@ -1199,6 +1622,8 @@ class LiveSyncEngine(QtCore.QObject):
             # 「後処理はまだ続いている」ことをUI側が正しく把握できる
             # ようにする(_on_export_finished_uiのような明示的な完了通知
             # は、後処理が全て終わった後、finallyの最後で行う)。
+            if self._export_moved_count >= 1:
+                self.stats["sync_count"] += 1
             self.stats["last_duration_ms"] = int((time.time() - t0) * 1000)
             self.stats["last_sync_at"] = datetime.datetime.now().strftime("%H:%M:%S")
             self.stats_changed.emit(dict(self.stats))
@@ -1235,6 +1660,55 @@ class LiveSyncEngine(QtCore.QObject):
         if locked_error is not None and _on_project_locked is not None:
             _on_project_locked(locked_error)
 
+    def _export_status_of(self, result):
+        """ExportStatus を結果ファイル用の名前にする。
+
+        2026.10.18(1.3.0): 名前が取れるときは export_status_name()。
+        既存の ExportStatus との == が取れたときはそちらを優先する
+        (従来のキャンセル・成功判定と同じ)。未知は error。
+        """
+        status_obj = getattr(result, "status", None)
+        status_name = export_status_name(status_obj)
+        try:
+            if status_obj == export.ExportStatus.Cancelled:
+                return "cancelled"
+            if status_obj == export.ExportStatus.Success:
+                return "success"
+            if status_obj == export.ExportStatus.Warning:
+                return "warning"
+            if status_obj == export.ExportStatus.Error:
+                return "error"
+        except Exception:
+            pass
+        return status_name
+
+    def _emit_export_outcome(self, preview, ok, status_name, moved_count, export_config, force_full):
+        """完了文は ok のときだけ出す。件数は置き換えたファイル数。
+
+        2026.10.18(1.3.0): Warning などは失敗として「完了しませんでした」
+        と出す。プレビューの完了文は、従来どおり 1 件以上動いた成功時だけ。
+        """
+        label = export_status_label(status_name)
+        if preview:
+            if ok and moved_count >= 1:
+                self._emit_status("プレビュー同期完了({0}件更新)".format(moved_count))
+            elif not ok:
+                self._emit_status("プレビュー同期は完了しませんでした(状態: {0})。".format(label))
+            return
+        if ok:
+            set_count = 0
+            if isinstance(export_config, dict):
+                set_count = len(export_config.get("exportList", []))
+            self._emit_status(
+                "フル解像度の最終書き出しが完了しました({0}件、対象{1}テクスチャセット、{2})。".format(
+                    moved_count,
+                    set_count,
+                    "全量" if (force_full or not self.final_baseline_established) else "差分",
+                )
+            )
+            return
+        self._emit_status("最終書き出しは完了しませんでした(状態: {0})。".format(label))
+
     def _do_export(self, preview=True, dirty_stack_ids=None, force_full=False):
         cfg = self.config
 
@@ -1246,6 +1720,9 @@ class LiveSyncEngine(QtCore.QObject):
         # このスナップショットを差し戻す(取りこぼしを防ぐため)。
         final_dirty_snapshot = None
         final_export_succeeded = False
+        # 2026.10.18(1.3.0): 呼び出し直下でも 0 から始める。早期スキップは
+        # ファイルを置かないので、この 0 のまま _safe_export へ戻る。
+        self._export_moved_count = 0
         if not preview:
             final_dirty_snapshot = set(self.dirty_stack_ids_final)
             self.dirty_stack_ids_final = set()
@@ -1314,141 +1791,199 @@ class LiveSyncEngine(QtCore.QObject):
                 cfg["final_subfolder_by_project"] = final_by_project
                 save_config({"final_subfolder_by_project": final_by_project})
         stage_root = cfg["staging_dir"]
-        os.makedirs(stage_root, exist_ok=True)
-        os.makedirs(dest_root, exist_ok=True)
-
-        tmp_dir = tempfile.mkdtemp(prefix="sp_live_", dir=stage_root)
-        # Phase 3: 実際に書き出したファイル名から、テクスチャセット名 ->
-        # ファイル名prefix の対応を逆算して記録する(_safe_name() による
-        # Maya側の予測とのズレを無くすため)。
-        export_prefix_updates = {}
+        # 2026.10.18(1.3.0): ここまでで dest_root は決まっている。
+        # これより前の失敗(変更なしスキップ、フォルダ名の計算前)では
+        # 結果ファイルを書かない。ここから先の成功・Warning・Error・
+        # キャンセル・例外では、印と同じフォルダへ _sync_result.json を
+        # 書く。印を書く条件(1件以上移動)と中身は変えない。結果ファイル
+        # を印より先に書く。要実機確認: Maya 側が印の mtime を見た時点で
+        # 結果ファイルが読めているか。
+        moved_count = 0
+        skipped_unchanged_count = 0
+        replaced_texture_sets = set()
+        tmp_dir = None
+        started_at = time.time()
+        export_id = uuid.uuid4().hex
+        export_config = {}
+        outcome_status = "exception"
+        outcome_message = ""
+        error = None
+        published = False
         try:
-            export_config = self._build_export_config(
-                tmp_dir, preview, dirty_stack_ids, final_dirty_snapshot, force_full)
-            result = export.export_project_textures(export_config)
+            os.makedirs(stage_root, exist_ok=True)
+            os.makedirs(dest_root, exist_ok=True)
 
-            if result.status == export.ExportStatus.Cancelled:
-                self._emit_status("書き出しがキャンセルされました。")
-                return
-            if result.status != export.ExportStatus.Success:
-                self._emit_status("書き出しステータス: {0}".format(result.message))
+            tmp_dir = tempfile.mkdtemp(prefix="sp_live_", dir=stage_root)
+            # Phase 3: 実際に書き出したファイル名から、テクスチャセット名 ->
+            # ファイル名prefix の対応を逆算して記録する(_safe_name() による
+            # Maya側の予測とのズレを無くすため)。
+            export_prefix_updates = {}
+            try:
+                export_config = self._build_export_config(
+                    tmp_dir, preview, dirty_stack_ids, final_dirty_snapshot, force_full)
+                result = export.export_project_textures(export_config)
+                status_name = self._export_status_of(result)
+                raw_message = getattr(result, "message", None)
+                if isinstance(raw_message, str):
+                    message = raw_message
+                elif raw_message is None:
+                    message = ""
+                else:
+                    message = str(raw_message)
 
-            moved_any = False
-            for key_tuple, files in result.textures.items():
-                # result.textures のキーは (テクスチャセット名, スタック名)
-                # のタプル(Painter公式APIドキュメントで確認済み)。
-                texture_set_name = None
-                if isinstance(key_tuple, (tuple, list)) and key_tuple:
-                    texture_set_name = key_tuple[0]
-                for src in files:
-                    if not os.path.isfile(src):
-                        continue
-                    dest = os.path.join(dest_root, os.path.basename(src))
-                    if self._unchanged(src, dest):
-                        self.stats["skip_count"] += 1
-                        continue
-                    try:
-                        # os.replace()はWindows上で上書きも原子的に行うため、
-                        # 直前にos.remove(dest)する必要は無い(それを行うと
-                        # destが一瞬存在しない窓ができ、Maya側のポーリングが
-                        # 「消えた」と誤認する余地を作ってしまう)。
-                        os.replace(src, dest)
-                        moved_any = True
-                    except OSError:
-                        # 2026.07.24(緊急バグ修正): ステージングと監視/Final
-                        # フォルダが別ボリューム(共有PCでネットワークドライブを
-                        # 指定する運用等)の場合、os.replace()はクロスデバイス
-                        # エラーでOSErrorを送出する。従来はここで直接destへ
-                        # shutil.copyfile()していたため、Maya側のポーリングが
-                        # 書き込み途中のファイル(torn read)を読む可能性が
-                        # あった。dest と同じディレクトリに一時ファイルとして
-                        # コピーしてから os.replace() で置き換えることで、
-                        # 同一ボリューム内のrenameとして常に原子的にする。
-                        tmp_dest = dest + ".tmp"
-                        shutil.copyfile(src, tmp_dest)
-                        os.replace(tmp_dest, dest)
-                        os.remove(src)
-                        moved_any = True
+                if status_name == "cancelled":
+                    self._emit_status("書き出しがキャンセルされました。")
+                else:
+                    if status_name != "success":
+                        self._emit_status("書き出しステータス: {0}".format(result.message))
 
-                    if texture_set_name and preview:
-                        base = os.path.basename(dest)
-                        for suffix in CHANNEL_SUFFIXES:
-                            marker = "_{0}.".format(suffix)
-                            if marker in base:
-                                export_prefix_updates[texture_set_name] = base.split(marker)[0]
-                                break
+                    for key_tuple, files in result.textures.items():
+                        # result.textures のキーは (テクスチャセット名, スタック名)
+                        # のタプル(Painter公式APIドキュメントで確認済み)。
+                        texture_set_name = None
+                        if isinstance(key_tuple, (tuple, list)) and key_tuple:
+                            texture_set_name = key_tuple[0]
+                        replaced_this_set = False
+                        for src in files:
+                            if not os.path.isfile(src):
+                                continue
+                            dest = os.path.join(dest_root, os.path.basename(src))
+                            if self._unchanged(src, dest):
+                                self.stats["skip_count"] += 1
+                                skipped_unchanged_count += 1
+                                continue
+                            try:
+                                # os.replace()はWindows上で上書きも原子的に行うため、
+                                # 直前にos.remove(dest)する必要は無い(それを行うと
+                                # destが一瞬存在しない窓ができ、Maya側のポーリングが
+                                # 「消えた」と誤認する余地を作ってしまう)。
+                                os.replace(src, dest)
+                            except OSError:
+                                # 2026.07.24(緊急バグ修正): ステージングと監視/Final
+                                # フォルダが別ボリューム(共有PCでネットワークドライブを
+                                # 指定する運用等)の場合、os.replace()はクロスデバイス
+                                # エラーでOSErrorを送出する。従来はここで直接destへ
+                                # shutil.copyfile()していたため、Maya側のポーリングが
+                                # 書き込み途中のファイル(torn read)を読む可能性が
+                                # あった。dest と同じディレクトリに一時ファイルとして
+                                # コピーしてから os.replace() で置き換えることで、
+                                # 同一ボリューム内のrenameとして常に原子的にする。
+                                tmp_dest = dest + ".tmp"
+                                shutil.copyfile(src, tmp_dest)
+                                os.replace(tmp_dest, dest)
+                                os.remove(src)
+                            moved_count += 1
+                            replaced_this_set = True
 
-            if export_prefix_updates:
-                # 2026.07.15-01: 別プロジェクトの同名テクスチャセットに
-                # prefixを取り違えて上書きしないよう、プロジェクトキーで
-                # ネストした構造(texture_set_export_prefix_by_project)に
-                # 保存する。
-                project_key = _current_project_key()
-                prefix_by_project = dict(self.config.get("texture_set_export_prefix_by_project", {}))
-                current_map = dict(prefix_by_project.get(project_key, {}))
-                if any(current_map.get(k) != v for k, v in export_prefix_updates.items()):
-                    current_map.update(export_prefix_updates)
-                    prefix_by_project[project_key] = current_map
-                    self.config["texture_set_export_prefix_by_project"] = prefix_by_project
-                    save_config({"texture_set_export_prefix_by_project": prefix_by_project})
+                            if texture_set_name and preview:
+                                base = os.path.basename(dest)
+                                for suffix in CHANNEL_SUFFIXES:
+                                    marker = "_{0}.".format(suffix)
+                                    if marker in base:
+                                        export_prefix_updates[texture_set_name] = base.split(marker)[0]
+                                        break
+                        if replaced_this_set and isinstance(texture_set_name, str) and texture_set_name:
+                            replaced_texture_sets.add(texture_set_name)
 
-            if preview:
-                if moved_any:
-                    # 2026.07.24(緊急バグ修正): 直接flag_pathへ"w"で開くと
-                    # 書き込み開始時点で0バイトへtruncateされるため、
-                    # Maya側のポーリングが読み取りタイミング次第で空/
-                    # 途中のファイルを読む可能性があった(他の書き込み箇所
-                    # と違い、ここだけ非原子的だった)。save_config()と
-                    # 同じ「一時ファイル→os.replace()」パターンに揃える。
-                    flag_path = os.path.join(dest_root, "_sync_complete.flag")
-                    tmp_flag_path = flag_path + ".tmp"
-                    with open(tmp_flag_path, "w", encoding="utf-8") as f:
-                        f.write(str(time.time()))
-                    os.replace(tmp_flag_path, flag_path)
-                    self._emit_status("プレビュー同期完了({0}件更新)".format(
-                        sum(len(v) for v in result.textures.values())
-                    ))
-            else:
-                # Maya側がFinalフォルダの更新を検知できるよう、こちらにも
-                # 同期完了フラグを書き込む(以前はpreview時にしか書いて
-                # おらず、表示品質をFinalにしたままだと新しい高画質版が
-                # 自動反映されない不具合があったため追加)。
-                if moved_any:
-                    # 2026.07.24(緊急バグ修正): 直接flag_pathへ"w"で開くと
-                    # 書き込み開始時点で0バイトへtruncateされるため、
-                    # Maya側のポーリングが読み取りタイミング次第で空/
-                    # 途中のファイルを読む可能性があった(他の書き込み箇所
-                    # と違い、ここだけ非原子的だった)。save_config()と
-                    # 同じ「一時ファイル→os.replace()」パターンに揃える。
-                    flag_path = os.path.join(dest_root, "_sync_complete.flag")
-                    tmp_flag_path = flag_path + ".tmp"
-                    with open(tmp_flag_path, "w", encoding="utf-8") as f:
-                        f.write(str(time.time()))
-                    os.replace(tmp_flag_path, flag_path)
-                # 2026.07.19-01: クラッシュとの相関を後から検証しやすい
-                # よう、Preview側と同様に書き出し件数をログへ残す
-                # (所要時間は _safe_export() 側で stats に記録済みで、
-                # 履歴ログには _emit_status() 経由で別途出力される)。
-                self._emit_status("フル解像度の最終書き出しが完了しました({0}件、対象{1}テクスチャセット、{2})。".format(
-                    sum(len(v) for v in result.textures.values()),
-                    len(export_config.get("exportList", [])),
-                    "全量" if (force_full or not self.final_baseline_established) else "差分",
-                ))
+                    if export_prefix_updates:
+                        # 2026.07.15-01: 別プロジェクトの同名テクスチャセットに
+                        # prefixを取り違えて上書きしないよう、プロジェクトキーで
+                        # ネストした構造(texture_set_export_prefix_by_project)に
+                        # 保存する。
+                        project_key = _current_project_key()
+                        prefix_by_project = dict(self.config.get("texture_set_export_prefix_by_project", {}))
+                        current_map = dict(prefix_by_project.get(project_key, {}))
+                        if any(current_map.get(k) != v for k, v in export_prefix_updates.items()):
+                            current_map.update(export_prefix_updates)
+                            prefix_by_project[project_key] = current_map
+                            self.config["texture_set_export_prefix_by_project"] = prefix_by_project
+                            save_config({"texture_set_export_prefix_by_project": prefix_by_project})
+
+                outcome_status = status_name
+                outcome_message = message
+            except Exception as exc:
+                error = exc
+                outcome_status = "exception"
+                outcome_message = "{0}".format(exc)
+
+            # 印より先に結果ファイル。印は 1 件以上移動した通常終了のときだけ。
+            # 例外のときは印を書かない(従来、例外は印の前で抜けていた)。
+            finished_at = time.time()
+            write_flag = error is None and moved_count >= 1
+            result_obj = build_export_result(
+                __version__,
+                export_id,
+                "preview" if preview else "final",
+                bool(force_full),
+                outcome_status,
+                outcome_message,
+                moved_count,
+                skipped_unchanged_count,
+                replaced_texture_sets,
+                write_flag,
+                started_at,
+                finished_at,
+                None,
+            )
+            publish_export_outputs(dest_root, result_obj, write_flag)
+            published = True
+            ok = bool(result_obj.get("ok"))
+            self._emit_export_outcome(
+                preview, ok, result_obj.get("status") or outcome_status,
+                moved_count, export_config, force_full,
+            )
+            if error is None and ok and not preview:
                 # 2026.07.19-03(フェーズ2): 成功したのでbaselineを確立
                 # (または再確立)し、次回以降の差分書き出しを有効にする。
+                # 2026.10.18(1.3.0): ok(status が success)のときだけ。
+                # Warning / Error では差し戻しが働くよう、ここを通さない。
                 final_export_succeeded = True
                 self.final_baseline_established = True
                 self._last_final_completed_at = time.time()
                 self._final_export_force_full = False
                 self.final_pending_changed.emit(False)
+            if error is not None:
+                raise error
+        except Exception as exc:
+            # makedirs や印の書き込みなど、上の結果ファイルを書く前に
+            # 落ちたときも、dest_root が決まっていれば結果を残す。
+            # すでに書いたあとの再送出では上書きしない。
+            if not published:
+                try:
+                    publish_export_outputs(
+                        dest_root,
+                        build_export_result(
+                            __version__,
+                            export_id,
+                            "preview" if preview else "final",
+                            bool(force_full),
+                            "exception",
+                            "{0}".format(exc),
+                            moved_count,
+                            skipped_unchanged_count,
+                            replaced_texture_sets,
+                            False,
+                            started_at,
+                            time.time(),
+                            None,
+                        ),
+                        False,
+                    )
+                except Exception as write_exc:
+                    _log("error", "書き出し結果ファイルの保存に失敗しました(書き出し自体は続行します): {0}".format(write_exc))
+                self._emit_export_outcome(
+                    preview, False, "exception", moved_count, export_config, force_full)
+            raise
         finally:
+            self._export_moved_count = moved_count
             if not preview and not final_export_succeeded and final_dirty_snapshot:
-                # 失敗した(例外・キャンセル)ので、今回対象にしていた
-                # 差分を失わないよう差し戻す。書き出し中に新たに積まれた
-                # 分(finally節実行時点のself.dirty_stack_ids_final)は
+                # 失敗した(例外・キャンセル・Warning・Error)ので、今回対象に
+                # していた差分を失わないよう差し戻す。書き出し中に新たに
+                # 積まれた分(finally節実行時点のself.dirty_stack_ids_final)は
                 # そのまま残し、そこへ合流させる。
                 self.dirty_stack_ids_final |= final_dirty_snapshot
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # 2026.07.19-04(フェーズ3: 一般的な軽量化)
     _HASH_CHUNK_SIZE = 1024 * 1024  # 1MB単位で読みながらハッシュを更新する
