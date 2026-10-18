@@ -122,6 +122,15 @@ TOOL_FILES = [
     {"name": "maya_live_sync.py", "required": True},
     {"name": "sp_to_aiStandardSurface.py", "required": False},
     {"name": "udim_setup.py", "required": False},
+    {"name": "uvremap_core.py", "required": False},
+    {"name": "uvremap_io.py", "required": False},
+    {"name": "uvremap_worker.py", "required": False},
+    {"name": "uvremap_bridge.py", "required": False},
+    {"name": "uvremap_maya.py", "required": False},
+    {"name": "uvremap_runtime.py", "required": False},
+    {"name": "uvremap_panel.py", "required": False},
+    {"name": "uvremap_integration.py", "required": False},
+    {"name": "uvremap_follow.py", "required": False},
 ]
 
 # --- シェルフアイコン画像(任意) --------------------------------------------
@@ -478,6 +487,12 @@ def _destroy_stale_livesync_window():
             except Exception as e:
                 _diag["scene_callbacks_unregister_error"] = str(e)
                 print("[Live Sync Installer] Could not unregister scene callbacks: {0}".format(e))
+            try:
+                uvremap = getattr(window, "_uvremap", None)
+                if uvremap is not None:
+                    uvremap.shutdown()
+            except Exception:
+                pass
             # 安全策: watcher(project_poll_timer/fs_watcher等)はQtの親子
             # 関係(LiveSyncWatcher(self))により、親ウィジェット破棄時に
             # 連動して破棄されるのが期待される標準動作だが、

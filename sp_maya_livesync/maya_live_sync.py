@@ -42,6 +42,22 @@ except ImportError:
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
 
 
+# UV再マップ中に飛ばしたノードの注記。Maya の API には依存しない
+# (テストはモジュールを import せず、この定義だけを実行する)。
+MSG_UVREMAP_SKIPPED_FMT = (
+    "UV再マップで切り替え中のノードが {n} 件あるため、それらは更新していません。"
+    "Painter の変更を反映するには、UV再マップ欄で『今すぐ変換』を押すか、"
+    "『原本に戻す』を押してください。"
+)
+
+
+def _uvremap_skip_note(skipped_count):
+    """UV再マップ中のため飛ばしたノード数の注記。0 以下なら空文字。"""
+    if type(skipped_count) is not int or skipped_count <= 0:
+        return ""
+    return MSG_UVREMAP_SKIPPED_FMT.format(n=skipped_count)
+
+
 # --- [DIAG-B2] -------------------------------------------------------------
 # B-2仮説(シーン⇔SPプロジェクト不一致による自動停止)の切り分け用ログの
 # 表示/非表示切り替え。仮説の再現性確認自体はまだ済んでいないため計装は
@@ -109,7 +125,7 @@ def diag_c1_check_qobject_validity(window):
 #  ここを更新すること。
 #
 #  変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.6.3"
+__version__ = "1.7.1"
 
 # ウィンドウのobjectNameと、Mayaがそこから自動生成するworkspaceControl名。
 # 「WorkspaceControl」というsuffixはMaya側の仕様(objectName + "WorkspaceControl")
@@ -262,6 +278,11 @@ DEFAULT_CONFIG = {
     # 内での紐付けをここにも保持しておく(セッション内フォールバック用)。
     # 恒久的な紐付けは常にシーンファイル側(fileInfo)を正とする。
     "last_scene_project_links": {},
+    # UV再マップ(試験運用)。既定OFF。Painter側と共有する設定ファイルへ
+    # 追加するキー。save_config() はディスク上の他キーを消さない。
+    "uvremap_enabled": False,
+    "uvremap_root_dir": "C:/SPMayaLiveSync/uvremap",
+    "uvremap_mayapy_path": "",
 }
 
 # Phase 3: file ノードのcolorSpaceに設定する値の候補。カラーマネジメント
@@ -2743,6 +2764,8 @@ class LiveSyncWatcher(QtCore.QObject):
 
         file_nodes = cmds.ls(type="file") or []
         if not file_nodes:
+            if getattr(self, "_uvremap_skip_noted_count", None) is not None:
+                self._uvremap_skip_noted_count = None
             self._emit_status("シーン内に file ノードが見つかりません。")
             return
 
@@ -2760,8 +2783,15 @@ class LiveSyncWatcher(QtCore.QObject):
         prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
         corrected = []
+        uvremap_skipped = set()
         try:
             for node in file_nodes:
+                try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        uvremap_skipped.add(node)
+                        continue
+                except Exception:
+                    pass
                 try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
@@ -2831,13 +2861,24 @@ class LiveSyncWatcher(QtCore.QObject):
                     "現在のフォルダへ参照先を補正しました。".format(len(corrected))
                 )
 
+            # UV再マップ中のノードは更新しない(判定は上の continue のまま)。
+            # プレビュー同期のたびに同じ注記を出さない。件数が変わったときだけ
+            # 付け、0 に戻ったら記録を消す。
+            skipped_count = len(uvremap_skipped)
+            if skipped_count <= 0 and getattr(self, "_uvremap_skip_noted_count", None) is not None:
+                self._uvremap_skip_noted_count = None
+
             if reloaded:
                 self._flush_with_settle(reloaded)
                 self.stats["reload_count"] += 1
                 self.stats["last_reload_at"] = _now()
                 self.stats["last_node_count"] = len(reloaded)
                 self.stats_changed.emit(dict(self.stats))
-                self._emit_status("{0} 個のテクスチャを再読込しました。".format(len(reloaded)))
+                status = "{0} 個のテクスチャを再読込しました。".format(len(reloaded))
+                if skipped_count > 0 and getattr(self, "_uvremap_skip_noted_count", None) != skipped_count:
+                    status += _uvremap_skip_note(skipped_count)
+                    self._uvremap_skip_noted_count = skipped_count
+                self._emit_status(status)
             elif not any(self.quality_by_project.values()):
                 # Phase 6: 高画質表示中のプロジェクトがある場合、そのぶんの
                 # file ノードは監視フォルダを参照していないのが正常な状態
@@ -2847,7 +2888,11 @@ class LiveSyncWatcher(QtCore.QObject):
                 # 「シーン内のどれか1つでもFinal表示中のプロジェクトが
                 # あるか」を緩い近似として使う(全プロジェクトがPreviewの
                 # 時だけこのログを出す)。
-                self._emit_status("監視フォルダを参照する file ノードが見つかりませんでした。")
+                if skipped_count > 0:
+                    self._emit_status(_uvremap_skip_note(skipped_count))
+                    self._uvremap_skip_noted_count = skipped_count
+                else:
+                    self._emit_status("監視フォルダを参照する file ノードが見つかりませんでした。")
         finally:
             cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
@@ -2937,8 +2982,15 @@ class LiveSyncWatcher(QtCore.QObject):
         prev_undo_state = cmds.undoInfo(query=True, stateWithoutFlush=True)
         cmds.undoInfo(stateWithoutFlush=True)
         corrected = []
+        uvremap_skipped = set()
         try:
             for node in file_nodes:
+                try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        uvremap_skipped.add(node)
+                        continue
+                except Exception:
+                    pass
                 try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
@@ -2998,7 +3050,14 @@ class LiveSyncWatcher(QtCore.QObject):
                 self.stats["last_reload_at"] = _now()
                 self.stats["last_node_count"] = len(reloaded)
                 self.stats_changed.emit(dict(self.stats))
-                self._emit_status("{0} 個の高画質(Final)テクスチャを再読込しました。".format(len(reloaded)))
+                status = "{0} 個の高画質(Final)テクスチャを再読込しました。".format(len(reloaded))
+                if uvremap_skipped:
+                    status += _uvremap_skip_note(len(uvremap_skipped))
+                self._emit_status(status)
+            elif uvremap_skipped:
+                # 「見つかりませんでした」に相当するログは元々無い。
+                # 再読込 0 件で UV再マップ中のノードだけを飛ばしたときは、その注記だけ出す。
+                self._emit_status(_uvremap_skip_note(len(uvremap_skipped)))
         finally:
             cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
@@ -3951,7 +4010,14 @@ class LiveSyncWatcher(QtCore.QObject):
             return 0
 
         nodes = []
+        uvremap_skipped = set()
         for node in cmds.ls(type="file") or []:
+            try:
+                if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                    uvremap_skipped.add(node)
+                    continue
+            except Exception:
+                pass
             try:
                 tex_path = cmds.getAttr(node + ".fileTextureName")
             except Exception:
@@ -3976,6 +4042,12 @@ class LiveSyncWatcher(QtCore.QObject):
             managed_dirs_all = self._managed_dirs()
             for node in cmds.ls(type="file") or []:
                 try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        uvremap_skipped.add(node)
+                        continue
+                except Exception:
+                    pass
+                try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
                     continue
@@ -3987,11 +4059,14 @@ class LiveSyncWatcher(QtCore.QObject):
                     nodes.append(node)
 
         if not nodes:
-            self._emit_status(
-                "切り替え対象の file ノードが見つかりませんでした"
-                "(選択中の作業対象が参照している監視フォルダ・Finalフォルダの"
-                "いずれのノードもありません)。"
-            )
+            if uvremap_skipped:
+                self._emit_status(_uvremap_skip_note(len(uvremap_skipped)))
+            else:
+                self._emit_status(
+                    "切り替え対象の file ノードが見つかりませんでした"
+                    "(選択中の作業対象が参照している監視フォルダ・Finalフォルダの"
+                    "いずれのノードもありません)。"
+                )
             return 0
 
         switched = []
@@ -4003,6 +4078,12 @@ class LiveSyncWatcher(QtCore.QObject):
         cmds.undoInfo(stateWithoutFlush=True)
         try:
             for node in nodes:
+                try:
+                    if cmds.attributeQuery("uvremapOriginalPath", node=node, exists=True):
+                        uvremap_skipped.add(node)
+                        continue
+                except Exception:
+                    pass
                 try:
                     tex_path = cmds.getAttr(node + ".fileTextureName")
                 except Exception:
@@ -4041,6 +4122,7 @@ class LiveSyncWatcher(QtCore.QObject):
         finally:
             cmds.undoInfo(stateWithoutFlush=prev_undo_state)
 
+        note = _uvremap_skip_note(len(uvremap_skipped))
         if switched or already:
             self._flush_with_settle(switched)
             normalized_key = _normalize_project_key_for_compare(project_key) if project_key else None
@@ -4057,23 +4139,25 @@ class LiveSyncWatcher(QtCore.QObject):
                 self.quality_by_project[normalized_key] = use_final
             label = "高画質版(Final)" if use_final else "リアルタイムプレビュー"
             if switched and already:
-                self._emit_status(
-                    "{0} 個のノードを{1}に切り替えました({2} 個は既にこの状態でした)。".format(
-                        len(switched), label, already
-                    )
+                done = "{0} 個のノードを{1}に切り替えました({2} 個は既にこの状態でした)。".format(
+                    len(switched), label, already
                 )
             elif switched:
-                self._emit_status("{0} 個のノードを{1}に切り替えました。".format(len(switched), label))
+                done = "{0} 個のノードを{1}に切り替えました。".format(len(switched), label)
             else:
-                self._emit_status("{0} 個のノードは既に{1}でした。".format(already, label))
+                done = "{0} 個のノードは既に{1}でした。".format(already, label)
+            self._emit_status(done + note)
         if missing:
             hint = "SP側でプロジェクトを保存すると高画質版が生成されます。" if use_final else ""
             shown = ", ".join(missing[:5]) + ("..." if len(missing) > 5 else "")
-            self._emit_status(
-                "{0} 件は切り替え先に画像が見つからなかったため据え置きました({1})。{2}".format(
-                    len(missing), shown, hint
-                )
+            missing_msg = "{0} 件は切り替え先に画像が見つからなかったため据え置きました({1})。{2}".format(
+                len(missing), shown, hint
             )
+            if not (switched or already):
+                missing_msg += note
+            self._emit_status(missing_msg)
+        elif note and not (switched or already):
+            self._emit_status(note)
         return len(switched) + already
 
     def create_shader_network(self, texture_set_name, channels=None, project_key=None):
@@ -4864,6 +4948,17 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         stats_layout.addRow("これまでの反映回数", self.reload_count_label)
         stats_layout.addRow("直近で反映したテクスチャ数", self.node_count_label)
         layout.addWidget(stats_group)
+
+        self._uvremap = None
+        try:
+            import uvremap_integration
+            self._uvremap = uvremap_integration.attach(self, layout)
+        except Exception:
+            self._uvremap = None
+            _append_history(
+                "uvremap",
+                "UV再マップ欄の組み込みに失敗しました。Live Sync は従来どおり動作します",
+            )
 
         layout.addWidget(QtWidgets.QLabel("ログ（動作の記録）"))
         self.log_view = QtWidgets.QPlainTextEdit()
@@ -5682,6 +5777,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 self.enable_btn.blockSignals(False)
             self._refresh_scene_link_label()
             self._refresh_material_table()
+            try:
+                if getattr(self, "_uvremap", None) is not None:
+                    self._uvremap.on_scene_changed()
+            except Exception:
+                pass
 
             # 2026.07.23 追加(実機報告: シーンを閉じて開き直すとUDIM
             # テクスチャを使っているオブジェクトが未割り当てのように
@@ -5748,6 +5848,11 @@ class LiveSyncWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 except Exception:
                     pass
             self._scene_callback_ids = []
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_uvremap", None) is not None:
+                self._uvremap.shutdown()
         except Exception:
             pass
         super(LiveSyncWindow, self).closeEvent(event)
