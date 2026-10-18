@@ -10,6 +10,11 @@ numpy は Maya 非依存のためモジュール先頭で読む。
 """
 from __future__ import annotations
 
+import hashlib
+import os
+import re
+from pathlib import Path
+
 import numpy as np
 
 DEFAULT_SHADING_GROUP = "initialShadingGroup"
@@ -919,3 +924,443 @@ def collect_arrays(shape_paths, ts_names, uv_set=None):
         rec["ts_resolve_warnings"] = ts_warnings
         records.append(rec)
     return concat_records(records, ts_names, uv_set=resolved_uv)
+
+
+# 2026.10.19(RB-c): リベース用メッシュ書き出し
+#
+# Painter が読み直すメッシュを、基準記録時と同じシェイプから FBX で書く。
+# シーンは変更しない(選択だけ退避して戻す)。一時ファイルへ書いてから
+# os.replace で確定する。meshes/ の掃除、FBX のバージョン・単位・軸の指定、
+# 新基準候補や依頼ファイルの作成はここでは行わない。
+
+REBASE_MESHES_DIRNAME = "meshes"
+REBASE_FBX_EXT = ".fbx"
+# 要実機確認: 第一案は "suffix" (<baseline_id>.fbx.tmp)。
+# MEL の -f が拡張子を要求する、または .fbx を付け足す場合は
+# "infix" (<baseline_id>.tmp.fbx) にこの定数だけを切り替える。
+REBASE_FBX_TMP_STYLE = "suffix"
+REBASE_FBX_CHUNK = 1024 * 1024
+REBASE_FBX_PLUGIN = "fbxmaya"
+MSG_FBX_EXPORT_FAILED = "メッシュの書き出しに失敗しました"
+
+_BASELINE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+_TMP_STYLES = ("suffix", "infix")
+
+
+class RebaseExportError(Exception):
+    """リベース用メッシュ書き出しの失敗。
+
+    code は依頼ファイルの失敗理由(既定 ``export_failed``)。
+    メッセージは利用者向けの短い文で、絶対パスを含めない。
+    元の例外は ``__cause__`` に残す。
+    """
+
+    def __init__(self, message=None, code="export_failed"):
+        self.code = code or "export_failed"
+        super().__init__(message or MSG_FBX_EXPORT_FAILED)
+
+
+def rebase_fbx_paths(meshes_dir, baseline_id, tmp_style=None):
+    """最終 FBX と一時ファイルのパスを返す。
+
+    Args:
+        meshes_dir: ``meshes`` ディレクトリ(この関数は
+            ``REBASE_MESHES_DIRNAME`` を足さない)。
+        baseline_id: 英数字で始まり、英数字と ``-`` ``_`` のみ、80 文字以内。
+        tmp_style: ``"suffix"`` または ``"infix"``。省略時は
+            ``REBASE_FBX_TMP_STYLE``。
+
+    Returns:
+        (最終 Path, 一時 Path)
+
+    Raises:
+        ValueError: baseline_id または tmp_style が不正。
+    """
+    if not isinstance(baseline_id, str) or _BASELINE_ID_RE.fullmatch(baseline_id) is None:
+        raise ValueError("基準 ID が不正です")
+    style = REBASE_FBX_TMP_STYLE if tmp_style is None else tmp_style
+    if style not in _TMP_STYLES:
+        raise ValueError("一時ファイルの流儀が不明です")
+    root = Path(meshes_dir)
+    final_path = root / (baseline_id + REBASE_FBX_EXT)
+    if style == "suffix":
+        tmp_path = root / (baseline_id + REBASE_FBX_EXT + ".tmp")
+    else:
+        tmp_path = root / (baseline_id + ".tmp" + REBASE_FBX_EXT)
+    return final_path, tmp_path
+
+
+def escape_mel_string(text):
+    """MEL のダブルクォート文字列用にエスケープする。
+
+    先に ``\\`` を ``/`` へ置換し、その後に残った ``\\`` を ``\\\\``、
+    ``"`` を ``\\"`` にする。パス区切りの変換は実機の ``FBXExport -f``
+    が受け取る形に合わせた決め打ち。
+    """
+    # 要実機確認: FBXExport -f のパスは / 区切り・引用符付きで渡す。
+    normalized = str(text).replace("\\", "/")
+    escaped = []
+    for ch in normalized:
+        if ch == "\\":
+            escaped.append("\\\\")
+        elif ch == '"':
+            escaped.append('\\"')
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
+
+
+def build_fbx_export_commands(tmp_path, *, triangulate=False):
+    """FBX 書き出し MEL を、1 コマンド 1 要素で返す。
+
+    コマンド名と引数は決め打ち。``triangulate`` は bool のみ。
+    既定は False(四角形を保ち、基準スナップショットとの面の対応を崩さない)。
+
+    要実機確認: 大きなメッシュの所要時間と、Maya が固まる時間は未計測(合否ではない)。
+    要実機確認: Painter が四角形を保ったまま読むかは RB-0/RB-e。この PR の合否ではない。
+    FBX のバージョン・単位・軸は契約に無いので送らない。
+    """
+    if not isinstance(triangulate, bool):
+        raise ValueError("triangulate は bool だけを受けます")
+    # 要実機確認: FBXExportTriangulate -v false で四角形が残り、true で三角形化されること。
+    tri_flag = "true" if triangulate else "false"
+    exported = escape_mel_string(os.fspath(tmp_path))
+    # 要実機確認: 各コマンドが存在し、名前・-v・小文字の true/false がこのとおりであること。
+    # 1. FBXResetExport。利用者の FBX 書き出し設定を初期化する副作用がある
+    #    (画面の注意は RB-d で決める)。
+    # 2-4. Maya 2027 で確認済み: InAscii / EmbeddedTextures / AnimationOnly は -v false。
+    # 5. FBXExportInputConnections -v false(出力に履歴ノードが入らないこと)
+    # 6. FBXExportCameras -v false(カメラが出ないこと)
+    # 7. FBXExportLights -v false(ライトが出ないこと)
+    # 8. FBXExportSmoothingGroups -v true(再読み込みでスムージングが保たれること)
+    # 9. FBXExportTriangulate
+    # 10. FBXExport -f "<一時パス>" -s(選択した親トランスフォームが出ること)
+    return [
+        "FBXResetExport;",
+        "FBXExportInAscii -v false;",
+        "FBXExportEmbeddedTextures -v false;",
+        "FBXExportAnimationOnly -v false;",
+        "FBXExportInputConnections -v false;",
+        "FBXExportCameras -v false;",
+        "FBXExportLights -v false;",
+        "FBXExportSmoothingGroups -v true;",
+        "FBXExportTriangulate -v {0};".format(tri_flag),
+        'FBXExport -f "{0}" -s;'.format(exported),
+    ]
+
+
+def export_rebase_mesh(
+    shape_paths,
+    meshes_dir,
+    baseline_id,
+    *,
+    triangulate=False,
+    mel_eval=None,
+    cmds=None,
+    replace_fn=None,
+    remove_fn=None,
+    tmp_style=None,
+):
+    """基準シェイプを FBX にして ``meshes/<baseline_id>.fbx`` へ確定する。
+
+    戻り値は依頼の ``mesh`` にそのまま入る素の dict
+    ``{"path", "size", "sha1"}``。``path`` は絶対パスで、区切りは OS 既定。
+
+    ``mel_eval`` / ``cmds`` / ``replace_fn`` / ``remove_fn`` を省略したときは
+    ``maya.mel.eval`` / ``maya.cmds`` / ``os.replace`` / ``os.remove``。
+    Maya が無い環境で既定の mel または cmds を使うと ``RebaseExportError``。
+
+    選ぶのはシェイプではなく親トランスフォーム。フルパスに親が含まれるときは
+    その親を使い、シェイプ名しか無いときは ``listRelatives`` で親を辿る。
+
+    失敗時は一時ファイルを残さない。``replace_fn`` が失敗したときは最終ファイルを
+    消さない(この呼び出しが作ったものではない)。replace 成功後にサイズが
+    一致しないときだけ、この呼び出しが置いた最終ファイルを消す。呼び出し前から
+    あった最終ファイルは上書きしない。``KeyboardInterrupt`` などの
+    ``BaseException`` は包まず、一時ファイルを消してから再送出する。
+
+    呼び出し側は ``REBASE_MESHES_DIRNAME`` を付けたディレクトリを ``meshes_dir``
+    に渡す。ここから古い FBX は消さない。
+    """
+    shapes = _require_shape_paths(shape_paths)
+    try:
+        final_path, tmp_path = rebase_fbx_paths(
+            meshes_dir, baseline_id, tmp_style=tmp_style,
+        )
+    except ValueError as exc:
+        raise RebaseExportError(str(exc)) from exc
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+
+    if replace_fn is None:
+        replace_fn = os.replace
+    if remove_fn is None:
+        remove_fn = os.remove
+
+    try:
+        Path(meshes_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+
+    try:
+        _unlink(tmp_path, remove_fn)
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if os.path.lexists(os.fspath(final_path)):
+        raise RebaseExportError("同じ名前のメッシュが既にあります")
+
+    try:
+        cmds_api = _default_cmds() if cmds is None else cmds
+        mel = _default_mel_eval() if mel_eval is None else mel_eval
+    except RebaseExportError:
+        raise
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+
+    try:
+        _ensure_fbx_plugin(cmds_api)
+        _ensure_shapes_exist(cmds_api, shapes)
+        parents = _parent_transforms(cmds_api, shapes)
+    except RebaseExportError:
+        raise
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+
+    selection_saved = False
+    previous = []
+    try:
+        previous = list(cmds_api.ls(selection=True, long=True) or [])
+        selection_saved = True
+        # Maya 2027 で確認済み: シェイプではなく親トランスフォームを選んで書き出す。
+        cmds_api.select(list(parents), replace=True)
+        for command in build_fbx_export_commands(tmp_path, triangulate=triangulate):
+            mel(command)
+        return _publish_rebase_fbx(tmp_path, final_path, replace_fn, remove_fn)
+    except RebaseExportError:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise
+    except Exception as exc:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    except BaseException:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise
+    finally:
+        if selection_saved:
+            _restore_selection(cmds_api, previous)
+
+
+def _require_shape_paths(shape_paths):
+    """文字列のシェイプパス列。空・非文字列は RebaseExportError。"""
+    if shape_paths is None or isinstance(shape_paths, (str, bytes)):
+        raise RebaseExportError("書き出し対象のシェイプがありません")
+    try:
+        shapes = list(shape_paths)
+    except TypeError as exc:
+        raise RebaseExportError("書き出し対象のシェイプがありません") from exc
+    if not shapes:
+        raise RebaseExportError("書き出し対象のシェイプがありません")
+    for item in shapes:
+        if not isinstance(item, str):
+            raise RebaseExportError("書き出し対象のシェイプが不正です")
+    return shapes
+
+
+def _default_cmds():
+    try:
+        import maya.cmds as cmds  # type: ignore
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    return cmds
+
+
+def _default_mel_eval():
+    try:
+        import maya.mel as mel  # type: ignore
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    return mel.eval
+
+
+def _ensure_fbx_plugin(cmds_api):
+    """未ロードなら fbxmaya を読む。契約に無い追加。"""
+    # 要実機確認: プラグインを外した状態でも loadPlugin で読めること。
+    try:
+        loaded = cmds_api.pluginInfo(REBASE_FBX_PLUGIN, query=True, loaded=True)
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if loaded:
+        return
+    try:
+        cmds_api.loadPlugin(REBASE_FBX_PLUGIN, quiet=True)
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+
+
+def _parent_in_dag_path(shape_path):
+    """フルパスに親が書いてあるとき、そのトランスフォームのパスを返す。"""
+    if "|" not in shape_path:
+        return None
+    parent, _shape_name = shape_path.rsplit("|", 1)
+    if not parent:
+        return None
+    return parent
+
+
+def _parent_transform(cmds_api, shape_path):
+    """書き出しに選ぶ親トランスフォーム。
+
+    フルパスならパス上の親を使う。シェイプ名しか無いときは
+    ``listRelatives`` で親を 1 つ辿る。複数ある、または無いときは失敗。
+    """
+    embedded = _parent_in_dag_path(shape_path)
+    if embedded:
+        return embedded
+    try:
+        found = cmds_api.listRelatives(shape_path, parent=True, fullPath=True)
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if isinstance(found, str):
+        parents = [found]
+    elif found:
+        try:
+            parents = list(found)
+        except TypeError as exc:
+            raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    else:
+        parents = []
+    if len(parents) != 1 or not isinstance(parents[0], str) or not parents[0]:
+        raise RebaseExportError("書き出し対象の親が見つかりません")
+    return parents[0]
+
+
+def _parent_transforms(cmds_api, shapes):
+    """シェイプごとに親を決め、同じ親は 1 回だけ選ぶ。"""
+    chosen = []
+    seen = set()
+    for shape_path in shapes:
+        parent = _parent_transform(cmds_api, shape_path)
+        if parent in seen:
+            continue
+        seen.add(parent)
+        chosen.append(parent)
+    if not chosen:
+        raise RebaseExportError("書き出し対象の親が見つかりません")
+    return chosen
+
+
+def _ensure_shapes_exist(cmds_api, shapes):
+    for path in shapes:
+        try:
+            exists = cmds_api.objExists(path)
+        except Exception as exc:
+            raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+        if not exists:
+            raise RebaseExportError("書き出し対象のシェイプが見つかりません")
+
+
+def _restore_selection(cmds_api, previous):
+    """選択を戻す。失敗しても書き出し結果は隠さない。"""
+    # 要実機確認: 書き出し後に元の選択へ戻ること。
+    try:
+        if previous:
+            cmds_api.select(previous, replace=True)
+        else:
+            cmds_api.select(clear=True)
+    except Exception:
+        return
+
+
+def _unlink(path, remove_fn):
+    target = os.fspath(path)
+    if not os.path.lexists(target):
+        return
+    try:
+        remove_fn(target)
+    except FileNotFoundError:
+        return
+
+
+def _unlink_quiet(path, remove_fn):
+    try:
+        _unlink(path, remove_fn)
+    except Exception:
+        return
+
+
+def _sha1_stream(path):
+    """1 チャンクずつ sha1 を計算する。戻り値は (hex, 読んだバイト数)。"""
+    chunk_size = REBASE_FBX_CHUNK
+    digest = hashlib.sha1()
+    total = 0
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk_size)
+            if not block:
+                break
+            total += len(block)
+            digest.update(block)
+    return digest.hexdigest(), total
+
+
+def _publish_rebase_fbx(tmp_path, final_path, replace_fn, remove_fn):
+    """一時ファイルを検査して確定する。
+
+    ``replace_fn`` が失敗したときは一時ファイルだけを消す。最終ファイルは
+    この呼び出しが作ったものではないので消さない。replace が成功したあとで
+    サイズが違えば、置いた最終ファイルを消す。
+    """
+    tmp_s = os.fspath(tmp_path)
+    final_s = os.fspath(final_path)
+    if not os.path.lexists(tmp_s):
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED)
+    try:
+        tmp_size = os.stat(tmp_s).st_size
+    except OSError as exc:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if tmp_size <= 0:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED)
+
+    try:
+        digest, hashed_size = _sha1_stream(tmp_path)
+    except Exception as exc:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if hashed_size != tmp_size or hashed_size <= 0:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED)
+
+    if os.path.lexists(final_s):
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError("同じ名前のメッシュが既にあります")
+
+    try:
+        # 要実機確認: Windows でウイルス対策や同期ソフトが一時ファイルを
+        # 掴むと os.replace が失敗することがある。失敗時は一時ファイルだけを
+        # 消す。最終ファイルは消さない(再試行はここでは足さない)。
+        replace_fn(tmp_s, final_s)
+    except Exception as exc:
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+
+    try:
+        final_size = os.stat(final_s).st_size
+    except OSError as exc:
+        _unlink_quiet(final_path, remove_fn)
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if final_size != tmp_size:
+        _unlink_quiet(final_path, remove_fn)
+        _unlink_quiet(tmp_path, remove_fn)
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED)
+
+    if os.path.lexists(tmp_s):
+        _unlink_quiet(tmp_path, remove_fn)
+
+    return {
+        "path": os.path.abspath(final_s),
+        "size": int(final_size),
+        "sha1": digest,
+    }
