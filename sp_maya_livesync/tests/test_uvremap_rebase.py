@@ -455,6 +455,62 @@ def test_parse_request_reload_mismatch_is_bad_settings(reload):
     assert reason == "bad_settings"
 
 
+@pytest.mark.parametrize("baseline_id", [
+    "b",
+    "bl-1",
+    "A_b-9",
+    "0",
+    "a" * 80,
+    "Z" + ("_" * 79),
+])
+def test_baseline_id_matches_shared_pattern(baseline_id):
+    parsed, reason = rb.parse_request(_valid_raw(baseline_id=baseline_id))
+    assert reason is None
+    assert parsed["baseline_id"] == baseline_id
+    assert _build(baseline_id=baseline_id)["baseline_id"] == baseline_id
+
+
+@pytest.mark.parametrize("baseline_id", [
+    "",
+    "-abc",
+    "_abc",
+    "a" * 81,
+    "has space",
+    "foo/bar",
+    "foo\\bar",
+    "..",
+    "bl.1",
+    "日本語",
+])
+def test_baseline_id_rejects_shared_pattern(baseline_id):
+    parsed, reason = rb.parse_request(_valid_raw(baseline_id=baseline_id))
+    assert parsed is None
+    assert reason == "bad_request"
+    with pytest.raises(ValueError):
+        _build(baseline_id=baseline_id)
+
+
+@pytest.mark.parametrize("created_at,expires_at", [
+    (100, 100),
+    (100, 99),
+    (100.0, 100.0),
+    (100.5, 100.5),
+])
+def test_parse_request_expires_must_be_after_created(created_at, expires_at):
+    parsed, reason = rb.parse_request(_valid_raw(created_at=created_at, expires_at=expires_at))
+    assert parsed is None
+    assert reason == "bad_request"
+
+
+def test_parse_request_accepts_expires_just_after_created(tmp_path):
+    parsed, reason = rb.parse_request(_valid_raw(created_at=100, expires_at=100.1))
+    assert reason is None
+    assert parsed["expires_at"] == 100.1
+    with pytest.raises(ValueError):
+        rb.write_request(tmp_path, _valid_raw(created_at=100, expires_at=100))
+    assert not rb.requests_dir(tmp_path).exists()
+
+
 def test_parse_request_bad_request_wins_over_bad_settings():
     raw = _valid_raw(schema=2)
     raw["reload"] = {"preserve_strokes": False, "import_cameras": False, "auto_unwrap": False}
@@ -524,6 +580,39 @@ def test_write_cancel_is_empty_and_idempotent(tmp_path):
     assert rb.cancel_exists(tmp_path, "..") is False
     with pytest.raises(ValueError):
         rb.write_cancel(tmp_path, "..")
+
+
+def test_write_cancel_leaves_existing_file_and_uses_replace_file(tmp_path, monkeypatch):
+    seen = []
+    real = rb.uvremap_io.replace_file
+
+    def spy(src, dst, **kwargs):
+        seen.append(Path(dst))
+        return real(src, dst, **kwargs)
+
+    monkeypatch.setattr(rb.uvremap_io, "replace_file", spy)
+    path = rb.write_cancel(tmp_path, RID)
+    assert seen == [path]
+    assert path.read_bytes() == b""
+    assert list(path.parent.glob("*.tmp")) == []
+    path.write_bytes(b"keep")
+    seen.clear()
+    again = rb.write_cancel(tmp_path, RID)
+    assert again == path
+    assert path.read_bytes() == b"keep"
+    assert seen == []
+
+
+def test_write_cancel_removes_tmp_when_replace_fails(tmp_path, monkeypatch):
+    def boom(src, dst, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(rb.uvremap_io, "replace_file", boom)
+    with pytest.raises(OSError):
+        rb.write_cancel(tmp_path, RID)
+    folder = rb.requests_dir(tmp_path)
+    assert list(folder.glob("*.tmp")) == []
+    assert not rb.cancel_path(tmp_path, RID).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1109,12 +1198,14 @@ def test_message_constants_are_non_empty_and_failed_formats():
         "MSG_STATUS_UNREADABLE",
         "MSG_PLUGIN_UPDATE_REQUIRED",
         "MSG_DONE_GUIDANCE",
+        "MSG_RESULT_UNCONFIRMED",
     )
     for name in names:
         value = getattr(rb, name)
         assert isinstance(value, str)
         assert value
     assert rb.MSG_FAILED_FMT.format(message="理由") == "リベースに失敗しました。理由"
+    assert rb.MSG_RESULT_UNCONFIRMED == "結果を確認できません"
     assert set(rb.CANCELABLE_STATES).isdisjoint(rb.LOCKED_STATES)
     assert set(rb.CANCELABLE_STATES).isdisjoint(rb.TERMINAL_STATES)
     assert set(rb.LOCKED_STATES).isdisjoint(rb.TERMINAL_STATES)

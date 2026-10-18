@@ -13,7 +13,8 @@
 
 このモジュールは指示書の表に合わせ、`backing_up` は `LOCKED_STATES` に入れた。
 `cancel_requested` が真でも文は「Painter が読み直しています(取り消せません)」のまま。
-どちらの表が契約の正かは未決。
+
+解決済み(契約の決定の記録どおり)。
 
 ## b. 設定キー名
 
@@ -21,10 +22,14 @@
 指示書に従い、設定ファイルのキーは `uvremap_rebase_ttl_s` だけを読む。
 `rebase_request_ttl_s` は見ない。三角化は `uvremap_rebase_triangulate`、間隔は `uvremap_rebase_poll_s`。
 
+解決済み(契約の決定の記録どおり)。
+
 ## c. `poll_s` の範囲
 
 契約に範囲が無い。仮に **0.5〜30.0 秒**へ丸める(`POLL_MIN_S` / `POLL_MAX_S`)。
 型違い(bool、NaN、inf、数値でないもの)は `1.0`。int は float として受け、範囲外は端に寄せる。
+
+解決済み(契約の決定の記録どおり)。
 
 ## d. `done` なのに結果が合わないとき
 
@@ -35,7 +40,9 @@
 - `request_id` が違う → `skip` / `result_request_id_mismatch`
 
 状態が `done` なら `decide_display` は「リベースが完了しました」のまま。
-結果が合わないときの画面(失敗に見せるか、完了のままにするか)は未決。
+
+RB-d が `judge_completion` の理由を見て表示を上書きする。文言定数は RB-a に置く。
+定数は `MSG_RESULT_UNCONFIRMED`(「結果を確認できません」)。このモジュールの `decide_display` は選ばない。
 
 ## e. `request_id` の形
 
@@ -44,10 +51,14 @@
 時刻は引数の datetime(tz があれば UTC へ変換、無ければ UTC の壁時計とみなす)。乱数も引数。
 このモジュールは時計を読まない。
 
+解決済み(契約の決定の記録どおり)。
+
 ## f. `meshes/` の古いファイル
 
 掃除は `requests/` の `.json` / `.cancel` と `status/` の状態ファイルだけ。
 `meshes/` と `baseline/` には触らない。メッシュの古い fbx をいつ消すかは契約に無い。
+
+解決済み(契約の決定の記録どおり)。
 
 ## g. そのほか、こちらで仮に決めた点
 
@@ -65,7 +76,7 @@
 6. **`failed` のバックアップ**。`MSG_FAILED_FMT` の後ろに ` バックアップ: {ファイル名}` を足す。`/` と `\\` は最後の要素だけ。`.` と `..` は名前にしない(None)。
 7. **TTL**。bool と数値でないもの、整数でない float(`600.5`、NaN、inf)は 1800。整数値の float(`600.0`)は int にしてから 60〜86400 に丸める。
 8. **triangulate**。本物の bool だけ。それ以外は False。
-9. **空の識別子**。空の `project_key`、`baseline_id`、メッシュの `path`、空のテクスチャセット名は `bad_request`(書き込みは `ValueError`)。指示書が明示しているのは空の `ts_names`(リストが空)まで。
+9. **空の識別子**。空の `project_key`、メッシュの `path`、空のテクスチャセット名は `bad_request`(書き込みは `ValueError`)。指示書が明示しているのは空の `ts_names`(リストが空)まで。`baseline_id` は追加依頼で `^[0-9A-Za-z][0-9A-Za-z_-]{0,79}$` にした。
 10. **sha1**。大文字の 16 進も受け、保存は小文字。
 11. **未知キー**。依頼と状態は落とす。`_sync_result.json` の未知キーは残す(指示書が「通す」と書いてあるのは結果側だけ)。
 12. **BOM**。`uvremap_worker.read_json` は `utf-8-sig` で BOM を外す。このモジュールは UTF-8 のまま読むので、BOM 付き JSON は None。指示書のテスト(BOM 付きは `read_request` が None)に合わせた。

@@ -4,7 +4,8 @@
 # 2026.10.19(RB-a): 新規。画面にも Maya にも依存しない。
 Painter のメッシュを新しい UV で読み直し、基準 UV を切り替える処理のうち、
 ファイルの書式と判定だけをここに置く。Maya の cmds、Qt、maya_live_sync は使わない。
-uvremap_runtime / uvremap_maya も import しない。
+uvremap_runtime / uvremap_maya は import しない。
+取り消しファイルの置き換えだけ ``uvremap_io.replace_file`` を使う。
 
 時計と乱数は引数で受け取る。このモジュールは現在時刻を読まない。
 契約が決めていない点はコメントに「契約に無い。仮」と書き、
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import uvremap_io
 from uvremap_worker import write_json_atomic
 
 __all__ = (
@@ -61,6 +63,7 @@ __all__ = (
     "MSG_STATUS_UNREADABLE",
     "MSG_PLUGIN_UPDATE_REQUIRED",
     "MSG_DONE_GUIDANCE",
+    "MSG_RESULT_UNCONFIRMED",
     "StatusRead",
     "RebaseDisplay",
     "CompletionDecision",
@@ -201,6 +204,8 @@ REQUEST_RELOAD = {
 }
 
 REQUEST_ID_RE = re.compile(r"^rb-\d{8}-\d{6}-[0-9a-f]{4}$")
+# RB-b・RB-c と同じ。先頭は英数字、続きは英数字・アンダースコア・ハイフンで全体 1〜80 文字。
+_BASELINE_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,79}$")
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _VERSION_RE = re.compile(r"^(\d+(?:\.\d+)*)(?:[-+].*)?$")
 
@@ -224,6 +229,9 @@ MSG_DONE_GUIDANCE = (
     "次を Painter で確認してください: 2D ビューのストローク、UV 投影のフィル、"
     "ベイク済みのメッシュマップ(再ベイクが必要な場合があります)"
 )
+# 2026.10.19(RB-a): done なのに完了判定が complete でないときの表示。使うのは RB-d。
+# decide_display は選ばない。
+MSG_RESULT_UNCONFIRMED = "結果を確認できません"
 
 # 契約に無い。仮: 状態ごとの phase。QUESTIONS_rb_a.md。
 # MSG_CANNOT_CANCEL と MSG_PLUGIN_UPDATE_REQUIRED は定数のみ。
@@ -353,14 +361,14 @@ def _read_json_safe(path) -> object | None:
 
 
 def _write_empty_atomic(path: Path) -> None:
-    """空ファイルを一時ファイル経由で置く。既にあっても置き換えて成功する。"""
+    """空ファイルを一時ファイル経由で新規作成する。置き換えは ``replace_file``。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name("{0}.{1}.tmp".format(path.name, os.getpid()))
     try:
         with open(tmp, "wb") as handle:
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        uvremap_io.replace_file(tmp, path)
     except BaseException:
         try:
             os.remove(tmp)
@@ -527,6 +535,10 @@ def _reload_problem(value):
     return None
 
 
+def _is_valid_baseline_id(value) -> bool:
+    return isinstance(value, str) and _BASELINE_ID_RE.fullmatch(value) is not None
+
+
 def _copy_reload() -> dict:
     return {
         "preserve_strokes": REQUEST_RELOAD["preserve_strokes"],
@@ -553,18 +565,20 @@ def parse_request(raw) -> tuple[dict | None, str | None]:
     if not is_valid_request_id(request_id):
         return None, "bad_request"
     project_key = raw.get("project_key")
-    # 契約に無い。仮: 空の project_key / baseline_id は bad_request。
+    # 契約に無い。仮: 空の project_key は bad_request。
     if not isinstance(project_key, str) or project_key == "":
         return None, "bad_request"
     created_at = raw.get("created_at")
     expires_at = raw.get("expires_at")
     if not _is_finite_number(created_at) or not _is_finite_number(expires_at):
         return None, "bad_request"
+    if not expires_at > created_at:
+        return None, "bad_request"
     mesh = _parse_mesh(raw.get("mesh"))
     if mesh is None:
         return None, "bad_request"
     baseline_id = raw.get("baseline_id")
-    if not isinstance(baseline_id, str) or baseline_id == "":
+    if not _is_valid_baseline_id(baseline_id):
         return None, "bad_request"
     reload_problem = _reload_problem(raw.get("reload"))
     if reload_problem == "bad_request":
@@ -623,7 +637,7 @@ def build_request(
     parsed_mesh = _parse_mesh(mesh)
     if parsed_mesh is None:
         raise ValueError("mesh が不正です")
-    if not isinstance(baseline_id, str) or baseline_id == "":
+    if not _is_valid_baseline_id(baseline_id):
         raise ValueError("baseline_id が不正です")
     names = _parse_ts_names(ts_names)
     if names is None:
@@ -707,8 +721,10 @@ def list_requests(root) -> list[dict]:
 # 取り消し
 # ---------------------------------------------------------------------------
 def write_cancel(root, request_id) -> Path:
-    """空の ``.cancel`` を原子的に置く。既にあっても成功する。"""
+    """空の ``.cancel`` を置く。既にあれば何もせずそのパスを返す。"""
     path = cancel_path(root, request_id)
+    if path.is_file():
+        return path
     _write_empty_atomic(path)
     return path
 
