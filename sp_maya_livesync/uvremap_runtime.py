@@ -723,8 +723,54 @@ def _rebase_error_text(exc: Exception) -> str:
     return name
 
 
+def _rebase_lock(root: Path):
+    """rebase_local.json 用。status と同じ FileLock。2026.10.19(RB-b)。"""
+    return FileLock(root / "rebase_local.lock", STATUS_LOCK_TIMEOUT_S, label="rebase_local")
+
+
+def _utc_file_stamp(epoch) -> str:
+    """ファイル名に使う UTC 時刻。時計は引数と time.gmtime。"""
+    try:
+        when = float(epoch)
+    except (TypeError, ValueError):
+        when = 0.0
+    if when < 0:
+        when = 0.0
+    clock = time.gmtime(when)
+    return "{0:04d}{1:02d}{2:02d}T{3:02d}{4:02d}{5:02d}Z".format(
+        clock.tm_year, clock.tm_mon, clock.tm_mday,
+        clock.tm_hour, clock.tm_min, clock.tm_sec,
+    )
+
+
+def _quarantine_corrupt_rebase(root: Path, time_fn) -> None:
+    """壊れた rebase_local.json を消さず退避する。契約に無い。仮。
+
+    名前は ``rebase_local.json.corrupt-<UTC時刻>``。同じ秒に既にあれば
+    連番を足す(既存の退避は上書きしない)。
+    """
+    src = root / REBASE_LOCAL_NAME
+    if not src.is_file():
+        return
+    try:
+        stamp = _utc_file_stamp(time_fn())
+    except Exception:
+        stamp = _utc_file_stamp(0)
+    dest = root / "{0}.corrupt-{1}".format(REBASE_LOCAL_NAME, stamp)
+    n = 2
+    while dest.exists():
+        dest = root / "{0}.corrupt-{1}-{2}".format(REBASE_LOCAL_NAME, stamp, n)
+        n += 1
+        if n > 1000:
+            raise RuntimeControlError("壊れた記録の退避先を作れませんでした")
+    src.replace(dest)
+
+
 def _read_rebase_document(root: Path):
-    """rebase_local.json。無いときは空の記録。壊れていたら None(記録なし)。"""
+    """rebase_local.json。無いときは空の記録。壊れていたら None(記録なし)。
+
+    ロックは呼び出し側が取る。
+    """
     try:
         data = read_json(root / REBASE_LOCAL_NAME, None)
     except Exception:
@@ -802,7 +848,10 @@ def _copy_rebase_row(row: dict) -> dict:
 
 
 def _lookup_rebase_row(root: Path, request_id):
-    doc = _read_rebase_document(root)
+    if not isinstance(request_id, str):
+        return None
+    with _rebase_lock(root):
+        doc = _read_rebase_document(root)
     if doc is None:
         return None
     requests = doc.get("requests")
@@ -811,18 +860,24 @@ def _lookup_rebase_row(root: Path, request_id):
     return _coerce_rebase_row(requests.get(request_id))
 
 
-def _write_rebase_row(root: Path, request_id: str, row: dict) -> None:
-    doc = _read_rebase_document(root)
-    if doc is None:
-        doc = {"schema": SCHEMA, "requests": {}}
-    requests = doc.get("requests")
-    if not isinstance(requests, dict):
-        requests = {}
-    requests[request_id] = _copy_rebase_row(row)
-    write_json_atomic(root / REBASE_LOCAL_NAME, {
-        "schema": SCHEMA,
-        "requests": requests,
-    })
+def _write_rebase_row(root: Path, request_id: str, row: dict, time_fn, *, only_if_absent=False) -> bool:
+    """1 行を書く。``only_if_absent`` で有効な行が既にあれば何も書かず False。"""
+    with _rebase_lock(root):
+        doc = _read_rebase_document(root)
+        if doc is None:
+            _quarantine_corrupt_rebase(root, time_fn)
+            doc = {"schema": SCHEMA, "requests": {}}
+        requests = doc.get("requests")
+        if not isinstance(requests, dict):
+            requests = {}
+        if only_if_absent and _coerce_rebase_row(requests.get(request_id)) is not None:
+            return False
+        requests[request_id] = _copy_rebase_row(row)
+        write_json_atomic(root / REBASE_LOCAL_NAME, {
+            "schema": SCHEMA,
+            "requests": requests,
+        })
+        return True
 
 
 def _notify_rebase_partial(history_fn, step: str) -> None:
@@ -2095,9 +2150,6 @@ class UVRemapRuntime:
             scene = self._scene_id()
         else:
             scene = str(scene_id)
-        current = _lookup_rebase_row(root, request_id)
-        if current is not None:
-            return
         _write_rebase_row(root, request_id, {
             "baseline_id": baseline_id,
             "ts_names": names,
@@ -2106,10 +2158,12 @@ class UVRemapRuntime:
             "completed": False,
             "completed_at": None,
             "steps": _empty_rebase_steps(),
-        })
+        }, self.time_fn, only_if_absent=True)
 
     def rebase_record(self, project_key, request_id):
-        """ローカル記録のコピー。無い、または壊れているときは None。"""
+        """ローカル記録のコピー。無い、壊れている、request_id が文字列でないときは None。"""
+        if not isinstance(request_id, str):
+            return None
         root = self._root(project_key)
         row = _lookup_rebase_row(root, request_id)
         if row is None:
@@ -2144,17 +2198,45 @@ class UVRemapRuntime:
     def _save_rebase_step(self, root: Path, request_id: str, row: dict, step_name: str) -> None:
         row["steps"][step_name] = True
         try:
-            _write_rebase_row(root, request_id, row)
+            _write_rebase_row(root, request_id, row, self.time_fn)
         except Exception:
             row["steps"][step_name] = False
             raise
+
+    def _rebase_blocked_by_job(self, ts_names) -> bool:
+        """対象 TS が実行中・待ち行列・保留のどれかなら True。
+
+        2026.10.19(RB-b): 旧基準のジョブが後から旧 UV へ切り戻すのを防ぐ。
+        """
+        for name in ts_names:
+            if self.has_running_job_for_ts(name):
+                return True
+            if self._queue_item_for_ts(name) is not None:
+                return True
+            key = str(name) if name is not None else ""
+            if key and key in self._pending:
+                return True
+        return False
 
     def complete_rebase(self, project_key, request_id, *, history_fn=None) -> dict:
         """リベースの完了処理。順序は active → reverted → follow_reset → history。
 
         2026.10.19(RB-b): 済んだ段階は記録して飛ばす。失敗しても先に進んだ分は戻さない。
-        キルスイッチはシーン確認より先に見る。
+        キルスイッチはシーン確認より先に見る。reverted の前に、対象 TS の
+        実行中・待ち・保留ジョブがあれば何も変えず ``skipped`` / ``job_running``。
         """
+        if not isinstance(request_id, str):
+            return _rebase_call_result(
+                status="skipped",
+                reason="no_local_record",
+                request_id=request_id,
+                baseline_id="",
+                ts_names=[],
+                steps=_empty_rebase_steps(),
+                reverted=[],
+                failed_step=None,
+                error=None,
+            )
         root = self._root(project_key)
         row = _lookup_rebase_row(root, request_id)
         if row is None:
@@ -2205,6 +2287,18 @@ class UVRemapRuntime:
                 failed_step=None,
                 error=None,
             )
+        if self._rebase_blocked_by_job(row["ts_names"]):
+            return _rebase_call_result(
+                status="skipped",
+                reason="job_running",
+                request_id=request_id,
+                baseline_id=row["baseline_id"],
+                ts_names=row["ts_names"],
+                steps=row["steps"],
+                reverted=[],
+                failed_step=None,
+                error=None,
+            )
 
         reverted = []
         step = "active"
@@ -2231,7 +2325,7 @@ class UVRemapRuntime:
             row["completed"] = True
             row["completed_at"] = self._now()
             try:
-                _write_rebase_row(root, request_id, row)
+                _write_rebase_row(root, request_id, row, self.time_fn)
             except Exception:
                 row["completed"] = False
                 row["completed_at"] = None

@@ -55,3 +55,11 @@
 失敗時の `error` は `type(exc).__name__` と 1 行の要約である。`RuntimeControlError` はクラス名 `RuntimeError_` の別名なので、要約の型名は `RuntimeError_` になる。絶対パスに見える部分は要約から除く(仮)。
 
 `scene_id` は既存の `_scene_id()` の戻りをそのまま保存する。Maya ではシーンパスになることがあり、その場合 `rebase_local.json` に絶対パスが入る。一致判定に使うため、ここでは削っていない。履歴の文言には入れてない。
+
+## レビュー対応(PR #34)
+
+- 対象 TS が実行中・待ち行列・保留なら、`complete_rebase` は何も変えず `skipped` / `job_running` を返す(進み具合も記録しない)。
+- `rebase_local.json` の読み書きは `FileLock`(`rebase_local.lock`)で囲んだ。
+- 壊れた `rebase_local.json` を作り直す前に `rebase_local.json.corrupt-<UTC時刻>` へ退避する。削除はしない。
+- `request_id` が文字列でないときは TypeError にせず、`complete_rebase` は `skipped` / `no_local_record`、`rebase_record` は `None` を返す。
+- 決定: Q1 基準が未記録のときはリベースを開始させない(RB-d で制御)。

@@ -497,6 +497,8 @@ def test_corrupt_rebase_local_is_no_record(tmp_path):
     path = runtime._root_path / rt.REBASE_LOCAL_NAME
     path.write_text("{", encoding="utf-8")
     assert runtime.rebase_record("proj", REQ) is None
+    assert path.read_text(encoding="utf-8") == "{"
+    assert list(runtime._root_path.glob("rebase_local.json.corrupt-*")) == []
     path.write_text(json.dumps({
         "schema": 1,
         "requests": {"rb-bad": ["nope"], "rb-num": {"baseline_id": 3, "ts_names": ["Body"]}},
@@ -898,6 +900,123 @@ def test_complete_rebase_missing_candidate_stops_at_active(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 # 13. 既存の保証(maya を読まない、datetime.now は 1 回)
 # ---------------------------------------------------------------------------
+def _unchanged(env):
+    root = env["root"]
+    return {
+        "active": (root / "baseline" / "active.json").read_bytes(),
+        "follow": (root / "follow.json").read_bytes(),
+        "status": (root / "status.json").read_bytes(),
+        "local": (root / rt.REBASE_LOCAL_NAME).read_bytes(),
+        "nodes": env["cmds"].copy_state(),
+    }
+
+
+def _assert_unchanged(env, snap):
+    root = env["root"]
+    assert (root / "baseline" / "active.json").read_bytes() == snap["active"]
+    assert (root / "follow.json").read_bytes() == snap["follow"]
+    assert (root / "status.json").read_bytes() == snap["status"]
+    assert (root / rt.REBASE_LOCAL_NAME).read_bytes() == snap["local"]
+    assert env["cmds"].copy_state() == snap["nodes"]
+
+
+def test_complete_rebase_skips_while_target_job_is_busy(tmp_path):
+    """実行中・待ち・保留が 1 つでもあれば、何も変えず skipped / job_running。"""
+    env = _prepare_rebase(tmp_path)
+    runtime = env["runtime"]
+    snap = _unchanged(env)
+    hist = []
+
+    def history(source, text):
+        hist.append((source, text))
+
+    runtime._jobs["j-body"] = {"ts_name": "Body", "job_id": "j-body"}
+    env["enabled"]["on"] = False
+    blocked = runtime.complete_rebase("proj", REQ, history_fn=history)
+    assert blocked["status"] == "skipped"
+    assert blocked["reason"] == "killswitch_off"
+    _assert_unchanged(env, snap)
+
+    env["enabled"]["on"] = True
+    running = runtime.complete_rebase("proj", REQ, history_fn=history)
+    _assert_result_keys(running)
+    assert running["status"] == "skipped"
+    assert running["reason"] == "job_running"
+    assert running["failed_step"] is None
+    assert running["steps"] == {name: False for name in _STEP_NAMES}
+    assert hist == []
+    _assert_unchanged(env, snap)
+    assert rt._read_active_baseline(env["root"]) == env["original"]
+
+    runtime._jobs.clear()
+    runtime._queue.append({"ts_name": "Head", "queue_id": "queued:1", "origin": "manual"})
+    queued = runtime.complete_rebase("proj", REQ, history_fn=history)
+    assert queued["status"] == "skipped"
+    assert queued["reason"] == "job_running"
+    _assert_unchanged(env, snap)
+
+    runtime._queue.clear()
+    runtime._pending["Cape"] = {"ts_name": "Cape", "queue_id": "queued:2"}
+    pending = runtime.complete_rebase("proj", REQ, history_fn=history)
+    assert pending["status"] == "skipped"
+    assert pending["reason"] == "job_running"
+    _assert_unchanged(env, snap)
+
+    runtime._pending.clear()
+    runtime._jobs["j-trim"] = {"ts_name": "Trim", "job_id": "j-trim"}
+    done = runtime.complete_rebase("proj", REQ, history_fn=history)
+    assert done["status"] == "completed"
+    assert hist == [("uvremap", rt.MSG_REBASE_HISTORY_DONE)]
+    assert rt._read_active_baseline(env["root"]) == env["candidate"]
+    assert env["cmds"].nodes["file_body"]["fileTextureName"] == "/src/Final/Body_BaseColor.png"
+    assert env["cmds"].nodes["file_trim"]["fileTextureName"] == "/src/Final/Trim_BaseColor.png"
+
+    runtime._jobs["j-body"] = {"ts_name": "Body"}
+    again = runtime.complete_rebase("proj", REQ, history_fn=history)
+    assert again["status"] == "already_completed"
+    assert len(hist) == 1
+
+
+def test_complete_rebase_non_string_request_id_returns_skipped(tmp_path):
+    env = _prepare_rebase(tmp_path)
+    snap = _unchanged(env)
+    for bad in (None, 12, ["rb"], {"id": REQ}):
+        result = env["runtime"].complete_rebase("proj", bad)
+        _assert_result_keys(result)
+        assert result["status"] == "skipped"
+        assert result["reason"] == "no_local_record"
+        assert env["runtime"].rebase_record("proj", bad) is None
+    _assert_unchanged(env, snap)
+
+
+def test_corrupt_rebase_local_is_quarantined_before_rewrite(tmp_path):
+    runtime = _make_runtime(
+        tmp_path, scene_id_fn=lambda: "sceneA.ma", time_fn=lambda: 0,
+    )
+    root = runtime._root_path
+    path = root / rt.REBASE_LOCAL_NAME
+    raw = '{"schema": 1, "requests": [{"request_id": "rb-old", "completed": true}]}'
+    path.write_text(raw, encoding="utf-8")
+    assert runtime.rebase_record("proj", REQ) is None
+    assert path.read_text(encoding="utf-8") == raw
+    runtime.register_rebase("proj", REQ, "bl-1", ["Body"])
+    backup = root / "rebase_local.json.corrupt-19700101T000000Z"
+    assert backup.is_file()
+    assert backup.read_text(encoding="utf-8") == raw
+    assert "rb-old" in backup.read_text(encoding="utf-8")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["requests"][REQ]["baseline_id"] == "bl-1"
+    assert saved["requests"][REQ]["completed"] is False
+    assert (root / "rebase_local.lock").is_file()
+
+    path.write_text("{second", encoding="utf-8")
+    runtime.register_rebase("proj", "rb-2", "bl-2", ["Head"])
+    second = root / "rebase_local.json.corrupt-19700101T000000Z-2"
+    assert second.read_text(encoding="utf-8") == "{second"
+    assert backup.read_text(encoding="utf-8") == raw
+    assert runtime.rebase_record("proj", "rb-2")["baseline_id"] == "bl-2"
+
+
 def test_rebase_additions_do_not_import_maya_or_add_datetime_now():
     source = Path(rt.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
