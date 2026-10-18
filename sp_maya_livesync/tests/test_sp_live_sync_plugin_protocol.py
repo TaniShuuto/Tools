@@ -320,6 +320,21 @@ def test_mesh_record_empty_path_is_none():
     assert plugin.build_mesh_record(None, None, now=1.0) is None
 
 
+def test_mesh_record_does_not_reuse_sha1_when_path_differs(tmp_path):
+    first_path = tmp_path / "a.fbx"
+    second_path = tmp_path / "b.fbx"
+    first_path.write_bytes(b"hello-mesh")
+    second_path.write_bytes(b"HELLO-MESH")
+    first = plugin.build_mesh_record(str(first_path), None, now=1.0)
+    st = first_path.stat()
+    os.utime(second_path, ns=(st.st_atime_ns, first["mtime_ns"]))
+    second = plugin.build_mesh_record(str(second_path), first, now=2.0)
+    assert second["size"] == first["size"]
+    assert second["mtime_ns"] == first["mtime_ns"]
+    assert second["sha1"] == hashlib.sha1(b"HELLO-MESH").hexdigest()
+    assert second["sha1"] != first["sha1"]
+
+
 def test_publish_writes_result_before_flag(monkeypatch):
     order = []
 
@@ -616,3 +631,92 @@ def test_edition_entered_schedules_named_timer(engine):
     engine._mesh_record_timer.start = lambda ms=0: started.append(ms)
     engine.on_project_edition_entered(None)
     assert started == [plugin._MESH_RECORD_DELAY_MS]
+
+
+def test_cancel_and_exception_skip_duplicate_failure_sentence(engine, isolated, monkeypatch):
+    _arm_export(monkeypatch, isolated, "Cancelled", message="stop")
+    engine._do_export(preview=False, force_full=True)
+    assert any("書き出しがキャンセルされました" in text for text in engine.messages)
+    assert not any("完了しませんでした" in text for text in engine.messages)
+
+    engine.messages.clear()
+    _arm_export(monkeypatch, isolated, "Error", message="bad output")
+    engine._do_export(preview=False, force_full=True)
+    assert any("最終書き出しは完了しませんでした(状態: エラー)" in text for text in engine.messages)
+    assert any("書き出しステータス:" in text for text in engine.messages)
+
+    engine.messages.clear()
+
+    def _boom(config):
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(plugin.export, "export_project_textures", _boom)
+    engine._safe_export(preview=False, force_full=True)
+    assert any(text.startswith("エラー:") for text in engine.messages)
+    assert not any("完了しませんでした" in text for text in engine.messages)
+
+
+def test_save_as_schedules_mesh_record_after_key_migration(engine, monkeypatch):
+    started = []
+    engine._mesh_record_timer.start = lambda ms=0: started.append(ms)
+    engine.enabled = False
+    engine.config["active_project_key"] = "__unsaved__"
+    monkeypatch.setattr(plugin.project, "name", lambda: "Demo")
+    monkeypatch.setattr(plugin.project, "file_path", lambda: "C:/work/Demo.spp")
+    engine.on_project_saved(None)
+    assert started == [plugin._MESH_RECORD_DELAY_MS]
+
+    started.clear()
+    engine.on_project_saved(None)
+    assert started == []
+
+
+def test_mesh_record_retries_empty_or_busy_without_sleep(engine, isolated, monkeypatch):
+    mesh = isolated / "hero.fbx"
+    mesh.write_bytes(b"mesh-body")
+    state = {"path": "", "busy": False}
+    monkeypatch.setattr(
+        plugin.project, "last_imported_mesh_path", lambda: state["path"], raising=False)
+    monkeypatch.setattr(plugin.project, "is_busy", lambda: state["busy"])
+    monkeypatch.setattr(plugin.project, "name", lambda: "Demo")
+    monkeypatch.setattr(plugin.project, "file_path", lambda: "C:/work/Demo.spp")
+    started = []
+    engine._mesh_record_timer.start = lambda ms=0: started.append(ms)
+    slept = []
+    monkeypatch.setattr(plugin.time, "sleep", lambda seconds: slept.append(seconds))
+    logs = []
+    monkeypatch.setattr(plugin, "_log", lambda level, message: logs.append((level, message)))
+
+    engine._mesh_record_retries = 0
+    engine._on_mesh_record_timer()
+    engine._on_mesh_record_timer()
+    assert started == [
+        plugin._MESH_RECORD_RETRY_DELAY_MS,
+        plugin._MESH_RECORD_RETRY_DELAY_MS,
+    ]
+    assert slept == []
+    assert not os.path.exists(plugin.CONFIG_PATH)
+    engine._on_mesh_record_timer()
+    assert started == [
+        plugin._MESH_RECORD_RETRY_DELAY_MS,
+        plugin._MESH_RECORD_RETRY_DELAY_MS,
+    ]
+    assert any("記録しませんでした" in message for _level, message in logs)
+    assert not os.path.exists(plugin.CONFIG_PATH)
+
+    state["path"] = str(mesh)
+    state["busy"] = True
+    logs.clear()
+    engine._schedule_mesh_record()
+    assert started[-1] == plugin._MESH_RECORD_DELAY_MS
+    before = len(started)
+    engine._on_mesh_record_timer()
+    assert started[before:] == [plugin._MESH_RECORD_RETRY_DELAY_MS]
+    assert not os.path.exists(plugin.CONFIG_PATH)
+    state["busy"] = False
+    engine._on_mesh_record_timer()
+    disk = json.loads(open(plugin.CONFIG_PATH, encoding="utf-8").read())
+    record = disk["painter_mesh_by_project"]["C:/work/Demo.spp"]
+    assert record["sha1"] == hashlib.sha1(b"mesh-body").hexdigest()
+    assert record["path"] == str(mesh)
+    assert not any("記録しませんでした" in message for _level, message in logs)

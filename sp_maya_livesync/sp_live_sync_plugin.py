@@ -94,6 +94,10 @@ MESH_SHA1_MAX_BYTES = 1024 * 1024 * 1024
 # までの待ち(ミリ秒)。0 はイベントループの次の回。
 # この待ちで last_imported_mesh_path() が埋まるかは要実機確認。
 _MESH_RECORD_DELAY_MS = 0
+# 2026.10.18(1.3.0): パスが空、または Painter が busy のときは 500ms 後に
+# 最大 2 回だけ再試行する。メインスレッドは sleep しない。
+_MESH_RECORD_RETRY_DELAY_MS = 500
+_MESH_RECORD_MAX_RETRIES = 2
 
 _EXPORT_STATUS_TOKENS = {
     "success": "success",
@@ -719,7 +723,8 @@ def build_mesh_record(path, prev_record, now, max_hash_bytes=None):
 
     path が空、またはファイルを stat できないときは None(記録しない。
     既存の値は呼び出し側が消さない)。
-    size と mtime_ns が前回と同じなら sha1 を計算し直さない。
+    path と size と mtime_ns が前回と同じなら sha1 を計算し直さない。
+    1GB 以下の sha1 はこの関数を呼んだスレッド(メインスレッド)で計算する。
     max_hash_bytes を超えるファイルは sha1 を null にする。
     既定の上限は 1GB。テストは引数で小さくする。
     """
@@ -739,7 +744,8 @@ def build_mesh_record(path, prev_record, now, max_hash_bytes=None):
     sha1 = None
     reused = False
     if isinstance(prev_record, dict):
-        if (prev_record.get("size") == size
+        if (prev_record.get("path") == path
+                and prev_record.get("size") == size
                 and prev_record.get("mtime_ns") == mtime_ns
                 and "sha1" in prev_record):
             sha1 = prev_record.get("sha1")
@@ -970,6 +976,8 @@ class LiveSyncEngine(QtCore.QObject):
         # last_imported_mesh_path が無い環境では、プロジェクトを開くたびに
         # 同じ警告を出さない。
         self._mesh_api_missing_logged = False
+        # 空パス / busy の再試行を何回スケジュールしたか。新規の記録予約で 0 に戻す。
+        self._mesh_record_retries = 0
 
         # 2026.10.18(1.3.0): プロジェクトを開いた直後に、読み込んだメッシュを
         # 共有設定へ記録する。名前付き単発タイマーなので shutdown() から
@@ -1120,6 +1128,10 @@ class LiveSyncEngine(QtCore.QObject):
             )
             if is_transitional_old and key and key != "__unsaved__":
                 key_migrated = self._migrate_project_key_entries(old_key, key)
+                # 2026.10.18(1.3.0): 未保存のまま開いたプロジェクトは
+                # ProjectEditionEntered では記録しない。名前を付けて保存
+                # したあと、キー移行の次にメッシュを取り直す。
+                self._schedule_mesh_record()
 
         if not self.enabled:
             return
@@ -1294,6 +1306,7 @@ class LiveSyncEngine(QtCore.QObject):
     def _schedule_mesh_record(self):
         if self._shutting_down:
             return
+        self._mesh_record_retries = 0
         try:
             self._mesh_record_timer.start(_MESH_RECORD_DELAY_MS)
         except Exception as exc:
@@ -1303,27 +1316,43 @@ class LiveSyncEngine(QtCore.QObject):
         if self._shutting_down:
             return
         try:
-            self._record_painter_mesh()
+            outcome = self._record_painter_mesh()
         except Exception as exc:
             _log("warning", "読み込んだメッシュの記録に失敗しました(既存の記録は残します): {0}".format(exc))
+            return
+        if outcome != "retry":
+            return
+        if self._mesh_record_retries >= _MESH_RECORD_MAX_RETRIES:
+            _log(
+                "info",
+                "読み込んだメッシュは記録しませんでした(再試行後もパスが空、"
+                "または Painter が busy です)。既存の記録は残します。",
+            )
+            return
+        self._mesh_record_retries += 1
+        try:
+            self._mesh_record_timer.start(_MESH_RECORD_RETRY_DELAY_MS)
+        except Exception as exc:
+            _log("warning", "メッシュ記録の再試行を予約できませんでした: {0}".format(exc))
 
     def _record_painter_mesh(self):
         """2026.10.18(1.3.0): Painter が読み込んでいるメッシュを共有設定へ書く。
 
         パスは project.last_imported_mesh_path()(12.1.5 で存在を確認済み)。
-        関数が無い・例外・空文字のときは記録しない。既存の値も消さない。
+        関数が無い・例外のときは記録しない。既存の値も消さない。
+        パスが空、または project.is_busy() が真のときは "retry" を返す。
+        呼び出し側が 500ms 後に最大 2 回だけ再試行する(sleep はしない)。
         未保存プロジェクト(__unsaved__ 系)では記録しない。
-        要実機確認: 12.0.0 にこの関数があるか、ProjectEditionEntered の
-        遅延後にパスが空でないか。
+        要実機確認: 12.0.0 にこの関数があるか、再試行でパスが埋まるか。
         """
         try:
             if not project.is_open():
-                return
+                return None
         except Exception:
-            return
+            return None
         key = _current_project_key()
         if _is_unsaved_project_key(key):
-            return
+            return None
         getter = getattr(project, "last_imported_mesh_path", None)
         if not callable(getter):
             if not self._mesh_api_missing_logged:
@@ -1334,15 +1363,20 @@ class LiveSyncEngine(QtCore.QObject):
                     "記録しません。要実機確認: Painter 12.0.0 では未提供の可能性が"
                     "あります(12.1.5 では存在を確認済み)。",
                 )
-            return
+            return None
+        try:
+            busy = bool(project.is_busy())
+        except Exception:
+            busy = False
+        if busy:
+            return "retry"
         try:
             mesh_path = getter()
         except Exception as exc:
             _log("warning", "読み込んだメッシュのパス取得に失敗したため記録しません(既存の記録は残します): {0}".format(exc))
-            return
+            return None
         if not isinstance(mesh_path, str) or mesh_path == "":
-            _log("info", "読み込んだメッシュのパスが空のため、記録しません。")
-            return
+            return "retry"
         by_project = self.config.get("painter_mesh_by_project")
         prev = by_project.get(key) if isinstance(by_project, dict) else None
         try:
@@ -1685,14 +1719,16 @@ class LiveSyncEngine(QtCore.QObject):
     def _emit_export_outcome(self, preview, ok, status_name, moved_count, export_config, force_full):
         """完了文は ok のときだけ出す。件数は置き換えたファイル数。
 
-        2026.10.18(1.3.0): Warning などは失敗として「完了しませんでした」
-        と出す。プレビューの完了文は、従来どおり 1 件以上動いた成功時だけ。
+        2026.10.18(1.3.0): Warning と Error は失敗として「完了しませんでした」
+        と出す。キャンセルと例外は、既存のキャンセル文・エラー文と重複
+        するので、ここでは出さない。プレビューの完了文は、従来どおり
+        1 件以上動いた成功時だけ。
         """
         label = export_status_label(status_name)
         if preview:
             if ok and moved_count >= 1:
                 self._emit_status("プレビュー同期完了({0}件更新)".format(moved_count))
-            elif not ok:
+            elif not ok and status_name not in ("cancelled", "exception"):
                 self._emit_status("プレビュー同期は完了しませんでした(状態: {0})。".format(label))
             return
         if ok:
@@ -1706,6 +1742,8 @@ class LiveSyncEngine(QtCore.QObject):
                     "全量" if (force_full or not self.final_baseline_established) else "差分",
                 )
             )
+            return
+        if status_name in ("cancelled", "exception"):
             return
         self._emit_status("最終書き出しは完了しませんでした(状態: {0})。".format(label))
 
