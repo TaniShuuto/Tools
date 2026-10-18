@@ -1026,15 +1026,20 @@ def build_fbx_export_commands(tmp_path, *, triangulate=False):
     tri_flag = "true" if triangulate else "false"
     exported = escape_mel_string(os.fspath(tmp_path))
     # 要実機確認: 各コマンドが存在し、名前・-v・小文字の true/false がこのとおりであること。
-    # 1. FBXResetExport
-    # 2. FBXExportInputConnections -v false(出力に履歴ノードが入らないこと)
-    # 3. FBXExportCameras -v false(カメラが出ないこと)
-    # 4. FBXExportLights -v false(ライトが出ないこと)
-    # 5. FBXExportSmoothingGroups -v true(再読み込みでスムージングが保たれること)
-    # 6. FBXExportTriangulate
-    # 7. FBXExport -f "<一時パス>" -s(選択したシェイプだけが出ること)
+    # 1. FBXResetExport。利用者の FBX 書き出し設定を初期化する副作用がある
+    #    (画面の注意は RB-d で決める)。
+    # 2-4. Maya 2027 で確認済み: InAscii / EmbeddedTextures / AnimationOnly は -v false。
+    # 5. FBXExportInputConnections -v false(出力に履歴ノードが入らないこと)
+    # 6. FBXExportCameras -v false(カメラが出ないこと)
+    # 7. FBXExportLights -v false(ライトが出ないこと)
+    # 8. FBXExportSmoothingGroups -v true(再読み込みでスムージングが保たれること)
+    # 9. FBXExportTriangulate
+    # 10. FBXExport -f "<一時パス>" -s(選択した親トランスフォームが出ること)
     return [
         "FBXResetExport;",
+        "FBXExportInAscii -v false;",
+        "FBXExportEmbeddedTextures -v false;",
+        "FBXExportAnimationOnly -v false;",
         "FBXExportInputConnections -v false;",
         "FBXExportCameras -v false;",
         "FBXExportLights -v false;",
@@ -1065,9 +1070,14 @@ def export_rebase_mesh(
     ``maya.mel.eval`` / ``maya.cmds`` / ``os.replace`` / ``os.remove``。
     Maya が無い環境で既定の mel または cmds を使うと ``RebaseExportError``。
 
-    失敗時は一時ファイルを残さない。この呼び出しが作る前からあった最終ファイルは
-    上書きしない。``KeyboardInterrupt`` などの ``BaseException`` は包まず、
-    一時ファイルを消してから再送出する。
+    選ぶのはシェイプではなく親トランスフォーム。フルパスに親が含まれるときは
+    その親を使い、シェイプ名しか無いときは ``listRelatives`` で親を辿る。
+
+    失敗時は一時ファイルを残さない。``replace_fn`` が失敗したときは最終ファイルを
+    消さない(この呼び出しが作ったものではない)。replace 成功後にサイズが
+    一致しないときだけ、この呼び出しが置いた最終ファイルを消す。呼び出し前から
+    あった最終ファイルは上書きしない。``KeyboardInterrupt`` などの
+    ``BaseException`` は包まず、一時ファイルを消してから再送出する。
 
     呼び出し側は ``REBASE_MESHES_DIRNAME`` を付けたディレクトリを ``meshes_dir``
     に渡す。ここから古い FBX は消さない。
@@ -1110,6 +1120,7 @@ def export_rebase_mesh(
     try:
         _ensure_fbx_plugin(cmds_api)
         _ensure_shapes_exist(cmds_api, shapes)
+        parents = _parent_transforms(cmds_api, shapes)
     except RebaseExportError:
         raise
     except Exception as exc:
@@ -1120,9 +1131,8 @@ def export_rebase_mesh(
     try:
         previous = list(cmds_api.ls(selection=True, long=True) or [])
         selection_saved = True
-        # 要実機確認: シェイプだけを選んで書き出す。親トランスフォームが
-        # 出ない、または重複するなら、親を選ぶ方式へ変える。
-        cmds_api.select(list(shapes), replace=True)
+        # Maya 2027 で確認済み: シェイプではなく親トランスフォームを選んで書き出す。
+        cmds_api.select(list(parents), replace=True)
         for command in build_fbx_export_commands(tmp_path, triangulate=triangulate):
             mel(command)
         return _publish_rebase_fbx(tmp_path, final_path, replace_fn, remove_fn)
@@ -1187,6 +1197,58 @@ def _ensure_fbx_plugin(cmds_api):
         raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
 
 
+def _parent_in_dag_path(shape_path):
+    """フルパスに親が書いてあるとき、そのトランスフォームのパスを返す。"""
+    if "|" not in shape_path:
+        return None
+    parent, _shape_name = shape_path.rsplit("|", 1)
+    if not parent:
+        return None
+    return parent
+
+
+def _parent_transform(cmds_api, shape_path):
+    """書き出しに選ぶ親トランスフォーム。
+
+    フルパスならパス上の親を使う。シェイプ名しか無いときは
+    ``listRelatives`` で親を 1 つ辿る。複数ある、または無いときは失敗。
+    """
+    embedded = _parent_in_dag_path(shape_path)
+    if embedded:
+        return embedded
+    try:
+        found = cmds_api.listRelatives(shape_path, parent=True, fullPath=True)
+    except Exception as exc:
+        raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    if isinstance(found, str):
+        parents = [found]
+    elif found:
+        try:
+            parents = list(found)
+        except TypeError as exc:
+            raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
+    else:
+        parents = []
+    if len(parents) != 1 or not isinstance(parents[0], str) or not parents[0]:
+        raise RebaseExportError("書き出し対象の親が見つかりません")
+    return parents[0]
+
+
+def _parent_transforms(cmds_api, shapes):
+    """シェイプごとに親を決め、同じ親は 1 回だけ選ぶ。"""
+    chosen = []
+    seen = set()
+    for shape_path in shapes:
+        parent = _parent_transform(cmds_api, shape_path)
+        if parent in seen:
+            continue
+        seen.add(parent)
+        chosen.append(parent)
+    if not chosen:
+        raise RebaseExportError("書き出し対象の親が見つかりません")
+    return chosen
+
+
 def _ensure_shapes_exist(cmds_api, shapes):
     for path in shapes:
         try:
@@ -1242,7 +1304,12 @@ def _sha1_stream(path):
 
 
 def _publish_rebase_fbx(tmp_path, final_path, replace_fn, remove_fn):
-    """一時ファイルを検査して確定する。失敗時は一時も最終も残さない。"""
+    """一時ファイルを検査して確定する。
+
+    ``replace_fn`` が失敗したときは一時ファイルだけを消す。最終ファイルは
+    この呼び出しが作ったものではないので消さない。replace が成功したあとで
+    サイズが違えば、置いた最終ファイルを消す。
+    """
     tmp_s = os.fspath(tmp_path)
     final_s = os.fspath(final_path)
     if not os.path.lexists(tmp_s):
@@ -1271,12 +1338,11 @@ def _publish_rebase_fbx(tmp_path, final_path, replace_fn, remove_fn):
 
     try:
         # 要実機確認: Windows でウイルス対策や同期ソフトが一時ファイルを
-        # 掴むと os.replace が失敗することがある。失敗時は一時ファイルを
-        # 消して失敗にする(再試行はここでは足さない)。
+        # 掴むと os.replace が失敗することがある。失敗時は一時ファイルだけを
+        # 消す。最終ファイルは消さない(再試行はここでは足さない)。
         replace_fn(tmp_s, final_s)
     except Exception as exc:
         _unlink_quiet(tmp_path, remove_fn)
-        _unlink_quiet(final_path, remove_fn)
         raise RebaseExportError(MSG_FBX_EXPORT_FAILED) from exc
 
     try:

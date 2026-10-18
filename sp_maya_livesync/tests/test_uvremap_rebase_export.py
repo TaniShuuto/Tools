@@ -20,20 +20,31 @@ if _PKG_DIR not in sys.path:
 
 import uvremap_maya as um  # noqa: E402
 
-_SHAPES = ["|group|meshShape", "|group|otherShape"]
+_SHAPES = ["|group|mesh|meshShape", "|group|other|otherShape"]
+_PARENTS = ["|group|mesh", "|group|other"]
 _ABS_PATH_RE = re.compile(
     r"(?:^|[\s'\"`(])(?:/[^\s'\"`]+|[A-Za-z]:[\\/][^\s'\"`]*)"
 )
 
 
 class FakeCmds(object):
-    """pluginInfo / loadPlugin / objExists / ls / select だけを持つ。"""
+    """pluginInfo / loadPlugin / objExists / ls / select / listRelatives を持つ。"""
 
-    def __init__(self, exists=None, plugin_loaded=False, load_error=False, fail_restore=False):
+    def __init__(
+        self,
+        exists=None,
+        plugin_loaded=False,
+        load_error=False,
+        fail_restore=False,
+        parents=None,
+        relatives_error=False,
+    ):
         self.exists = set(exists or [])
         self.plugin_loaded = plugin_loaded
         self.load_error = load_error
         self.fail_restore = fail_restore
+        self.parents = {} if parents is None else parents
+        self.relatives_error = relatives_error
         self.selection = []
         self.calls = []
 
@@ -51,6 +62,15 @@ class FakeCmds(object):
     def objExists(self, path):
         self.calls.append(("objExists", path))
         return path in self.exists
+
+    def listRelatives(self, node, parent=False, fullPath=False):
+        self.calls.append(("listRelatives", node, parent, fullPath))
+        if self.relatives_error:
+            raise RuntimeError("relatives failed")
+        found = self.parents.get(node, [])
+        if isinstance(found, str):
+            return [found]
+        return list(found)
 
     def ls(self, selection=False, long=False):
         self.calls.append(("ls", selection, long))
@@ -247,6 +267,9 @@ def test_export_success_matches_file_and_leaves_no_tmp(tmp_path):
 def test_mel_command_order_triangulate_and_temp_path(tmp_path):
     expected = [
         "FBXResetExport;",
+        "FBXExportInAscii -v false;",
+        "FBXExportEmbeddedTextures -v false;",
+        "FBXExportAnimationOnly -v false;",
         "FBXExportInputConnections -v false;",
         "FBXExportCameras -v false;",
         "FBXExportLights -v false;",
@@ -255,10 +278,12 @@ def test_mel_command_order_triangulate_and_temp_path(tmp_path):
         'FBXExport -f "C:/tmp/bl-1.fbx.tmp" -s;',
     ]
     assert um.build_fbx_export_commands(r"C:\tmp\bl-1.fbx.tmp") == expected
+    assert len(expected) == 10
     assert all(command.endswith(";") for command in expected)
     flipped = um.build_fbx_export_commands("C:/tmp/bl-1.fbx.tmp", triangulate=True)
-    assert flipped[5] == "FBXExportTriangulate -v true;"
+    assert flipped[8] == "FBXExportTriangulate -v true;"
     assert flipped[0] == "FBXResetExport;"
+    assert flipped[1:4] == expected[1:4]
     assert flipped[-1].startswith("FBXExport -f ")
     with pytest.raises(ValueError):
         um.build_fbx_export_commands("C:/tmp/bl-1.fbx.tmp", triangulate=1)
@@ -275,7 +300,14 @@ def test_mel_command_order_triangulate_and_temp_path(tmp_path):
     assert "FBXExportTriangulate -v false;" in mel.commands
     assert mel_export_path(mel.commands[-1]) == os.fspath(tmp)
     assert mel_export_path(mel.commands[-1]) != os.fspath(final)
-    assert all(seen == list(_SHAPES) for seen in mel.selection_at_calls)
+    assert mel.commands[1:4] == [
+        "FBXExportInAscii -v false;",
+        "FBXExportEmbeddedTextures -v false;",
+        "FBXExportAnimationOnly -v false;",
+    ]
+    assert len(mel.commands) == 10
+    assert all(seen == list(_PARENTS) for seen in mel.selection_at_calls)
+    assert not any(call[0] == "listRelatives" for call in cmds.calls)
 
 
 def test_tmp_style_suffix_infix_and_unknown(tmp_path):
@@ -370,7 +402,7 @@ def test_selection_restored_when_mel_fails(tmp_path):
     assert_safe_error(caught.value, tmp_path)
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert cmds.selection == ["|keepA", "|keepB"]
-    assert mel.selection_at_calls[-1] == list(_SHAPES)
+    assert mel.selection_at_calls[-1] == list(_PARENTS)
     assert not tmp.exists()
     assert not final.exists()
 
@@ -383,10 +415,10 @@ def test_selection_cleared_when_previous_was_empty(tmp_path):
     _export(meshes, cmds, mel)
     assert cmds.selection == []
     select_calls = [call for call in cmds.calls if call[0] == "select"]
-    assert select_calls[0][1][0] == list(_SHAPES)
+    assert select_calls[0][1][0] == list(_PARENTS)
     assert select_calls[0][2].get("replace") is True
     assert select_calls[-1][2].get("clear") is True
-    assert all(seen == list(_SHAPES) for seen in mel.selection_at_calls)
+    assert all(seen == list(_PARENTS) for seen in mel.selection_at_calls)
 
 
 def test_keyboard_interrupt_cleans_tmp_and_restores_selection(tmp_path):
@@ -431,14 +463,12 @@ def test_mel_failure_leaves_no_files(tmp_path, kwargs, mode):
     assert not final.exists()
 
 
-def test_replace_exception_leaves_no_files(tmp_path):
+def test_replace_exception_leaves_no_tmp_when_final_was_not_written(tmp_path):
     meshes = tmp_path / "meshes"
     cmds = FakeCmds(exists=_SHAPES, plugin_loaded=True)
     mel = FakeMel(cmds, payload=b"body")
 
     def boom(src, dst):
-        with open(dst, "wb") as handle:
-            handle.write(b"partial-final")
         raise RuntimeError("replace failed")
 
     final, tmp = _paths(meshes)
@@ -448,6 +478,32 @@ def test_replace_exception_leaves_no_files(tmp_path):
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert not tmp.exists()
     assert not final.exists()
+
+
+def test_replace_failure_keeps_final_file(tmp_path):
+    meshes = tmp_path / "meshes"
+    cmds = FakeCmds(exists=_SHAPES, plugin_loaded=True)
+    mel = FakeMel(cmds, payload=b"body")
+    removed = []
+
+    def remove_fn(path):
+        removed.append(os.path.basename(path))
+        os.remove(path)
+
+    def boom(src, dst):
+        with open(dst, "wb") as handle:
+            handle.write(b"leave-this-final")
+        raise RuntimeError("replace failed")
+
+    final, tmp = _paths(meshes)
+    with pytest.raises(um.RebaseExportError) as caught:
+        _export(meshes, cmds, mel, replace_fn=boom, remove_fn=remove_fn)
+    assert_safe_error(caught.value, tmp_path)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert not tmp.exists()
+    assert final.read_bytes() == b"leave-this-final"
+    assert tmp.name in removed
+    assert final.name not in removed
 
 
 @pytest.mark.parametrize(
@@ -469,7 +525,7 @@ def test_bad_shapes_do_not_touch_selection(tmp_path, shapes):
 
 def test_missing_shape_does_not_change_selection(tmp_path):
     meshes = tmp_path / "meshes"
-    cmds = FakeCmds(exists=["|group|meshShape"], plugin_loaded=True)
+    cmds = FakeCmds(exists=["|group|mesh|meshShape"], plugin_loaded=True)
     cmds.selection = ["|keep"]
     mel = FakeMel(cmds)
     final, tmp = _paths(meshes)
@@ -479,9 +535,80 @@ def test_missing_shape_does_not_change_selection(tmp_path):
     assert cmds.selection == ["|keep"]
     assert not any(call[0] == "select" for call in cmds.calls)
     assert not any(call[0] == "mel" for call in cmds.calls)
-    assert ("objExists", "|group|otherShape") in cmds.calls
+    assert ("objExists", "|group|other|otherShape") in cmds.calls
     assert not tmp.exists()
     assert not final.exists()
+
+
+def test_selects_parent_from_full_path_once(tmp_path):
+    meshes = tmp_path / "meshes"
+    shapes = ["|g|mesh|aShape", "|g|mesh|bShape"]
+    cmds = FakeCmds(exists=shapes, plugin_loaded=True)
+    mel = FakeMel(cmds, payload=b"same-parent")
+    _export(meshes, cmds, mel, shape_paths=shapes, baseline_id="bl-parent")
+    assert mel.selection_at_calls[0] == ["|g|mesh"]
+    assert not any(call[0] == "listRelatives" for call in cmds.calls)
+
+
+def test_walks_parent_when_only_shape_name_is_known(tmp_path):
+    meshes = tmp_path / "meshes"
+    cmds = FakeCmds(
+        exists=["pCubeShape", "|onlyShape"],
+        plugin_loaded=True,
+        parents={
+            "pCubeShape": ["|char|pCube"],
+            "|onlyShape": ["|char|only"],
+        },
+    )
+    mel = FakeMel(cmds, payload=b"walked")
+    _export(
+        meshes,
+        cmds,
+        mel,
+        shape_paths=["pCubeShape", "|onlyShape"],
+        baseline_id="bl-walk",
+    )
+    assert mel.selection_at_calls[0] == ["|char|pCube", "|char|only"]
+    relatives = [call for call in cmds.calls if call[0] == "listRelatives"]
+    assert relatives == [
+        ("listRelatives", "pCubeShape", True, True),
+        ("listRelatives", "|onlyShape", True, True),
+    ]
+
+
+@pytest.mark.parametrize("found", [[], ["|a|mesh", "|b|mesh"], [""], [None]])
+def test_parent_walk_failure_does_not_change_selection(tmp_path, found):
+    meshes = tmp_path / "meshes"
+    cmds = FakeCmds(
+        exists=["pCubeShape"],
+        plugin_loaded=True,
+        parents={"pCubeShape": found},
+    )
+    cmds.selection = ["|keep"]
+    mel = FakeMel(cmds)
+    final, tmp = _paths(meshes, "bl-noparent")
+    with pytest.raises(um.RebaseExportError) as caught:
+        _export(meshes, cmds, mel, shape_paths=["pCubeShape"], baseline_id="bl-noparent")
+    assert_safe_error(caught.value, tmp_path)
+    assert cmds.selection == ["|keep"]
+    assert not any(call[0] == "select" for call in cmds.calls)
+    assert mel.commands == []
+    assert not tmp.exists()
+    assert not final.exists()
+
+
+def test_parent_walk_error_does_not_change_selection(tmp_path):
+    meshes = tmp_path / "meshes"
+    cmds = FakeCmds(exists=["pCubeShape"], plugin_loaded=True, relatives_error=True)
+    cmds.selection = ["|keep"]
+    mel = FakeMel(cmds)
+    with pytest.raises(um.RebaseExportError) as caught:
+        _export(meshes, cmds, mel, shape_paths=["pCubeShape"], baseline_id="bl-rel")
+    assert_safe_error(caught.value, tmp_path)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert cmds.selection == ["|keep"]
+    assert not any(call[0] == "select" for call in cmds.calls)
+    assert mel.commands == []
 
 
 def test_load_plugin_error(tmp_path):
