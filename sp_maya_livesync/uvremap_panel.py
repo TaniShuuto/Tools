@@ -84,6 +84,9 @@ LABEL_ENABLE = "UV変換を有効にする"
 LABEL_CONVERT = "今すぐ変換"
 LABEL_REVERT = "原本に戻す"
 LABEL_REFRESH = "更新"
+# 2026.10.19(RB-d): リベース欄。引数を省略したパネルには出さない。
+LABEL_REBASE_SEND = "Painterへ送る"
+LABEL_REBASE_CANCEL = "依頼を取り消す"
 LABEL_DISABLED = "UV変換は無効(従来のLive Syncの動作)"
 LABEL_NO_INFO = "情報なし"
 LABEL_NO_PROJECT = "プロジェクト未設定"
@@ -132,6 +135,38 @@ class StatusView:
 def color_for_state(state: str) -> str:
     """既知の状態は規約色。未知の状態名は取り違え防止のため注意色。"""
     return STATE_COLORS.get(state, COLOR_ATTENTION)
+
+
+def color_for_rebase_phase(phase: str) -> str:
+    """リベースの phase を既存の色トークンへ対応させる。
+
+    done は OK、failed は WARN、待ち・作業・ロック・取り消し中は ATTENTION、
+    終わったものは MUTED。
+    """
+    if phase == "done":
+        return COLOR_OK
+    if phase == "failed":
+        return COLOR_WARN
+    if phase in ("waiting", "working", "locked", "canceling"):
+        return COLOR_ATTENTION
+    if phase == "ended":
+        return COLOR_MUTED
+    return COLOR_MUTED
+
+
+def normalize_rebase_view(raw) -> dict:
+    """``get_rebase_view`` の戻りを画面用に整える。不正なら空欄。"""
+    empty = {"text": "", "phase": "", "can_send": False, "can_cancel": False}
+    if not isinstance(raw, dict):
+        return empty
+    text = raw.get("text")
+    phase = raw.get("phase")
+    return {
+        "text": text if isinstance(text, str) else "",
+        "phase": phase if isinstance(phase, str) else "",
+        "can_send": bool(raw.get("can_send")),
+        "can_cancel": bool(raw.get("can_cancel")),
+    }
 
 
 def empty_rows_label(status_path) -> str:
@@ -350,6 +385,9 @@ def _uvremap_panel_class():
             on_toggle_auto_follow_uv: Callable[[bool], None] | None = None,
             converting_stale_s: float = CONVERTING_STALE_SECONDS,
             now_fn: Callable[[], datetime] | None = None,
+            on_rebase_send: Callable[[], None] | None = None,
+            on_rebase_cancel: Callable[[], None] | None = None,
+            get_rebase_view: Callable[[], dict | None] | None = None,
         ) -> None:
             super().__init__(parent)
             self._on_toggle_enabled = on_toggle_enabled
@@ -361,6 +399,9 @@ def _uvremap_panel_class():
             self._on_toggle_auto_follow = on_toggle_auto_follow
             self._get_auto_follow_uv = get_auto_follow_uv
             self._on_toggle_auto_follow_uv = on_toggle_auto_follow_uv
+            self._on_rebase_send = on_rebase_send
+            self._on_rebase_cancel = on_rebase_cancel
+            self._get_rebase_view = get_rebase_view
             self._converting_stale_s = converting_stale_s
             self._now_fn = now_fn if now_fn is not None else datetime.now
 
@@ -437,6 +478,34 @@ def _uvremap_panel_class():
             buttons.addWidget(self._btn_refresh)
             root.addLayout(buttons)
 
+            # 2026.10.19(RB-d): 引数をすべて省略したときは欄を作らない。
+            self._rebase_status = None
+            self._btn_rebase_send = None
+            self._btn_rebase_cancel = None
+            if (
+                on_rebase_send is not None
+                or on_rebase_cancel is not None
+                or get_rebase_view is not None
+            ):
+                self._rebase_status = QtWidgets.QLabel("")
+                self._rebase_status.setObjectName("rebase_status")
+                self._rebase_status.setWordWrap(True)
+                self._rebase_status.setTextInteractionFlags(
+                    QtCore.Qt.TextSelectableByMouse
+                )
+                root.addWidget(self._rebase_status)
+                rebase_buttons = QtWidgets.QHBoxLayout()
+                self._btn_rebase_send = QtWidgets.QPushButton(LABEL_REBASE_SEND)
+                self._btn_rebase_send.setObjectName("btn_rebase_send")
+                self._btn_rebase_send.clicked.connect(self._emit_rebase_send)
+                self._btn_rebase_cancel = QtWidgets.QPushButton(LABEL_REBASE_CANCEL)
+                self._btn_rebase_cancel.setObjectName("btn_rebase_cancel")
+                self._btn_rebase_cancel.clicked.connect(self._emit_rebase_cancel)
+                rebase_buttons.addWidget(self._btn_rebase_send)
+                rebase_buttons.addWidget(self._btn_rebase_cancel)
+                rebase_buttons.addStretch(1)
+                root.addLayout(rebase_buttons)
+
             self._timer = QtCore.QTimer(self)
             self._timer.setObjectName("refresh_timer")
             self._timer.setInterval(REFRESH_INTERVAL_MS)
@@ -467,6 +536,41 @@ def _uvremap_panel_class():
                 now_fn=self._now_fn,
             ).load()
             self._render(view, enabled, status_path)
+            self._refresh_rebase()
+
+        def _refresh_rebase(self) -> None:
+            if self._rebase_status is None:
+                return
+            raw = None
+            if self._get_rebase_view is not None:
+                try:
+                    raw = self._get_rebase_view()
+                except Exception:
+                    raw = None
+            view = normalize_rebase_view(raw)
+            self._rebase_status.setText(view["text"])
+            color = color_for_rebase_phase(view["phase"]) if view["text"] else COLOR_MUTED
+            self._apply_state_style(self._rebase_status, color)
+            if self._btn_rebase_send is not None:
+                self._btn_rebase_send.setEnabled(view["can_send"])
+            if self._btn_rebase_cancel is not None:
+                self._btn_rebase_cancel.setEnabled(view["can_cancel"])
+
+        def _emit_rebase_send(self) -> None:
+            if self._on_rebase_send is None:
+                return
+            try:
+                self._on_rebase_send()
+            except Exception:
+                pass
+
+        def _emit_rebase_cancel(self) -> None:
+            if self._on_rebase_cancel is None:
+                return
+            try:
+                self._on_rebase_cancel()
+            except Exception:
+                pass
 
         def _read_enabled(self) -> bool:
             if self._get_enabled is None:

@@ -106,6 +106,8 @@ TOOL_FILE_NAMES = [
     "uvremap_panel.py",
     "uvremap_integration.py",
     "uvremap_follow.py",
+    # 2026.10.19(RB-d): install.py の TOOL_FILES と同じく、導入したファイルは消す。
+    "uvremap_rebase.py",
 ]
 LIVESYNC_LABEL = "LiveSync"
 AISS_LABEL = "aiSS"

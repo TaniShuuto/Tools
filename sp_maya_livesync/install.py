@@ -131,6 +131,8 @@ TOOL_FILES = [
     {"name": "uvremap_panel.py", "required": False},
     {"name": "uvremap_integration.py", "required": False},
     {"name": "uvremap_follow.py", "required": False},
+    # 2026.10.19(RB-d): uvremap_integration が import するため、登録を忘れると導入後に読めない。
+    {"name": "uvremap_rebase.py", "required": False},
 ]
 
 # --- シェルフアイコン画像(任意) --------------------------------------------
