@@ -1735,6 +1735,33 @@ def _set_current_uv(cmds, shape, uv_set_name):
     cmds.polyUVSet(shape, currentUVSet=True, uvSet=uv_set_name)
 
 
+def _attach_export_uvold(exc, info):
+    """書き出しが失敗しても、uvOld が残ったことを呼び出し側が読めるようにする。"""
+    if exc is None or not isinstance(info, dict):
+        return
+    warnings = info.get("warnings") or []
+    if UVOLD_CLEANUP_FAILED not in warnings:
+        return
+    shapes = []
+    for name in info.get("shapes") or []:
+        if isinstance(name, str) and name:
+            shapes.append(name)
+    codes = []
+    for code in warnings:
+        if isinstance(code, str) and code and code not in codes:
+            codes.append(code)
+    name = info.get("name") if isinstance(info.get("name"), str) else None
+    try:
+        exc.uvold_info = {
+            "applied": bool(info.get("applied")),
+            "name": name,
+            "warnings": codes,
+            "shapes": shapes,
+        }
+    except Exception:
+        pass
+
+
 def _cleanup_created_uvolds(cmds, created, info):
     """作ったセットだけ消す。1 つが失敗しても他は続ける。例外は握る。"""
     if not created or cmds is None:
@@ -1826,6 +1853,8 @@ def export_rebase_mesh_with_uvold(
     created = []
     cmds_api = _resolve_cmds(cmds)
     undo_prev, undo_stopped = _pause_undo_recording(cmds_api)
+    export_exc = None
+    mesh = None
     try:
         try:
             _attach_uvold(
@@ -1856,14 +1885,18 @@ def export_rebase_mesh_with_uvold(
             remove_fn=remove_fn,
             tmp_style=tmp_style,
         )
-        return mesh, info
+    except BaseException as exc:
+        export_exc = exc
+        raise
     finally:
         try:
             _cleanup_created_uvolds(cmds_api, created, info)
         except Exception:
             _append_warning(info, UVOLD_CLEANUP_FAILED)
+        _attach_export_uvold(export_exc, info)
         created.clear()
         _restore_undo_recording(cmds_api, undo_prev, undo_stopped)
+    return mesh, info
 
 
 def _attach_uvold(

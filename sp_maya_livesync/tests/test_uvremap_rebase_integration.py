@@ -358,6 +358,7 @@ def test_replace_confirms_once_and_locked_does_not(tmp_path, monkeypatch):
     assert rb.cancel_exists(ctrl._work, first["request_id"])
 
     _put_status(ctrl, second["request_id"], "backing_up")
+    ctrl.rebase_tick(ctrl._clock["t"] + 5)
     locked_view = ctrl.rebase_view()
     assert locked_view["phase"] == "locked"
     assert locked_view["can_send"] is False
@@ -476,7 +477,8 @@ def test_done_completes_once_and_guides_once(tmp_path):
     second = ctrl.rebase_tick(102.0)
     assert _kinds(ctrl).count("complete") == 1
     assert sum(1 for _s, text in ctrl._history if text == rb.MSG_DONE_GUIDANCE) == 1
-    assert second["message"] == rb.MSG_DONE_GUIDANCE
+    assert second["message"] == ""
+    assert ctrl.rebase_view()["text"] == rb.MSG_DONE_GUIDANCE
 
 
 @pytest.mark.parametrize("over,reason_file", [
@@ -503,7 +505,8 @@ def test_unconfirmed_done_does_not_complete_or_discard(tmp_path, over, reason_fi
     assert ctrl.rebase_view()["phase"] == "failed"
     assert ctrl.rebase_view()["can_cancel"] is False
     again = ctrl.rebase_tick(102.0)
-    assert again["message"] == rb.MSG_RESULT_UNCONFIRMED
+    assert again["message"] == ""
+    assert ctrl.rebase_view()["text"] == rb.MSG_RESULT_UNCONFIRMED
     assert sum(1 for _s, text in ctrl._history if text == rb.MSG_RESULT_UNCONFIRMED) == 1
     assert reason_file
 
@@ -525,21 +528,20 @@ def test_killswitch_and_scene_wait_without_complete(tmp_path):
     assert shown["message"] == integ.MSG_REBASE_DONE_SKIPPED_FMT["scene_changed"]
 
 
-def test_job_running_and_partial_retry_then_stop(tmp_path):
+def test_job_running_does_not_consume_retries_partial_stops_at_five(tmp_path):
     ctrl = _make(tmp_path)
     sent = ctrl.rebase_send()
     _arm_done(ctrl, sent["request_id"])
     ctrl._runtime.complete_results = [
         {"status": "skipped", "reason": "job_running", "failed_step": None}
-        for _ in range(6)
+        for _ in range(8)
     ]
-    for step in range(5):
+    for step in range(8):
         ctrl.rebase_tick(100.0 + step)
-    assert _kinds(ctrl).count("complete") == 5
-    ctrl.rebase_tick(100.0 + 5)
-    assert _kinds(ctrl).count("complete") == 5
-    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
-    assert sum(1 for _s, text in ctrl._history if text == integ.MSG_REBASE_RETRY_EXHAUSTED) == 1
+    assert _kinds(ctrl).count("complete") == 8
+    assert ctrl._rebase_complete_tries.get(sent["request_id"], 0) == 0
+    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_DONE_SKIPPED_FMT["job_running"]
+    assert integ.MSG_REBASE_RETRY_EXHAUSTED not in [text for _s, text in ctrl._history]
 
     ctrl = _make(tmp_path)
     sent = ctrl.rebase_send()
@@ -551,12 +553,16 @@ def test_job_running_and_partial_retry_then_stop(tmp_path):
     shown = ctrl.rebase_tick(200.0)
     assert "active" in shown["message"]
     assert "もう一度試します" in shown["message"]
+    messages = [shown["message"]]
     for step in range(1, 5):
-        ctrl.rebase_tick(200.0 + step)
+        messages.append(ctrl.rebase_tick(200.0 + step)["message"])
     assert _kinds(ctrl).count("complete") == 5
-    stopped = ctrl.rebase_tick(206.0)
+    assert integ.MSG_REBASE_RETRY_EXHAUSTED in messages
+    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    assert sum(1 for _s, text in ctrl._history if text == integ.MSG_REBASE_RETRY_EXHAUSTED) == 1
+    stopped = ctrl.rebase_tick(210.0)
     assert _kinds(ctrl).count("complete") == 5
-    assert stopped["message"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    assert stopped["message"] == ""
 
 
 def test_foreign_and_completed_records_are_left_alone(tmp_path):
@@ -838,3 +844,215 @@ def test_public_methods_swallow_runtime_errors(tmp_path):
     finally:
         rb.write_cancel = original
     assert isinstance(ctrl.rebase_view(), dict)
+
+
+class _Bar:
+    def __init__(self):
+        self.texts = []
+
+    def set_message(self, text):
+        self.texts.append(text)
+
+
+def test_poll_keeps_send_text_and_other_button_text(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    assert sent["message"] == integ.MSG_REBASE_SENT
+    handle = _Bar()
+    integ.run_poll_tick(ctrl, handle, now_ns=2_000_000_000)
+    assert handle.texts == []
+    handle.texts.append("変換を開始しました")
+    integ.run_poll_tick(ctrl, handle, now_ns=5_000_000_000)
+    assert handle.texts == ["変換を開始しました"]
+
+    def dirty(shape_paths, meshes_dir, baseline_id, triangulate=False, **kwargs):
+        path = Path(meshes_dir) / "{0}.fbx".format(baseline_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"FBX!")
+        return (
+            {"path": str(path), "size": 4, "sha1": SHA},
+            {
+                "applied": True,
+                "name": "uvOld",
+                "warnings": ["uvold_cleanup_failed"],
+                "shapes": ["pSphereShape1"],
+            },
+        )
+
+    ctrl = _make(tmp_path, export=dirty)
+    result = ctrl.rebase_send()
+    assert "削除できませんでした" in result["message"]
+    handle = _Bar()
+    integ.run_poll_tick(ctrl, handle, now_ns=2_000_000_000)
+    assert handle.texts == []
+    _put_status(ctrl, result["request_id"], "received")
+    integ.run_poll_tick(ctrl, handle, now_ns=8_000_000_000)
+    assert handle.texts == [rb.MSG_PREPARING]
+
+
+def test_export_and_cleanup_failure_reaches_screen_and_history(tmp_path):
+    def failing(*_args, **_kwargs):
+        err = RuntimeError("export")
+        err.uvold_info = {
+            "applied": True,
+            "name": "uvOld",
+            "warnings": ["uvold_cleanup_failed"],
+            "shapes": ["pSphereShape1"],
+        }
+        raise err
+
+    ctrl = _make(tmp_path, export=failing)
+    result = ctrl.rebase_send()
+    assert result["ok"] is False
+    assert "削除できませんでした" in result["message"]
+    assert "pSphereShape1" in result["message"]
+    assert integ.MSG_REBASE_SEND_FAILED not in result["message"]
+    assert any("pSphereShape1" in text for _source, text in ctrl._history)
+    assert "/" not in result["message"]
+
+
+def test_exception_after_write_request_is_still_sent(tmp_path, monkeypatch):
+    ctrl = _make(tmp_path)
+
+    def boom(self, _uvold):
+        raise RuntimeError("after write")
+
+    monkeypatch.setattr(integ.UVRemapController, "_uvold_history_line", boom)
+    result = ctrl.rebase_send()
+    assert result["ok"] is True
+    assert result["message"] != integ.MSG_REBASE_SEND_FAILED
+    assert "送れませんでした" not in result["message"]
+    assert ctrl._rebase_blocks_follow is True
+    assert len(rb.list_requests(ctrl._work)) == 1
+
+
+def test_follow_block_releases_except_open_and_recent_done(tmp_path):
+    ctrl = _make(tmp_path)
+    calls = []
+    ctrl._follow_tick_impl = lambda now_ns: calls.append(now_ns) or {"ok": True, "message": ""}
+    sent = ctrl.rebase_send()
+    ctrl.follow_tick(1)
+    assert calls == []
+
+    ctrl = _make(tmp_path)
+    calls = []
+    ctrl._follow_tick_impl = lambda now_ns: calls.append(now_ns) or {"ok": True, "message": ""}
+    sent = ctrl.rebase_send()
+    _put_status(ctrl, sent["request_id"], "done")
+    (ctrl._final / "_sync_result.json").unlink()
+    ctrl.rebase_tick(100.0)
+    ctrl.follow_tick(1)
+    assert calls == []
+    assert ctrl.rebase_view()["text"] == rb.MSG_RESULT_UNCONFIRMED
+    assert "discard" not in _kinds(ctrl)
+    ctrl.rebase_tick(160.0)
+    ctrl.follow_tick(2)
+    assert calls == []
+    ctrl.rebase_tick(161.0)
+    ctrl.follow_tick(3)
+    assert calls == [3]
+    assert ctrl.rebase_view()["text"] == rb.MSG_RESULT_UNCONFIRMED
+    assert "discard" not in _kinds(ctrl)
+
+    ctrl = _make(tmp_path)
+    calls = []
+    ctrl._follow_tick_impl = lambda now_ns: calls.append(now_ns) or {"ok": True, "message": ""}
+    sent = ctrl.rebase_send()
+    _arm_done(ctrl, sent["request_id"])
+    ctrl._runtime.complete_results = [
+        {"status": "partial", "reason": "", "failed_step": "active"}
+        for _ in range(6)
+    ]
+    for step in range(5):
+        ctrl.rebase_tick(300.0 + step)
+    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    ctrl.follow_tick(1)
+    assert calls == []
+    ctrl.rebase_tick(361.0)
+    ctrl.follow_tick(2)
+    assert calls == [2]
+    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    assert "discard" not in _kinds(ctrl)
+
+    ctrl = _make(tmp_path)
+    calls = []
+    ctrl._follow_tick_impl = lambda now_ns: calls.append(now_ns) or {"ok": True, "message": ""}
+    sent = ctrl.rebase_send()
+    _arm_done(ctrl, sent["request_id"])
+    ctrl._runtime.scene_id = "scene-other"
+    ctrl.rebase_tick(400.0)
+    assert ctrl._rebase_blocks_follow is False
+    ctrl.follow_tick(9)
+    assert calls == [9]
+    assert "complete" not in _kinds(ctrl)
+    assert ctrl._runtime.records[sent["request_id"]]["scene_id"] != ctrl._runtime.scene_id
+
+    ctrl._clock["t"] += 1
+    second = ctrl.rebase_send()
+    assert second["ok"] is True
+    ctrl.rebase_tick(402.0)
+    ctrl.follow_tick(10)
+    assert calls == [9]
+    assert ctrl._rebase_blocks_follow is True
+
+
+def test_restart_does_not_repeat_terminal_history(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    _put_status(ctrl, sent["request_id"], "failed", message="書き出せません")
+    ctrl.rebase_tick(100.0)
+    failed = [text for _source, text in ctrl._history if "書き出せません" in text]
+    assert failed
+    ctrl._rebase_live_ids.clear()
+    ctrl._rebase_noted.clear()
+    ctrl._rebase_discarded.clear()
+    ctrl._rebase_frozen_view.clear()
+    ctrl._rebase_emitted_text = None
+    ctrl._rebase_last_tick_s = None
+    ctrl.rebase_tick(200.0)
+    assert [text for _source, text in ctrl._history if "書き出せません" in text] == failed
+
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    ctrl._rebase_live_ids.clear()
+    ctrl.rebase_tick(100.0)
+    _put_status(ctrl, sent["request_id"], "failed", message="書き出せません")
+    ctrl._rebase_last_tick_s = None
+    ctrl.rebase_tick(102.0)
+    assert any("書き出せません" in text for _source, text in ctrl._history)
+
+
+def test_settled_requests_skip_later_status_reads(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    real = rb.read_status
+
+    def wrapped(root, request_id):
+        calls["n"] += 1
+        return real(root, request_id)
+
+    monkeypatch.setattr(rb, "read_status", wrapped)
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    _put_status(ctrl, sent["request_id"], "declined")
+    calls["n"] = 0
+    ctrl.rebase_tick(100.0)
+    assert calls["n"] >= 1
+    calls["n"] = 0
+    ctrl.rebase_tick(102.0)
+    assert calls["n"] == 0
+    ctrl.rebase_view()
+    assert calls["n"] == 0
+
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    _arm_done(ctrl, sent["request_id"])
+    calls["n"] = 0
+    ctrl.rebase_tick(200.0)
+    assert calls["n"] >= 1
+    assert _kinds(ctrl).count("complete") == 1
+    calls["n"] = 0
+    ctrl.rebase_tick(202.0)
+    assert calls["n"] == 0
+    ctrl.rebase_view()
+    assert calls["n"] == 0
+    assert ctrl.rebase_view()["text"] == rb.MSG_DONE_GUIDANCE

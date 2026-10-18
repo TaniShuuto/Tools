@@ -313,6 +313,36 @@ def test_export_failure_still_cleans_uvold(tmp_path, fail):
     assert cmds.undo is True
 
 
+def test_export_and_cleanup_failure_marks_the_exception(tmp_path):
+    shape = "|grp|pSphereShape1"
+    cmds = FakeCmds([shape])
+    cmds.delete_fail.add(shape)
+    snap = _snap(
+        [4], [0, 1, 2, 3],
+        [[0, 0], [1, 0], [1, 1], [0, 1]],
+        [0], ["UUID-A"],
+    )
+    with pytest.raises(um.RebaseExportError) as caught:
+        um.export_rebase_mesh_with_uvold(
+            [shape], tmp_path, "bl-1",
+            baseline_snapshot=snap,
+            candidate_snapshot=snap,
+            cmds=cmds,
+            uuid_fn=lambda _shape: "UUID-A",
+            fill_uvs_fn=_fill_recorder(cmds.log),
+            export_fn=_export_recorder(
+                cmds.log, fail=um.RebaseExportError("メッシュの書き出しに失敗しました"),
+            ),
+        )
+    info = getattr(caught.value, "uvold_info", None)
+    assert isinstance(info, dict)
+    assert um.UVOLD_CLEANUP_FAILED in info["warnings"]
+    assert info["name"] == "uvOld"
+    assert info["shapes"] == ["pSphereShape1"]
+    assert "/" not in "".join(info["shapes"])
+    assert cmds.undo is True
+
+
 def test_create_or_fill_failure_exports_without_uvold():
     shapes = ["|a|shapeA", "|b|shapeB"]
     snap = _quad_tri(uuids=("UUID-A", "UUID-B"), face_mesh=(0, 1))
