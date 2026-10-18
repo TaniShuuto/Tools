@@ -172,6 +172,7 @@ def _yes_exists(_path):
 def _make_runtime(
     tmp_path, *, enabled=True, cmds=None, popen=None, collect=None, mayapy=None,
     exists_fn=None, scene_id_fn=None, max_parallel_fn=None, time_fn=None, mtime_fn=None,
+    uv_fingerprints_fn=None,
 ):
     root = tmp_path / "uvremap" / "proj"
     root.mkdir(parents=True, exist_ok=True)
@@ -204,6 +205,7 @@ def _make_runtime(
         max_parallel_fn=max_parallel_fn,
         time_fn=time_fn,
         mtime_fn=mtime_fn,
+        uv_fingerprints_fn=uv_fingerprints_fn,
     )
     runtime._now_box = now_box
     runtime._root_path = root
@@ -2172,3 +2174,57 @@ def test_mark_stale_only_from_converted_ok(tmp_path):
     assert status["ts"][TS]["message"] == "fail"
 
     assert runtime.mark_stale("proj", "Missing", "nope") is False
+
+
+def test_launch_writes_uv_fp_per_ts(tmp_path):
+    import uvremap_follow as follow
+
+    seen = {}
+
+    def fake(shape_paths, uv_set=None):
+        seen["paths"] = list(shape_paths)
+        seen["uv_set"] = uv_set
+        return ({str(path): (7, 3) for path in shape_paths}, 0.002)
+
+    popen = CapturedPopen(code=None)
+    runtime = _make_runtime(
+        tmp_path, popen=popen, scene_id_fn=lambda: "sceneA.ma",
+        uv_fingerprints_fn=fake,
+    )
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    _touch_src(src, mtime_ns=1234)
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh", "other"], src, out, channels=_CH_BC,
+        udim=False, timeout_s=30, uv_fp_shapes=["meshShape"],
+    )
+    assert job_id
+    row = follow.load_follow(runtime._root_path)["ts"][TS]
+    assert row["uv_fp"] == {"meshShape": [7, 3]}
+    assert row["last_job_id"] == job_id
+    assert seen["paths"] == ["meshShape"]
+
+
+def test_launch_continues_when_uv_fingerprint_fails(tmp_path):
+    import uvremap_follow as follow
+
+    def boom(shape_paths, uv_set=None):
+        raise RuntimeError("fingerprint failed")
+
+    popen = CapturedPopen(code=None)
+    runtime = _make_runtime(tmp_path, popen=popen, uv_fingerprints_fn=boom)
+    runtime.record_baseline("proj", [TS], ["mesh"])
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    _touch_src(src)
+    job_id = runtime.convert_now(
+        "proj", TS, ["mesh"], src, out, channels=_CH_BC, udim=False, timeout_s=30,
+    )
+    assert job_id
+    assert len(popen.calls) == 1
+    row = follow.load_follow(runtime._root_path)["ts"][TS]
+    assert "uv_fp" not in row
+    assert row["last_job_id"] == job_id

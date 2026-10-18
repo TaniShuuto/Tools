@@ -12,20 +12,30 @@ import time
 from pathlib import Path
 
 from uvremap_follow import (
+    LABEL_APPLY,
     MSG_AUTO_INPUT_AS_IS,
     MSG_INPUT_STALE,
     MSG_PAINTER_START_FMT,
     MSG_PEND_FMT,
     MSG_QUEUE_FMT,
+    MSG_UV_SLOW,
+    MSG_UV_STALE,
+    MSG_UV_START_FMT,
+    STATE_CONVERTED_OK,
+    STATE_STALE,
     _flag_is_newer,
     _settled_ns,
+    apply_button_visible,
     decide_follow,
+    decide_uv_follow,
     fold_status_label_p2,
     input_stale,
     load_follow,
     normalize_follow_settings,
     save_follow,
+    fingerprint_maps_differ,
     source_signature,
+    uv_recorded_differs,
 )
 from uvremap_runtime import (
     MSG_ALREADY_RUNNING,
@@ -43,6 +53,8 @@ import uvremap_bridge as br
 DEFAULT_UVREMAP_ROOT = "C:/SPMayaLiveSync/uvremap"
 CONVERT_TIMEOUT_S = 1200
 POLL_INTERVAL_MS = 1000
+UV_SLOW_LIMIT_S = 0.2
+UV_SLOW_POLL_S = 10.0
 
 MSG_NO_PROJECT = (
     "作業対象のプロジェクトがリンクされていません。"
@@ -152,6 +164,50 @@ def resolve_targets(known_ts, texture_sets):
             if shape:
                 shapes.add(str(shape))
     return ts_names, sorted(shapes), missing
+
+
+def ts_by_shape_from_texture_sets(texture_sets):
+    """``list_texture_sets`` の結果から ``{シェイプ名: (TS名, ...)}`` を作る。
+
+    TS 名は昇順。シーン走査はしない。``uv_tick`` はこの結果をメモリから使う。
+    """
+    mapping = {}
+    if not isinstance(texture_sets, dict):
+        return {}
+    for ts_name, entries in texture_sets.items():
+        if not isinstance(ts_name, str) or not ts_name:
+            continue
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, (list, tuple)):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            shape = entry.get("shape")
+            if not isinstance(shape, str) or not shape:
+                continue
+            mapping.setdefault(shape, set()).add(ts_name)
+    return {shape: tuple(sorted(names)) for shape, names in sorted(mapping.items())}
+
+
+def _split_fingerprint_result(result):
+    """``(mapping, elapsed_s)`` または mapping。合わなければ ``(None, 0.0)``。"""
+    mapping = None
+    elapsed = 0.0
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict):
+        mapping = result[0]
+        try:
+            elapsed = float(result[1])
+        except (TypeError, ValueError):
+            elapsed = 0.0
+    elif isinstance(result, dict):
+        mapping = result
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        elapsed = 0.0
+    if elapsed < 0:
+        elapsed = 0.0
+    return mapping, float(elapsed)
 
 
 def uvremap_root_for_project(root_dir, final_subfolder):
@@ -444,6 +500,7 @@ class UVRemapController:
         list_texture_sets_fn,
         runtime=None,
         history_fn=None,
+        uv_fingerprints_fn=None,
     ):
         self.get_config = get_config
         self.save_config_fn = save_config_fn
@@ -453,6 +510,14 @@ class UVRemapController:
         self.final_subfolder_fn = final_subfolder_fn
         self.list_texture_sets_fn = list_texture_sets_fn
         self.history_fn = history_fn
+        self.uv_fingerprints_fn = uv_fingerprints_fn
+        self._ts_by_shape = {}
+        self._cached_shape_paths = []
+        self._uv_last_poll_s = None
+        self._uv_prev_fps = None
+        self._uv_last_change_at = None
+        self._uv_slow = False
+        self._uv_slow_noted = False
         self._follow_last_flag_mtime_ns = None
         self._follow_last_change_seen_ns = None
         # 重い段階を最後まで済ませた印。落ち着き待ちでは更新しない。
@@ -493,6 +558,9 @@ class UVRemapController:
 
     def _auto_follow_from_config(self):
         return bool(self._follow_settings_from_config()["uvremap_auto_follow"])
+
+    def _auto_follow_uv_from_config(self):
+        return self._follow_settings_from_config()["uvremap_auto_follow_uv"] is True
 
     def _max_parallel_from_config(self):
         return self._follow_settings_from_config()["uvremap_max_parallel"]
@@ -562,6 +630,7 @@ class UVRemapController:
             texture_sets = self._call(self.list_texture_sets_fn)
         except Exception:
             texture_sets = {}
+        self._remember_texture_sets(texture_sets, known)
         ts_names, shapes, missing = resolve_targets(known, texture_sets)
         if not ts_names:
             extra = ""
@@ -630,6 +699,57 @@ class UVRemapController:
         except Exception:
             return {"ok": False, "message": "設定の更新に失敗しました"}
 
+    def set_auto_follow_uv(self, enabled):
+        """``uvremap_auto_follow_uv`` を部分マージで保存する。"""
+        try:
+            enabled = bool(enabled)
+            was = self._auto_follow_uv_from_config()
+            cfg = self._safe_config()
+            if isinstance(cfg, dict):
+                cfg["uvremap_auto_follow_uv"] = enabled
+            self.save_config_fn({"uvremap_auto_follow_uv": enabled})
+            if enabled != was:
+                self._follow_force_heavy = True
+            return {"ok": True, "message": "", "auto_follow_uv": enabled}
+        except Exception:
+            return {"ok": False, "message": "設定の更新に失敗しました"}
+
+    def _remember_texture_sets(self, texture_sets, known=None):
+        """シーン走査の結果をメモリに持つ。``uv_tick`` はここを読む。"""
+        self._ts_by_shape = ts_by_shape_from_texture_sets(texture_sets)
+        if known is None:
+            key = self._project_key()
+            if not key:
+                known = []
+            else:
+                try:
+                    known = self._call(self.known_ts_fn, key)
+                except Exception:
+                    known = []
+        _ts_names, shapes, _missing = resolve_targets(known, texture_sets)
+        self._cached_shape_paths = list(shapes)
+
+    def refresh_shape_map(self):
+        """``list_texture_sets`` を 1 回呼び、TS とシェイプの対応を更新する。"""
+        try:
+            texture_sets = self._call(self.list_texture_sets_fn)
+        except Exception:
+            texture_sets = {}
+        self._remember_texture_sets(texture_sets)
+        return self._ts_by_shape
+
+    def note_scene_changed(self):
+        """シーン切替。UV の間隔を既定に戻し、シェイプ対応と Painter 判定をやり直す。"""
+        self._follow_force_heavy = True
+        self._uv_slow = False
+        self._uv_slow_noted = False
+        self._uv_prev_fps = None
+        self._uv_last_change_at = None
+        try:
+            self.refresh_shape_map()
+        except Exception:
+            pass
+
     def _message_after_disable(self):
         try:
             reverted = self.runtime.revert_to_original()
@@ -690,14 +810,13 @@ class UVRemapController:
             pending = []
             queued = []
             for ts_name in resolved["ts_names"]:
-                job_id = self.runtime.convert_now(
+                job_id = self._start_ts(
                     resolved["project_key"],
                     ts_name,
                     resolved["shape_paths"],
-                    source_dir=resolved["final_dir"],
-                    output_dir=out,
-                    quality="final",
-                    timeout_s=CONVERT_TIMEOUT_S,
+                    resolved["final_dir"],
+                    out,
+                    "manual",
                 )
                 if not job_id:
                     continue
@@ -724,6 +843,86 @@ class UVRemapController:
             }
         except Exception:
             return {"ok": False, "message": "変換の開始に失敗しました"}
+
+    def apply_changes(self):
+        """``STALE`` の TS だけを手動の要求として変換する。"""
+        try:
+            if not self._enabled_from_config():
+                return {"ok": False, "message": MSG_DISABLED}
+            resolved = self._resolve_context()
+            if not resolved.get("ok"):
+                return {"ok": False, "message": resolved.get("message") or MSG_NO_TARGETS}
+            if not baseline_exists(resolved["root"]):
+                return {"ok": False, "message": MSG_NO_BASELINE}
+            states = self._status_ts_states(resolved["project_key"])
+            names = [
+                ts_name for ts_name in resolved["ts_names"]
+                if states.get(ts_name) == STATE_STALE
+            ]
+            out = output_dir_for_root(resolved["root"])
+            job_ids = []
+            started = []
+            pending = []
+            queued = []
+            for ts_name in names:
+                job_id = self._start_ts(
+                    resolved["project_key"],
+                    ts_name,
+                    resolved["shape_paths"],
+                    resolved["final_dir"],
+                    out,
+                    "manual",
+                )
+                if not job_id:
+                    continue
+                job_ids.append(job_id)
+                if is_reservation_id(job_id):
+                    if self._ts_is_running(ts_name):
+                        pending.append(ts_name)
+                    else:
+                        queued.append(ts_name)
+                else:
+                    started.append(job_id)
+            if not job_ids:
+                return {"ok": False, "message": MSG_NOT_STARTED, "job_ids": []}
+            message = convert_launch_messages(
+                started, pending, queued, missing=resolved.get("missing") or None,
+            )
+            return {
+                "ok": True,
+                "message": message,
+                "job_ids": job_ids,
+                "missing": list(resolved.get("missing") or []),
+                "pending": pending,
+                "queued": queued,
+            }
+        except Exception:
+            return {"ok": False, "message": "変換の開始に失敗しました"}
+
+    def _uv_fp_shapes_for(self, ts_name, fallback):
+        found = []
+        mapping = self._ts_by_shape if isinstance(self._ts_by_shape, dict) else {}
+        for shape, names in mapping.items():
+            if isinstance(names, str):
+                names = (names,)
+            if isinstance(names, (list, tuple)) and ts_name in names:
+                found.append(shape)
+        if found:
+            return sorted(found)
+        return list(fallback or [])
+
+    def _start_ts(self, project_key, ts_name, shape_paths, final_dir, output_dir, origin):
+        return self.runtime.convert_now(
+            project_key,
+            ts_name,
+            shape_paths,
+            source_dir=final_dir,
+            output_dir=output_dir,
+            quality="final",
+            timeout_s=CONVERT_TIMEOUT_S,
+            origin=origin,
+            uv_fp_shapes=self._uv_fp_shapes_for(ts_name, shape_paths),
+        )
 
     def _ts_is_running(self, ts_name):
         checker = getattr(self.runtime, "has_running_job_for_ts", None)
@@ -877,11 +1076,13 @@ class UVRemapController:
     def _follow_tick_heavy(self, now_ns, flag_mtime_ns):
         resolved = self._resolve_context()
         if not isinstance(resolved, dict) or not resolved.get("ok"):
+            self._remember_heavy_flag(flag_mtime_ns, False, None)
             return {"ok": True, "message": ""}
         final_dir = resolved.get("final_dir")
         root = resolved.get("root")
         project_key = resolved.get("project_key")
         if not final_dir or not root or not project_key:
+            self._remember_heavy_flag(flag_mtime_ns, False, None)
             return {"ok": True, "message": ""}
         self._note_flag_mtime(flag_mtime_ns, now_ns)
         settings = self._follow_settings_from_config()
@@ -933,15 +1134,8 @@ class UVRemapController:
         messages = []
         for ts_name in list(decision.ts_to_convert) + list(decision.ts_to_pend):
             try:
-                job_id = self.runtime.convert_now(
-                    project_key,
-                    ts_name,
-                    shape_paths,
-                    source_dir=final_dir,
-                    output_dir=out,
-                    quality="final",
-                    timeout_s=CONVERT_TIMEOUT_S,
-                    origin="auto",
+                job_id = self._start_ts(
+                    project_key, ts_name, shape_paths, final_dir, out, "auto",
                 )
             except Exception:
                 job_id = ""
@@ -959,6 +1153,206 @@ class UVRemapController:
             flag_mtime_ns, waiting, settings["uvremap_follow_settle_s"],
         )
         return {"ok": True, "message": messages[-1] if messages else ""}
+
+    def _uv_poll_interval_s(self):
+        if self._uv_slow:
+            return UV_SLOW_POLL_S
+        return float(self._follow_settings_from_config()["uvremap_uv_poll_s"])
+
+    def _as_poll_seconds(self, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = float(value)
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return number
+
+    def _watch_states(self, project_key):
+        states = self._status_ts_states(project_key)
+        watched = {
+            name: state for name, state in states.items()
+            if state in (STATE_CONVERTED_OK, STATE_STALE)
+        }
+        return states, watched
+
+    def _shapes_for_watched(self, states):
+        shapes = []
+        mapping = self._ts_by_shape if isinstance(self._ts_by_shape, dict) else {}
+        for shape, names in mapping.items():
+            if isinstance(names, str):
+                names = (names,)
+            if not isinstance(names, (list, tuple)):
+                continue
+            for ts_name in names:
+                if states.get(ts_name) in (STATE_CONVERTED_OK, STATE_STALE):
+                    shapes.append(shape)
+                    break
+        return sorted(set(shapes))
+
+    def _recorded_uv_by_ts(self):
+        root = self._root_if_available()
+        if not root:
+            return {}
+        try:
+            data = load_follow(root)
+        except Exception:
+            return {}
+        table = data.get("ts") if isinstance(data, dict) else None
+        if not isinstance(table, dict):
+            return {}
+        recorded = {}
+        for name, row in table.items():
+            if not isinstance(name, str) or not isinstance(row, dict):
+                continue
+            uv_fp = row.get("uv_fp")
+            if isinstance(uv_fp, dict):
+                recorded[name] = uv_fp
+        return recorded
+
+    def _take_uv_fingerprints(self, shape_paths):
+        fn = self.uv_fingerprints_fn
+        if fn is None:
+            import uvremap_maya
+            fn = uvremap_maya.uv_fingerprints
+        return fn(list(shape_paths))
+
+    def _uv_launch_context(self):
+        """指紋取得のあと、自動変換に使う場所。シーン走査はしない。"""
+        key = self._project_key()
+        if not key:
+            return None
+        try:
+            final_dir = self._call(self.final_dir_fn, key)
+        except Exception:
+            return None
+        if not final_dir:
+            return None
+        try:
+            root = self._root_for_project(key)
+        except Exception:
+            return None
+        cfg = self._safe_config()
+        if not work_folder_is_safe(
+            root,
+            final_dir=final_dir,
+            watch_dir=cfg.get("watch_dir"),
+            final_export_dir=cfg.get("final_export_dir"),
+        ):
+            return None
+        if not baseline_exists(root):
+            return None
+        paths = list(self._cached_shape_paths or [])
+        if not paths:
+            paths = sorted(self._ts_by_shape) if isinstance(self._ts_by_shape, dict) else []
+        return {
+            "project_key": key,
+            "final_dir": os.path.normpath(str(final_dir)),
+            "root": root,
+            "shape_paths": paths,
+        }
+
+    def _uv_job_message(self, ts_name, job_id):
+        if not job_id:
+            return ""
+        if is_reservation_id(job_id):
+            if self._ts_is_running(ts_name):
+                return MSG_PEND_FMT.format(ts=ts_name)
+            return MSG_QUEUE_FMT.format(ts=ts_name)
+        return MSG_UV_START_FMT.format(ts=ts_name)
+
+    def uv_tick(self, now_s):
+        """UV 指紋を見て STALE と、任意の自動変換を進める。例外は出さない。"""
+        try:
+            return self._uv_tick_impl(now_s)
+        except Exception:
+            return {"ok": False, "message": ""}
+
+    def _uv_tick_impl(self, now_s):
+        if not self._enabled_from_config():
+            return {"ok": True, "message": ""}
+        now = self._as_poll_seconds(now_s)
+        if now is None:
+            return {"ok": True, "message": ""}
+        interval = self._uv_poll_interval_s()
+        if self._uv_last_poll_s is None:
+            self._uv_last_poll_s = now
+            return {"ok": True, "message": ""}
+        if (now - self._uv_last_poll_s) < interval:
+            return {"ok": True, "message": ""}
+        project_key = self._project_key()
+        if not project_key:
+            self._uv_last_poll_s = now
+            return {"ok": True, "message": ""}
+        states, watched = self._watch_states(project_key)
+        if not watched:
+            self._uv_last_poll_s = now
+            return {"ok": True, "message": ""}
+        shapes = self._shapes_for_watched(states)
+        if not shapes:
+            self._uv_last_poll_s = now
+            return {"ok": True, "message": ""}
+        self._uv_last_poll_s = now
+        result = self._take_uv_fingerprints(shapes)
+        fingerprints, elapsed = _split_fingerprint_result(result)
+        if not isinstance(fingerprints, dict):
+            return {"ok": True, "message": ""}
+        slow_message = ""
+        if elapsed > UV_SLOW_LIMIT_S:
+            self._uv_slow = True
+            if not self._uv_slow_noted:
+                self._uv_slow_noted = True
+                slow_message = MSG_UV_SLOW
+                self._write_history(slow_message)
+        recorded = self._recorded_uv_by_ts()
+        if self._uv_prev_fps is None:
+            changed = uv_recorded_differs(fingerprints, recorded)
+        else:
+            changed = fingerprint_maps_differ(fingerprints, self._uv_prev_fps)
+        if changed:
+            self._uv_last_change_at = now
+        self._uv_prev_fps = dict(fingerprints)
+        settings = self._follow_settings_from_config()
+        decision = decide_uv_follow(
+            now,
+            fingerprints,
+            recorded,
+            self._uv_last_change_at,
+            settings["uvremap_uv_settle_s"],
+            self._ts_by_shape,
+            states,
+            True,
+            settings["uvremap_auto_follow_uv"] is True,
+        )
+        marker = getattr(self.runtime, "mark_stale", None)
+        if callable(marker):
+            for ts_name in decision.ts_to_stale:
+                try:
+                    marker(project_key, ts_name, MSG_UV_STALE)
+                except Exception:
+                    pass
+        messages = []
+        if decision.ts_to_convert:
+            ctx = self._uv_launch_context()
+            if ctx is not None:
+                out = output_dir_for_root(ctx["root"])
+                for ts_name in decision.ts_to_convert:
+                    try:
+                        job_id = self._start_ts(
+                            ctx["project_key"],
+                            ts_name,
+                            ctx["shape_paths"],
+                            ctx["final_dir"],
+                            out,
+                            "auto",
+                        )
+                    except Exception:
+                        job_id = ""
+                    text = self._uv_job_message(ts_name, job_id)
+                    if text:
+                        messages.append(text)
+                        self._write_history(text)
+        text = messages[-1] if messages else slow_message
+        return {"ok": True, "message": text}
 
     def revert(self):
         try:
@@ -1109,6 +1503,12 @@ class UVRemapAttachment:
 
     def on_scene_changed(self):
         """表示先(project_key と status.json のパス)だけ更新する。原本へは戻さない。"""
+        try:
+            note = getattr(self.controller, "note_scene_changed", None)
+            if callable(note):
+                note()
+        except Exception:
+            pass
         self.set_message(MSG_SCENE_SWITCHED)
         recovered = []
         try:
@@ -1191,7 +1591,7 @@ def _controller_from_window(window, history_fn=None):
 def run_poll_tick(controller, handle, now_ns=None):
     """on_tick の本体。poll の message が空でなければ set_message する。
 
-    poll の後に ``follow_tick`` を呼ぶ。follow の例外は外へ出さない。
+    poll の後に ``follow_tick``、続けて ``uv_tick`` を呼ぶ。例外は外へ出さない。
     """
     try:
         result = controller.poll()
@@ -1213,6 +1613,18 @@ def run_poll_tick(controller, handle, now_ns=None):
         follow_text = raw if isinstance(raw, str) else ""
         if follow_text:
             text = follow_text
+    try:
+        uv_tick = getattr(controller, "uv_tick", None)
+        if callable(uv_tick):
+            now_s = time.time() if now_ns is None else (now_ns / 1_000_000_000)
+            uv_result = uv_tick(now_s)
+            if isinstance(uv_result, dict):
+                raw = uv_result.get("message") or ""
+                uv_text = raw if isinstance(raw, str) else ""
+                if uv_text:
+                    text = uv_text
+    except Exception:
+        pass
     if text:
         setter = getattr(handle, "set_message", None)
         if callable(setter):
@@ -1276,6 +1688,18 @@ def _status_has_stale(status_path):
     return _status_has_state(status_path, STATE_STALE)
 
 
+def _apply_visible_now(controller):
+    """開閉行の「変更を反映する」を出すか。純関数 ``apply_button_visible`` に渡す。"""
+    try:
+        key = controller._project_key()
+        if not key:
+            return False
+        states = controller._status_ts_states(key)
+    except Exception:
+        return False
+    return apply_button_visible(states)
+
+
 def _current_fold_status(controller):
     """有効フラグと status から、折りたたみ横の短い文言を決める。"""
     enabled = False
@@ -1296,12 +1720,21 @@ def _current_fold_status(controller):
             path = None
         converting = _status_has_converting(path)
         needs_apply = _status_has_stale(path)
+        painter = False
+        uv_on = False
         getter = getattr(controller, "_auto_follow_from_config", None)
         if callable(getter):
             try:
-                auto_any = bool(getter())
+                painter = bool(getter())
             except Exception:
-                auto_any = False
+                painter = False
+        getter_uv = getattr(controller, "_auto_follow_uv_from_config", None)
+        if callable(getter_uv):
+            try:
+                uv_on = bool(getter_uv())
+            except Exception:
+                uv_on = False
+        auto_any = painter or uv_on
     return fold_status_label_p2(enabled, converting, needs_apply, auto_any)
 
 
@@ -1310,6 +1743,10 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
     QtCore, QtWidgets = _load_qt()
     if controller is None:
         controller = _controller_from_window(window)
+    try:
+        controller.refresh_shape_map()
+    except Exception:
+        pass
 
     group = QtWidgets.QGroupBox("UV再マップ(試験運用)")
     group.setObjectName("uvremap_group")
@@ -1329,8 +1766,18 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
     fold_btn.setFlat(True)
     fold_status = QtWidgets.QLabel(LABEL_FOLD_OFF)
     fold_status.setObjectName("uvremap_fold_status")
+    from uvremap_panel import COLOR_ATTENTION
+    apply_btn = QtWidgets.QPushButton(LABEL_APPLY)
+    apply_btn.setObjectName("btn_apply_changes")
+    apply_btn.setVisible(False)
+    apply_btn.setStyleSheet(
+        "QPushButton {{ background-color: {0}; color: #ffffff; padding: 4px; }}".format(
+            COLOR_ATTENTION,
+        )
+    )
     fold_layout.addWidget(fold_btn)
     fold_layout.addWidget(fold_status)
+    fold_layout.addWidget(apply_btn)
     fold_layout.addStretch(1)
     group_layout.addWidget(fold_row)
 
@@ -1410,6 +1857,28 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         show_message(result.get("message") or "")
         refresh_open_views()
 
+    def get_auto_follow_uv():
+        getter = getattr(controller, "_auto_follow_uv_from_config", None)
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+
+    def on_toggle_auto_follow_uv(checked):
+        setter = getattr(controller, "set_auto_follow_uv", None)
+        if not callable(setter):
+            return
+        result = setter(bool(checked))
+        show_message(result.get("message") or "")
+        refresh_open_views()
+
+    def on_apply_changes():
+        result = controller.apply_changes()
+        show_message(result.get("message") or "")
+        refresh_open_views()
+
     def on_convert_now():
         result = controller.convert_now()
         show_message(result.get("message") or "")
@@ -1429,6 +1898,8 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         get_status_path=get_status_path,
         get_auto_follow=get_auto_follow,
         on_toggle_auto_follow=on_toggle_auto_follow,
+        get_auto_follow_uv=get_auto_follow_uv,
+        on_toggle_auto_follow_uv=on_toggle_auto_follow_uv,
     )
     panel.setObjectName("uvremap_panel")
     detail_layout.addWidget(panel)
@@ -1467,6 +1938,7 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         fold_btn.setText(LABEL_FOLD_HIDE if fold_open["value"] else LABEL_FOLD_SHOW)
 
     fold_btn.clicked.connect(on_fold_clicked)
+    apply_btn.clicked.connect(on_apply_changes)
     parent_layout.addWidget(group)
 
     timer = QtCore.QTimer(group)
@@ -1476,6 +1948,10 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
     def refresh_fold_status():
         try:
             fold_status.setText(_current_fold_status(controller))
+        except Exception:
+            pass
+        try:
+            apply_btn.setVisible(_apply_visible_now(controller))
         except Exception:
             pass
 

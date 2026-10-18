@@ -231,7 +231,8 @@ class FakeRuntime:
 
 def _make_controller(tmp_path, *, enabled=True, project=PROJECT, known=None,
                      texture_sets=None, final_dir=None, subfolder=SUBFOLDER,
-                     runtime=None, history=None, cfg=None, raise_project=False):
+                     runtime=None, history=None, cfg=None, raise_project=False,
+                     uv_fingerprints_fn=None):
     root_dir = tmp_path / "uvremap"
     work = root_dir / SUBFOLDER
     work.mkdir(parents=True, exist_ok=True)
@@ -278,6 +279,7 @@ def _make_controller(tmp_path, *, enabled=True, project=PROJECT, known=None,
         list_texture_sets_fn=lambda: texture_sets,
         runtime=runtime,
         history_fn=lambda source, text: history_rows.append((source, text)),
+        uv_fingerprints_fn=uv_fingerprints_fn,
     )
     ctrl._config = config
     ctrl._saved = saved
@@ -1580,3 +1582,292 @@ def test_follow_tick_auto_off_stale_only_on_heavy_pass(tmp_path, monkeypatch):
     assert ctrl._runtime.convert_calls == []
     assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_INPUT_STALE)]
     assert follow.load_follow(ctrl._work)["flag_mtime_ns"] == 10
+
+
+# ---------------------------------------------------------------------------
+# P2-c2: UV 追従
+# ---------------------------------------------------------------------------
+def _fp_box(initial, elapsed=0.01):
+    box = {"fp": dict(initial), "elapsed": elapsed, "n": 0, "paths": None}
+
+    def fake(shape_paths, uv_set=None):
+        box["n"] += 1
+        box["paths"] = list(shape_paths)
+        return (dict(box["fp"]), box["elapsed"])
+
+    return box, fake
+
+
+def _prepare_uv_ctrl(
+    tmp_path, *, enabled=True, auto_uv=False, states=None, recorded=None,
+    fp=None, elapsed=0.01, settle=3.0, poll=2.0,
+):
+    box, fake = _fp_box(fp or {"|meshA": (2, 4)}, elapsed)
+    ctrl = _make_controller(
+        tmp_path,
+        enabled=enabled,
+        cfg={
+            "uvremap_auto_follow_uv": auto_uv,
+            "uvremap_uv_settle_s": settle,
+            "uvremap_uv_poll_s": poll,
+        },
+        uv_fingerprints_fn=fake,
+    )
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    if states is None:
+        states = {"Body": "CONVERTED_OK"}
+    _write_status_rows(ctrl._work, states)
+    ctrl.refresh_shape_map()
+    if recorded is None:
+        recorded = {"Body": {"uv_fp": {"|meshA": [1, 4]}}}
+    follow.save_follow(ctrl._work, {
+        "schema": 1,
+        "flag_mtime_ns": None,
+        "ts": recorded,
+    })
+    ctrl._fp_box = box
+    return ctrl
+
+
+def test_set_auto_follow_uv_partial_merge(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    result = ctrl.set_auto_follow_uv(True)
+    assert result["ok"] is True
+    assert result["auto_follow_uv"] is True
+    assert result["message"] == ""
+    assert ctrl._saved[-1] == {"uvremap_auto_follow_uv": True}
+    assert ctrl._config["uvremap_auto_follow_uv"] is True
+    assert ctrl._auto_follow_uv_from_config() is True
+    off = ctrl.set_auto_follow_uv(False)
+    assert off["ok"] is True
+    assert off["auto_follow_uv"] is False
+    assert ctrl._saved[-1] == {"uvremap_auto_follow_uv": False}
+
+
+def test_current_fold_status_uv_follow_is_auto(tmp_path):
+    ctrl = _make_controller(tmp_path, enabled=True, cfg={"uvremap_auto_follow_uv": True})
+    _write_status_rows(ctrl._work, {"Body": "CONVERTED_OK"})
+    assert integ._current_fold_status(ctrl) == "自動追従"
+
+
+def test_uv_tick_before_interval_does_nothing(tmp_path):
+    ctrl = _prepare_uv_ctrl(tmp_path)
+    assert ctrl.uv_tick(0)["message"] == ""
+    assert ctrl.uv_tick(1)["message"] == ""
+    assert ctrl._fp_box["n"] == 0
+    assert ctrl._runtime.stale_calls == []
+    ctrl.uv_tick(2)
+    assert ctrl._fp_box["n"] == 1
+
+
+def test_uv_tick_skips_fingerprint_without_watch_states(tmp_path):
+    ctrl = _prepare_uv_ctrl(
+        tmp_path, states={"Body": "ORIGINAL", "Trim": "FAILED"},
+    )
+    ctrl.uv_tick(0)
+    result = ctrl.uv_tick(2)
+    assert result["ok"] is True
+    assert ctrl._fp_box["n"] == 0
+    assert ctrl._runtime.stale_calls == []
+
+
+def test_uv_tick_change_marks_stale(tmp_path):
+    ctrl = _prepare_uv_ctrl(tmp_path, auto_uv=False)
+    ctrl.uv_tick(0)
+    result = ctrl.uv_tick(2)
+    assert result["ok"] is True
+    assert result["message"] == ""
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_UV_STALE)]
+    assert ctrl._fp_box["paths"] == ["|meshA"]
+
+
+def test_uv_tick_before_settle_does_not_convert(tmp_path):
+    ctrl = _prepare_uv_ctrl(tmp_path, auto_uv=True, settle=2.0, poll=2.0)
+    ctrl.uv_tick(0)
+    result = ctrl.uv_tick(2)
+    assert result["ok"] is True
+    assert ctrl._runtime.convert_calls == []
+    assert ctrl._runtime.stale_calls == [(PROJECT, "Body", follow.MSG_UV_STALE)]
+    assert follow.MSG_UV_START_FMT.format(ts="Body") not in result["message"]
+
+
+def test_uv_tick_after_settle_starts_auto(tmp_path):
+    ctrl = _prepare_uv_ctrl(tmp_path, auto_uv=True, settle=2.0, poll=2.0)
+    ctrl.uv_tick(0)
+    ctrl.uv_tick(2)
+    result = ctrl.uv_tick(4)
+    text = follow.MSG_UV_START_FMT.format(ts="Body")
+    assert result["ok"] is True
+    assert result["message"] == text
+    assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["auto"]
+    assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+    assert ("uvremap", text) in ctrl._history
+
+
+def test_uv_tick_killswitch_off_does_nothing(tmp_path):
+    ctrl = _prepare_uv_ctrl(tmp_path, enabled=False, auto_uv=True)
+    ctrl.uv_tick(0)
+    result = ctrl.uv_tick(100)
+    assert result["ok"] is True
+    assert result["message"] == ""
+    assert ctrl._fp_box["n"] == 0
+    assert ctrl._runtime.stale_calls == []
+    assert ctrl._runtime.convert_calls == []
+
+
+def test_uv_tick_slow_fingerprint_widens_interval_until_scene_change(tmp_path):
+    ctrl = _prepare_uv_ctrl(tmp_path, elapsed=0.25, poll=2.0)
+    assert ctrl.uv_tick(0)["message"] == ""
+    assert ctrl._fp_box["n"] == 0
+    first = ctrl.uv_tick(2)
+    assert ctrl._fp_box["n"] == 1
+    assert first["message"] == follow.MSG_UV_SLOW
+    assert ctrl._history == [("uvremap", follow.MSG_UV_SLOW)]
+    assert ctrl.uv_tick(11)["message"] == ""
+    assert ctrl._fp_box["n"] == 1
+    assert ctrl.uv_tick(12)["ok"] is True
+    assert ctrl._fp_box["n"] == 2
+    assert [row[1] for row in ctrl._history].count(follow.MSG_UV_SLOW) == 1
+    ctrl._fp_box["elapsed"] = 0.01
+    ctrl.note_scene_changed()
+    assert ctrl._uv_slow is False
+    ctrl.uv_tick(13)
+    assert ctrl._fp_box["n"] == 2
+    ctrl.uv_tick(14)
+    assert ctrl._fp_box["n"] == 3
+    assert [row[1] for row in ctrl._history].count(follow.MSG_UV_SLOW) == 1
+
+
+def test_uv_tick_does_not_scan_scene_each_tick(tmp_path, monkeypatch):
+    ctrl = _prepare_uv_ctrl(tmp_path)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    ctrl.uv_tick(0)
+    for step in range(1, 6):
+        ctrl.uv_tick(step * 2)
+    assert counts["list"] == 0
+    assert ctrl._fp_box["n"] == 5
+
+
+def test_apply_changes_converts_only_stale(tmp_path):
+    ctrl = _make_controller(tmp_path, enabled=True)
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    _write_status_rows(ctrl._work, {"Body": "STALE", "Trim": "CONVERTED_OK"})
+    result = ctrl.apply_changes()
+    assert result["ok"] is True
+    assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+    assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["manual"]
+    assert "変換を開始しました" in result["message"]
+    assert follow.apply_button_visible({"Body": "STALE", "Trim": "CONVERTED_OK"}) is True
+
+    ctrl._runtime.already_running = {"Body"}
+    ctrl._runtime.convert_calls.clear()
+    pending = ctrl.apply_changes()
+    assert pending["ok"] is True
+    assert follow.MSG_PEND_FMT.format(ts="Body") in pending["message"]
+    assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+
+    quiet = _make_controller(tmp_path / "other", enabled=True)
+    qdest = quiet._work / "baseline" / "bl-old"
+    qdest.mkdir(parents=True, exist_ok=True)
+    (qdest / "mesh.npz").write_bytes(b"x")
+    _write_status_rows(quiet._work, {"Body": "CONVERTED_OK", "Trim": "ORIGINAL"})
+    none = quiet.apply_changes()
+    assert none["ok"] is False
+    assert quiet._runtime.convert_calls == []
+    assert follow.apply_button_visible({"Body": "CONVERTED_OK", "Trim": "ORIGINAL"}) is False
+
+
+def test_follow_tick_no_targets_heavy_once(tmp_path, monkeypatch):
+    ctrl = _make_controller(
+        tmp_path, enabled=True, known=[], cfg={"uvremap_auto_follow": True},
+    )
+    final = Path(tmp_path) / "final" / SUBFOLDER
+    _touch_ns(final / "_sync_complete.flag", b"done", 50)
+    counts = _arm_follow_counts(ctrl, monkeypatch)
+    start = 10 * FOLLOW_NS
+    for step in range(6):
+        result = ctrl.follow_tick(start + step * FOLLOW_NS)
+        assert result["ok"] is True
+        assert result["message"] == ""
+    assert counts["list"] == 1
+    ctrl.note_scene_changed()
+    ctrl.follow_tick(start + 6 * FOLLOW_NS)
+    assert counts["list"] > 1
+
+
+def test_poll_tick_calls_uv_tick_and_swallows_errors(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    seen = []
+
+    def uv(now_s):
+        seen.append(now_s)
+        return {"ok": True, "message": "uv-msg"}
+
+    ctrl.uv_tick = uv
+
+    class Handle:
+        def __init__(self):
+            self.texts = []
+
+        def set_message(self, text):
+            self.texts.append(text)
+
+        def _refresh_panel(self):
+            self.texts.append("refresh")
+
+    handle = Handle()
+    integ.run_poll_tick(ctrl, handle, now_ns=4 * FOLLOW_NS)
+    assert seen == [4.0]
+    assert "uv-msg" in handle.texts
+
+    def boom(_now_s):
+        raise RuntimeError("uv")
+
+    ctrl.uv_tick = boom
+    integ.run_poll_tick(ctrl, handle, now_ns=5 * FOLLOW_NS)
+
+
+def test_apply_button_widget_follows_stale(qapp, tmp_path):
+    from PySide6 import QtWidgets
+
+    from uvremap_panel import COLOR_ATTENTION
+
+    ctrl = _make_controller(tmp_path, enabled=True)
+    dest = ctrl._work / "baseline" / "bl-old"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "mesh.npz").write_bytes(b"x")
+    _write_status_rows(ctrl._work, {"Body": "STALE", "Trim": "CONVERTED_OK"})
+    win = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(win)
+    handle = integ.attach(
+        win, layout, controller=ctrl,
+        confirm_fn=lambda _t: False, inform_fn=lambda _t: None,
+    )
+    try:
+        win.show()
+        qapp.processEvents()
+        detail = win.findChild(QtWidgets.QWidget, "uvremap_detail")
+        button = win.findChild(QtWidgets.QPushButton, "btn_apply_changes")
+        convert = win.findChild(QtWidgets.QPushButton, "btn_convert")
+        assert detail is not None and detail.isVisible() is False
+        assert button is not None
+        assert button.text() == follow.LABEL_APPLY
+        assert button.isVisible() is True
+        assert COLOR_ATTENTION in button.styleSheet()
+        assert convert is not None
+        button.click()
+        qapp.processEvents()
+        assert [c["ts_name"] for c in ctrl._runtime.convert_calls] == ["Body"]
+        assert [c["origin"] for c in ctrl._runtime.convert_calls] == ["manual"]
+        _write_status_rows(ctrl._work, {"Body": "CONVERTED_OK", "Trim": "ORIGINAL"})
+        handle.refresh_fold_status()
+        qapp.processEvents()
+        assert button.isVisible() is False
+    finally:
+        handle.shutdown()
+        win.close()

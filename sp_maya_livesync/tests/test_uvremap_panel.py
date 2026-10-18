@@ -18,7 +18,7 @@ _MODULE_DIR = Path(__file__).resolve().parents[1]
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from uvremap_follow import LABEL_CHECK_PAINTER  # noqa: E402
+from uvremap_follow import LABEL_CHECK_PAINTER, LABEL_CHECK_UV  # noqa: E402
 from uvremap_follow import fold_status_label_p2  # noqa: E402
 from uvremap_panel import (  # noqa: E402
     COLOR_ATTENTION,
@@ -552,6 +552,60 @@ class TestPainterFollowCheckbox:
         )
         try:
             box = panel.findChild(type(panel._check_painter), "check_painter")
+            assert box.isEnabled() is True
+            assert box.isChecked() is False
+            box.click()
+            qapp.processEvents()
+            assert calls == [True]
+            assert box.isChecked() is True
+        finally:
+            panel.hide()
+            panel.close()
+
+
+class TestUvFollowCheckbox:
+    def test_checkbox_under_painter_and_grayed_when_kill_off(self, qapp):
+        enabled = {"value": False}
+        auto_uv = {"value": True}
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: enabled["value"],
+            get_auto_follow_uv=lambda: auto_uv["value"],
+        )
+        try:
+            painter = panel.findChild(type(panel._check_painter), "check_painter")
+            box = panel.findChild(type(panel._check_uv), "check_uv")
+            assert painter is not None and box is not None
+            assert box.text() == LABEL_CHECK_UV
+            assert box.isEnabled() is False
+            assert box.isChecked() is True
+            order = []
+            layout = panel.layout()
+            for index in range(layout.count()):
+                widget = layout.itemAt(index).widget()
+                if widget is not None and widget.objectName() in ("check_painter", "check_uv"):
+                    order.append(widget.objectName())
+            assert order == ["check_painter", "check_uv"]
+            enabled["value"] = True
+            panel.refresh()
+            qapp.processEvents()
+            assert box.isEnabled() is True
+            assert box.isChecked() is True
+        finally:
+            panel.hide()
+            panel.close()
+
+    def test_checkbox_calls_callback(self, qapp):
+        calls = []
+        auto_uv = {"value": False}
+        panel = _make_panel(
+            qapp,
+            get_enabled=lambda: True,
+            get_auto_follow_uv=lambda: auto_uv["value"],
+            on_toggle_auto_follow_uv=lambda value: calls.append(value) or auto_uv.update(value=value),
+        )
+        try:
+            box = panel.findChild(type(panel._check_uv), "check_uv")
             assert box.isEnabled() is True
             assert box.isChecked() is False
             box.click()

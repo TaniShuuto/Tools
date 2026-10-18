@@ -631,6 +631,7 @@ class UVRemapRuntime:
         max_parallel_fn=None,
         time_fn=None,
         mtime_fn=None,
+        uv_fingerprints_fn=None,
     ):
         if get_enabled is None or not callable(get_enabled):
             raise RuntimeControlError("get_enabled がありません")
@@ -649,6 +650,7 @@ class UVRemapRuntime:
         self.max_parallel_fn = max_parallel_fn
         self.time_fn = time_fn if time_fn is not None else time.time
         self.mtime_fn = mtime_fn if mtime_fn is not None else os.path.getmtime
+        self.uv_fingerprints_fn = uv_fingerprints_fn
         self._seq = 0
         self._queue_seq = 0
         self._jobs = {}
@@ -1273,8 +1275,47 @@ class UVRemapRuntime:
         except Exception:
             return False
 
-    def _write_follow_launch(self, root: Path, ts_name, source_dir, channels, job_id, scene_id) -> None:
-        """起動直後に follow.json へ source_sig / last_job_id / scene_id を書く。失敗は握る。"""
+    def _uv_fp_shapes(self, request_shapes, opts):
+        """指紋を取るシェイプ。``uv_fp_shapes`` が無ければジョブのシェイプを使う。"""
+        named = opts.get("uv_fp_shapes") if isinstance(opts, dict) else None
+        if isinstance(named, (list, tuple)) and not isinstance(named, str) and named:
+            return [path for path in named if isinstance(path, str) and path]
+        if request_shapes is None:
+            return []
+        return [path for path in list(request_shapes) if isinstance(path, str)]
+
+    def _call_uv_fingerprints(self, shape_paths, uv_set):
+        """指紋関数の戻り値を ``{シェイプ名: [crc, UV数]}`` にする。失敗は None。"""
+        fn = self.uv_fingerprints_fn
+        if fn is None:
+            import uvremap_maya
+            fn = uvremap_maya.uv_fingerprints
+        result = fn(list(shape_paths), uv_set)
+        mapping = None
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict):
+            mapping = result[0]
+        elif isinstance(result, dict):
+            mapping = result
+        if not isinstance(mapping, dict):
+            return None
+        stored = {}
+        for name, value in mapping.items():
+            if not isinstance(name, str) or not name:
+                continue
+            pair = follow._fingerprint_pair(value)
+            if pair is None:
+                continue
+            stored[name] = [pair[0], pair[1]]
+        return stored
+
+    def _write_follow_launch(
+        self, root: Path, ts_name, source_dir, channels, job_id, scene_id,
+        shape_paths=None, uv_set=None,
+    ) -> None:
+        """起動直後に follow.json へ source_sig / last_job_id / scene_id / uv_fp を書く。
+
+        指紋の取得に失敗しても変換は止めない。失敗時は既存の ``uv_fp`` を残す。
+        """
         try:
             data = follow.load_follow(root)
             table = data.get("ts")
@@ -1286,6 +1327,12 @@ class UVRemapRuntime:
             row["source_sig"] = self._source_sig_now(source_dir, ts_name, channels)
             row["last_job_id"] = str(job_id)
             row["scene_id"] = "" if scene_id is None else str(scene_id)
+            try:
+                uv_fp = self._call_uv_fingerprints(shape_paths, uv_set)
+            except Exception:
+                uv_fp = None
+            if isinstance(uv_fp, dict):
+                row["uv_fp"] = uv_fp
             table[ts_name] = row
             follow.save_follow(root, data)
         except Exception:
@@ -1443,6 +1490,7 @@ class UVRemapRuntime:
             )
             return ""
 
+        uv_shapes = self._uv_fp_shapes(shape_paths, opts)
         self._jobs[job_id] = {
             "job_id": job_id,
             "project_key": project_key,
@@ -1457,7 +1505,9 @@ class UVRemapRuntime:
             "log_path": log_path,
             "scene_id": str(scene_id),
         }
-        self._write_follow_launch(root, ts_name, src, ch, job_id, scene_id)
+        self._write_follow_launch(
+            root, ts_name, src, ch, job_id, scene_id, uv_shapes, uv_set,
+        )
         return job_id
 
     def _restore_queued_after_scene_change(self, item: dict) -> None:
