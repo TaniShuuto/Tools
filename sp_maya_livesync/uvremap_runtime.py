@@ -12,6 +12,7 @@ import datetime
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -55,6 +56,16 @@ MSG_INTERRUPTED = (
 MSG_ALREADY_RUNNING = "このテクスチャセットは変換中です"
 MSG_QUEUED = "順番待ち"
 MSG_WORKER_CRASH = "ワーカーが異常終了しました(終了コード {0})"
+# 2026.10.19(RB-b): リベース完了処理の履歴文言。
+MSG_REBASE_HISTORY_DONE = "リベースが完了しました"
+MSG_REBASE_HISTORY_PARTIAL_FMT = "リベースの完了処理が途中で止まりました(未完了の段階: {step})"
+# 契約に無い。仮。完了の印は rebase/ の外(Painter は読まない・書かない)。
+REBASE_LOCAL_NAME = "rebase_local.json"
+_CANDIDATE_ID_ATTEMPTS = 8
+_REBASE_STEP_NAMES = ("active", "reverted", "follow_reset", "history")
+_SAFE_BASELINE_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,79}$")
+_ABS_WIN_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']+")
+_ABS_POSIX_RE = re.compile(r"(?<![0-9A-Za-z_])/(?:[^/\s\"']+/)*[^/\s\"']+")
 ORIGIN_MANUAL = "manual"
 ORIGIN_AUTO = "auto"
 MAX_PARALLEL_DEFAULT = 2
@@ -611,6 +622,237 @@ def _normalize_origin(origin) -> str:
     if origin == ORIGIN_AUTO:
         return ORIGIN_AUTO
     return ORIGIN_MANUAL
+
+
+def _is_safe_baseline_id(baseline_id) -> bool:
+    """基準 ID としてパスに使ってよいか。英数字で始まり、英数字と - _ だけ、80 文字以内。"""
+    if not isinstance(baseline_id, str) or not baseline_id or len(baseline_id) > 80:
+        return False
+    if "/" in baseline_id or "\\" in baseline_id or ".." in baseline_id:
+        return False
+    if any(ch.isspace() for ch in baseline_id):
+        return False
+    return _SAFE_BASELINE_ID_RE.fullmatch(baseline_id) is not None
+
+
+def _remove_candidate_dir(dest: Path) -> None:
+    """この呼び出しが作った候補フォルダを消す。失敗しても例外は出さない。"""
+    try:
+        if dest.is_symlink():
+            dest.unlink()
+            return
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        elif dest.exists():
+            dest.unlink()
+    except Exception:
+        return
+
+
+def _read_raw_active_baseline_id(root: Path):
+    """active.json の生の baseline_id。指す先が無くても返す。読めなければ None。"""
+    try:
+        data = read_json(root / "baseline" / ACTIVE_BASELINE_NAME, None)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    bid = data.get("baseline_id")
+    if isinstance(bid, str) and bid:
+        return bid
+    return None
+
+
+def _resolved_baseline_child(root: Path, baseline_id: str):
+    """baseline/<id> が baseline 直下の実ディレクトリなら、解決後のパスを返す。"""
+    try:
+        base = (root / "baseline").resolve()
+        target = (base / baseline_id).resolve()
+    except OSError:
+        return None
+    if target.name != baseline_id or target.parent != base:
+        return None
+    if not target.is_dir():
+        return None
+    return target
+
+
+def _empty_rebase_steps() -> dict:
+    return {name: False for name in _REBASE_STEP_NAMES}
+
+
+def _require_nonempty_str(value, what: str) -> str:
+    if not isinstance(value, str) or value == "":
+        raise RuntimeControlError("{0} が空です".format(what))
+    return value
+
+
+def _require_ts_names(ts_names) -> list:
+    if isinstance(ts_names, (str, bytes)) or not isinstance(ts_names, (list, tuple)):
+        raise RuntimeControlError("ts_names が空です")
+    names = []
+    for name in ts_names:
+        if not isinstance(name, str) or name == "":
+            raise RuntimeControlError("ts_names が空です")
+        names.append(name)
+    if not names:
+        raise RuntimeControlError("ts_names が空です")
+    return names
+
+
+def _scene_token(value) -> str:
+    """None は空文字。シーン一致の比較用。"""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _rebase_error_text(exc: Exception) -> str:
+    """例外の型と 1 行の要約。絶対パスは含めない。契約に無い。仮。"""
+    name = type(exc).__name__
+    try:
+        raw = str(exc)
+    except Exception:
+        raw = ""
+    line = raw.replace("\r", " ").replace("\n", " ").strip()
+    line = _ABS_WIN_RE.sub("", line)
+    line = _ABS_POSIX_RE.sub("", line)
+    line = " ".join(line.split())
+    if line:
+        return "{0}: {1}".format(name, line)
+    return name
+
+
+def _read_rebase_document(root: Path):
+    """rebase_local.json。無いときは空の記録。壊れていたら None(記録なし)。"""
+    try:
+        data = read_json(root / REBASE_LOCAL_NAME, None)
+    except Exception:
+        return None
+    if data is None:
+        return {"schema": SCHEMA, "requests": {}}
+    if not isinstance(data, dict):
+        return None
+    requests = data.get("requests")
+    if requests is None:
+        return {"schema": SCHEMA, "requests": {}}
+    if not isinstance(requests, dict):
+        return None
+    return data
+
+
+def _coerce_rebase_row(row):
+    """型が合う行だけ辞書にして返す。違えば None(その行は無視)。"""
+    if not isinstance(row, dict):
+        return None
+    baseline_id = row.get("baseline_id")
+    ts_names = row.get("ts_names")
+    if not isinstance(baseline_id, str) or baseline_id == "":
+        return None
+    if not isinstance(ts_names, list) or not ts_names:
+        return None
+    if not all(isinstance(name, str) and name for name in ts_names):
+        return None
+    scene_id = row.get("scene_id")
+    if scene_id is None:
+        scene_id = ""
+    elif not isinstance(scene_id, str):
+        return None
+    registered_at = row.get("registered_at")
+    if registered_at is None:
+        registered_at = ""
+    elif not isinstance(registered_at, str):
+        return None
+    completed = row.get("completed", False)
+    if not isinstance(completed, bool):
+        return None
+    completed_at = row.get("completed_at", None)
+    if completed_at is not None and not isinstance(completed_at, str):
+        return None
+    steps_in = row.get("steps", {})
+    if not isinstance(steps_in, dict):
+        return None
+    steps = _empty_rebase_steps()
+    for name in _REBASE_STEP_NAMES:
+        value = steps_in.get(name, False)
+        if not isinstance(value, bool):
+            return None
+        steps[name] = value
+    return {
+        "baseline_id": baseline_id,
+        "ts_names": list(ts_names),
+        "scene_id": scene_id,
+        "registered_at": registered_at,
+        "completed": completed,
+        "completed_at": completed_at,
+        "steps": steps,
+    }
+
+
+def _copy_rebase_row(row: dict) -> dict:
+    return {
+        "baseline_id": row["baseline_id"],
+        "ts_names": list(row["ts_names"]),
+        "scene_id": row["scene_id"],
+        "registered_at": row["registered_at"],
+        "completed": row["completed"],
+        "completed_at": row["completed_at"],
+        "steps": dict(row["steps"]),
+    }
+
+
+def _lookup_rebase_row(root: Path, request_id):
+    doc = _read_rebase_document(root)
+    if doc is None:
+        return None
+    requests = doc.get("requests")
+    if not isinstance(requests, dict):
+        return None
+    return _coerce_rebase_row(requests.get(request_id))
+
+
+def _write_rebase_row(root: Path, request_id: str, row: dict) -> None:
+    doc = _read_rebase_document(root)
+    if doc is None:
+        doc = {"schema": SCHEMA, "requests": {}}
+    requests = doc.get("requests")
+    if not isinstance(requests, dict):
+        requests = {}
+    requests[request_id] = _copy_rebase_row(row)
+    write_json_atomic(root / REBASE_LOCAL_NAME, {
+        "schema": SCHEMA,
+        "requests": requests,
+    })
+
+
+def _notify_rebase_partial(history_fn, step: str) -> None:
+    if history_fn is None:
+        return
+    try:
+        history_fn("uvremap", MSG_REBASE_HISTORY_PARTIAL_FMT.format(step=step))
+    except Exception:
+        return
+
+
+def _rebase_call_result(
+    *, status, reason, request_id, baseline_id, ts_names, steps, reverted,
+    failed_step, error,
+) -> dict:
+    steps_out = _empty_rebase_steps()
+    if isinstance(steps, dict):
+        for name in _REBASE_STEP_NAMES:
+            steps_out[name] = bool(steps.get(name, False))
+    return {
+        "status": status,
+        "reason": "" if reason is None else str(reason),
+        "request_id": request_id,
+        "baseline_id": "" if baseline_id is None else str(baseline_id),
+        "ts_names": [str(name) for name in (ts_names or [])],
+        "steps": steps_out,
+        "reverted": [str(name) for name in (reverted or [])],
+        "failed_step": failed_step,
+        "error": error,
+    }
 
 
 class UVRemapRuntime:
@@ -1772,3 +2014,259 @@ class UVRemapRuntime:
             if existing is None or cur_state == STATE_CONVERTING:
                 self._set_status(root, ts_name, state, gen, message, iso)
         return event
+
+    def record_baseline_candidate(self, project_key, ts_names, shape_paths, *, uv_set=None) -> str:
+        """基準UVの候補を記録する。``active.json`` は作らず、書き換えない。
+
+        2026.10.19(RB-b): 同じ ID のフォルダがあれば ID を取り直す(最大 8 回)。
+        収集か保存に失敗したら、この呼び出しが作ったフォルダだけ消してから再送出する。
+        """
+        root = self._root(project_key)
+        iso = self._now()
+        for _attempt in range(_CANDIDATE_ID_ATTEMPTS):
+            baseline_id = self._next_id("bl-", iso)
+            dest = root / "baseline" / baseline_id
+            if dest.exists():
+                continue
+            try:
+                arrays, info = self._collect(shape_paths, ts_names, uv_set)
+                if dest.exists():
+                    continue
+                snap = br.arrays_to_snapshot(
+                    arrays, info, baseline_id=baseline_id, created=iso,
+                )
+                if dest.exists():
+                    continue
+                br.save_baseline(snap, root)
+            except Exception:
+                _remove_candidate_dir(dest)
+                raise
+            return baseline_id
+        raise RuntimeControlError("基準候補の ID が既存フォルダと衝突したため作れませんでした")
+
+    def discard_baseline_candidate(self, project_key, baseline_id) -> bool:
+        """候補フォルダを消す。現行の基準は消さない。失敗しても False で、例外は出さない。
+
+        2026.10.19(RB-b): ``active.json`` は書き換えない。他の候補フォルダも触らない。
+        """
+        try:
+            if not _is_safe_baseline_id(baseline_id):
+                return False
+            root = self._root(project_key)
+            folder = root / "baseline" / baseline_id
+            if not folder.is_dir():
+                return False
+            try:
+                active = _read_active_baseline(root)
+            except Exception:
+                active = None
+            if active is not None and active == baseline_id:
+                return False
+            raw = _read_raw_active_baseline_id(root)
+            if raw is not None and raw == baseline_id:
+                return False
+            # 解決できた基準も active.json の生 ID も無いときだけ、名前順の先頭を守る。
+            # record_baseline / convert_now が事実上の基準に使うため。
+            # 括弧書きの「1」は条件1(安全でない ID)で、ここに来る時点では無い。
+            # 生 ID があるときは条件4だけを守り、先頭は守らない。契約に無い。仮。
+            if active is None and raw is None:
+                ids = _list_baseline_ids(root)
+                if ids and ids[0] == baseline_id:
+                    return False
+            resolved = _resolved_baseline_child(root, baseline_id)
+            if resolved is None:
+                return False
+            shutil.rmtree(resolved)
+            return True
+        except Exception:
+            return False
+
+    def register_rebase(self, project_key, request_id, baseline_id, ts_names, *, scene_id=None) -> None:
+        """完了処理のための Maya ローカル記録を作る。同じ request_id は上書きしない。
+
+        2026.10.19(RB-b): 依頼ファイルを書く前に呼ぶ(RB-d への申し送り)。
+        ``scene_id`` を省略したときは現在のシーン。``rebase/`` には書かない。
+        """
+        request_id = _require_nonempty_str(request_id, "request_id")
+        baseline_id = _require_nonempty_str(baseline_id, "baseline_id")
+        names = _require_ts_names(ts_names)
+        root = self._root(project_key)
+        if scene_id is None:
+            scene = self._scene_id()
+        else:
+            scene = str(scene_id)
+        current = _lookup_rebase_row(root, request_id)
+        if current is not None:
+            return
+        _write_rebase_row(root, request_id, {
+            "baseline_id": baseline_id,
+            "ts_names": names,
+            "scene_id": scene,
+            "registered_at": self._now(),
+            "completed": False,
+            "completed_at": None,
+            "steps": _empty_rebase_steps(),
+        })
+
+    def rebase_record(self, project_key, request_id):
+        """ローカル記録のコピー。無い、または壊れているときは None。"""
+        root = self._root(project_key)
+        row = _lookup_rebase_row(root, request_id)
+        if row is None:
+            return None
+        return _copy_rebase_row(row)
+
+    def _rebase_activate(self, root: Path, baseline_id: str) -> None:
+        folder = root / "baseline" / str(baseline_id)
+        if not (folder / "mesh.npz").is_file():
+            raise RuntimeControlError("基準候補が見つかりません")
+        _write_active_baseline(root, baseline_id)
+
+    def _rebase_reset_follow(self, root: Path, ts_names) -> None:
+        """切り替えた TS の follow 行だけ消す。1 行も無ければ follow.json は書かない。
+
+        契約の「初期化」の形は無い。契約に無い。仮。行の削除にした。
+        """
+        data = follow.load_follow(root)
+        table = data.get("ts")
+        if not isinstance(table, dict):
+            return
+        removed = False
+        for name in ts_names:
+            if name in table:
+                del table[name]
+                removed = True
+        if not removed:
+            return
+        data["ts"] = table
+        follow.save_follow(root, data)
+
+    def _save_rebase_step(self, root: Path, request_id: str, row: dict, step_name: str) -> None:
+        row["steps"][step_name] = True
+        try:
+            _write_rebase_row(root, request_id, row)
+        except Exception:
+            row["steps"][step_name] = False
+            raise
+
+    def complete_rebase(self, project_key, request_id, *, history_fn=None) -> dict:
+        """リベースの完了処理。順序は active → reverted → follow_reset → history。
+
+        2026.10.19(RB-b): 済んだ段階は記録して飛ばす。失敗しても先に進んだ分は戻さない。
+        キルスイッチはシーン確認より先に見る。
+        """
+        root = self._root(project_key)
+        row = _lookup_rebase_row(root, request_id)
+        if row is None:
+            return _rebase_call_result(
+                status="skipped",
+                reason="no_local_record",
+                request_id=request_id,
+                baseline_id="",
+                ts_names=[],
+                steps=_empty_rebase_steps(),
+                reverted=[],
+                failed_step=None,
+                error=None,
+            )
+        if row["completed"]:
+            return _rebase_call_result(
+                status="already_completed",
+                reason="",
+                request_id=request_id,
+                baseline_id=row["baseline_id"],
+                ts_names=row["ts_names"],
+                steps=row["steps"],
+                reverted=[],
+                failed_step=None,
+                error=None,
+            )
+        if not self._enabled_now():
+            return _rebase_call_result(
+                status="skipped",
+                reason="killswitch_off",
+                request_id=request_id,
+                baseline_id=row["baseline_id"],
+                ts_names=row["ts_names"],
+                steps=row["steps"],
+                reverted=[],
+                failed_step=None,
+                error=None,
+            )
+        if _scene_token(self._scene_id()) != _scene_token(row.get("scene_id")):
+            return _rebase_call_result(
+                status="skipped",
+                reason="scene_changed",
+                request_id=request_id,
+                baseline_id=row["baseline_id"],
+                ts_names=row["ts_names"],
+                steps=row["steps"],
+                reverted=[],
+                failed_step=None,
+                error=None,
+            )
+
+        reverted = []
+        step = "active"
+        try:
+            if not row["steps"]["active"]:
+                step = "active"
+                self._rebase_activate(root, row["baseline_id"])
+                self._save_rebase_step(root, request_id, row, "active")
+            if not row["steps"]["reverted"]:
+                step = "reverted"
+                self._root(project_key)
+                for ts_name in list(row["ts_names"]):
+                    reverted.extend(self.revert_to_original(ts_name))
+                self._save_rebase_step(root, request_id, row, "reverted")
+            if not row["steps"]["follow_reset"]:
+                step = "follow_reset"
+                self._rebase_reset_follow(root, row["ts_names"])
+                self._save_rebase_step(root, request_id, row, "follow_reset")
+            if not row["steps"]["history"]:
+                step = "history"
+                if history_fn is not None:
+                    history_fn("uvremap", MSG_REBASE_HISTORY_DONE)
+                self._save_rebase_step(root, request_id, row, "history")
+            row["completed"] = True
+            row["completed_at"] = self._now()
+            try:
+                _write_rebase_row(root, request_id, row)
+            except Exception:
+                row["completed"] = False
+                row["completed_at"] = None
+                raise
+        except Exception as exc:
+            _notify_rebase_partial(history_fn, step)
+            saved = _lookup_rebase_row(root, request_id)
+            if saved is None:
+                saved_steps = _empty_rebase_steps()
+                saved_baseline = row["baseline_id"]
+                saved_names = row["ts_names"]
+            else:
+                saved_steps = saved["steps"]
+                saved_baseline = saved["baseline_id"]
+                saved_names = saved["ts_names"]
+            return _rebase_call_result(
+                status="partial",
+                reason="",
+                request_id=request_id,
+                baseline_id=saved_baseline,
+                ts_names=saved_names,
+                steps=saved_steps,
+                reverted=reverted,
+                failed_step=step,
+                error=_rebase_error_text(exc),
+            )
+        saved = _lookup_rebase_row(root, request_id) or row
+        return _rebase_call_result(
+            status="completed",
+            reason="",
+            request_id=request_id,
+            baseline_id=saved["baseline_id"],
+            ts_names=saved["ts_names"],
+            steps=saved["steps"],
+            reverted=reverted,
+            failed_step=None,
+            error=None,
+        )
