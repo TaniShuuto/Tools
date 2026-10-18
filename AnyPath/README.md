@@ -1,6 +1,5 @@
 # AnyPath 実装状況
 
-参照設計書: `AnyPath_技術設計書_v2.1.md`（単一の真実源）
 再設計計画書: `AnyPath_再設計計画書_v1.md`（UI・運用フロー刷新の方針。2026.07.30策定、同日実装反映）
 
 ## 2026.07.30 UI・運用フロー再設計（v1.1〜1.2系）について
@@ -166,8 +165,6 @@ AnyPath/
       Gate0_検証手順.md              G2/G3/G4の実機確認手順書
       userSetup_probe.py             G3確認用の一時的診断プローブ
       gate0_check.py                  観測ログ集計スクリプト（Maya不要）
-
-tests/anypath_core/            -- pytest 224件
 ```
 
 ## Gate 0（実機検証）の扱い — 重要
@@ -182,12 +179,6 @@ tests/anypath_core/            -- pytest 224件
 
 ## テスト結果
 
-```
-224 passed
-```
-
-内訳: 再設計前の163件（Core層108件＋log_format/root_guard/gate0_format/shell.messages 55件）＋ UI再設計で追加した23件（`test_root_manager.py` 新規・`test_shell_messages.py` 追加分）＋ 拡張子違いフォールバックで追加した14件（`test_index.py`のlookup_by_stem系6件・`test_scoring.py`のallow_high系4件・`test_cascade.py`のS4フォールバック系3件、および既存への追記1件）＋ あいまいファイル名マッチングで追加した24件（`test_normalize.py`のlevenshtein_distance系8件・`test_index.py`のlookup_fuzzy系7件・`test_scoring.py`のfuzzy_distances系4件・`test_cascade.py`のS4あいまい一致フォールバック系5件）。決定論性テストは実際に `PYTHONHASHSEED` 0〜9 の10通りで別プロセスを起動し、全結果が完全一致することを確認済みです。
-
 PySide6 UIコンポーネント（`ReviewPanel`, `DiagnosisPanel`, `ReviewRow`, `ReferenceSectionWidget`, `StatusBadge`, `CollapsibleSection`）は、`QT_QPA_PLATFORM=offscreen` 環境でのスモークテストにより、インスタンス化・データ投入・シグナル配線（2択ボタンのconfirm/reject、折りたたみセクションの開閉、探索ルート追加ボタン、参照シーンのOK/違うボタン等、および複数候補時の縦並び「適用」ボタン各々のconfirm_requested発火・「どれも違う」ボタンのreject_requested発火）が例外なく動作することを確認済みです（pytestの自動テストには含めていません。Qtのオフスクリーン実行にシステムライブラリの追加インストールが必要なため、CI組み込みは別途検討してください）。
 
 `_resolve_unresolved_references()`（AnyPath.py、リファレンスへのCore解決適用）についても、maya.cmdsをモック化した手動スクリプトで、EXACT/HIGHの自動適用・REVIEWの候補保持・FAILEDのそのまま保持・reload_reference失敗時のフォールバック・空リストの早期リターンを個別に確認済みです（AnyPath.py自体がMaya API依存のためpytest自動テストの対象外。テスト手法はREADMEの「動作確認」節と同様の制約）。
@@ -201,7 +192,7 @@ PySide6 UIコンポーネント（`ReviewPanel`, `DiagnosisPanel`, `ReviewRow`, 
 
 ## 未実装（今回スコープ外として残っているもの）
 
-- 利用者向けドキュメント（§11）: `README_利用者向け.md`
+- 利用者向けドキュメント（§11）: 未作成
 - Maya結合テスト（§9.2、`mayapy`バッチでの実機テスト）— Maya実行環境がないため未実施
 - Gate 0の実測結論そのもの（上記の通り、道具立てのみ）
 - 再設計計画書 §7 の未決事項（実機での使用感を見ながら判断予定）:

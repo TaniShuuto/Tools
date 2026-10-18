@@ -1,8 +1,6 @@
 """
 install_anypath.py  -  AnyPath Maya drag-and-drop installer
 ================================================================================
-設計書: AnyPath_技術設計書_v2.1.md §2.4（インストーラ／アンインストーラ要件）
-
 使い方:
     この install_anypath.py を、AnyPath.py / anypath/（Core パッケージ）と
     同じフォルダに置いたまま、Maya のビューポートへドラッグ＆ドロップする

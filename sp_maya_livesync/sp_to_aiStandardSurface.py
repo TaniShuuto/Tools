@@ -7,7 +7,7 @@
 #  プレフィックス自動検出 + チェックリストUI
 #  + Displacement再センタリング(remapValue)修正
 #
-#  必要環境 : Maya 2022+ / Arnold 7+
+#  必要環境 : Maya 2026+ / Arnold 7+
 #  使い方   : Mayaのスクリプトエディタ(Pythonタブ)に貼り付けて実行するか、
 #             ~/Documents/maya/scripts/ に保存してシェルフから呼び出す
 #

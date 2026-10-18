@@ -1,8 +1,6 @@
 """
 anypath.bridge  -  AnyPath Bridge層: Maya連携層
 
-設計書 AnyPath_技術設計書_v2.1.md §2.1, §4, §5, §6.4, §6.7, §6.9, §8 より。
-
 Core層（anypath.core）とは異なり、本パッケージは maya.cmds / maya.api を
 前提とする。Maya環境外ではimportできない（このパッケージ配下のモジュールを
 pytestで直接importするテストは書かない。Core層側にMaya非依存ロジックを

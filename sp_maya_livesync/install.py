@@ -27,7 +27,7 @@ install.py  -  SP -> Maya Live Sync : Maya drag-and-drop installer
     4. Maya 起動時に LiveSync が自動読み込みされるよう userSetup.py へ登録
     5. 完了メッセージを表示
 
-対象: Maya 2022 以降(ドラッグ&ドロップ実行自体は 2017 Update 3 以降で対応)
+対象: Maya 2026 以降
 
 設計メモ:
     sp_to_aiStandardSurface.py 本体には一切手を加えていない(拡張性・既存機能を
