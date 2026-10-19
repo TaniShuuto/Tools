@@ -677,9 +677,21 @@ def test_terminal_cannot_transition():
 
 
 def test_write_status_transition_and_corrupt_and_error(tmp_path, monkeypatch):
-    done = plugin.build_rebase_status(RID, "done", 1, PLUGIN_VERSION)
-    assert plugin.write_rebase_status(tmp_path, done) is True
-    failed = plugin.build_rebase_status(RID, "failed", 2, PLUGIN_VERSION, reason="busy")
+    sequence = (
+        "received",
+        "awaiting_approval",
+        "preparing",
+        "backing_up",
+        "reloading",
+        "exporting",
+        "done",
+    )
+    updated = 1
+    for state in sequence:
+        status = plugin.build_rebase_status(RID, state, updated, PLUGIN_VERSION)
+        assert plugin.write_rebase_status(tmp_path, status) is True
+        updated += 1
+    failed = plugin.build_rebase_status(RID, "failed", updated, PLUGIN_VERSION, reason="busy")
     assert plugin.write_rebase_status(tmp_path, failed) is False
     assert rb.read_status(tmp_path, RID).status["state"] == "done"
 
@@ -701,9 +713,11 @@ def test_write_status_transition_and_corrupt_and_error(tmp_path, monkeypatch):
 
 
 def test_same_nonterminal_rewrite_is_allowed(tmp_path):
-    first = plugin.build_rebase_status(RID, "preparing", 1, PLUGIN_VERSION, message="a")
+    seed = plugin.build_rebase_status(RID, "received", 1, PLUGIN_VERSION)
+    assert plugin.write_rebase_status(tmp_path, seed) is True
+    first = plugin.build_rebase_status(RID, "preparing", 2, PLUGIN_VERSION, message="a")
     assert plugin.write_rebase_status(tmp_path, first) is True
-    second = plugin.build_rebase_status(RID, "preparing", 2, PLUGIN_VERSION, message="b")
+    second = plugin.build_rebase_status(RID, "preparing", 3, PLUGIN_VERSION, message="b")
     assert plugin.write_rebase_status(tmp_path, second) is True
     assert rb.read_status(tmp_path, RID).status["message"] == "b"
 
