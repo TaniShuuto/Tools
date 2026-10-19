@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from uvremap_follow import (
@@ -49,6 +50,7 @@ from uvremap_runtime import (
     WARN_SCENE_CHANGED,
 )
 import uvremap_bridge as br
+import uvremap_rebase as rb
 
 DEFAULT_UVREMAP_ROOT = "C:/SPMayaLiveSync/uvremap"
 CONVERT_TIMEOUT_S = 1200
@@ -107,6 +109,50 @@ MSG_ENABLED = "UV変換を有効にしました"
 MSG_DISABLED_NO_REVERT = "UV変換を無効にしました"
 MSG_DISABLED_REVERTED = "UV変換を無効にし、原本に戻しました"
 MSG_DISABLED_REVERTED_FMT = "UV変換を無効にし、原本に戻しました({n} 件)"
+
+# 2026.10.19(RB-d): リベースの画面文言。決定は純関数、文言は定数。
+MSG_REBASE_NEED_KILLSWITCH = "UV変換が無効のため、Painterへは送れません"
+MSG_REBASE_NEED_BASELINE = "基準UVが未記録です。先に『基準UVを記録』を押してください"
+MSG_REBASE_NEED_SAVED_SCENE = "シーンを保存してから送ってください"
+MSG_REBASE_PLUGIN_UNKNOWN = (
+    "Painter の応答を確認できません。Painter で Final を 1 回書き出してから送ってください"
+)
+MSG_REBASE_CONFIRM_REPLACE = "Painter へ送った依頼がまだ終わっていません。新しい依頼で置き換えますか"
+MSG_REBASE_LOCKED_NO_REPLACE = "Painter が読み直しています。終わってから送ってください"
+MSG_REBASE_SENT = "Painter へ送りました。Painter で確認してください"
+MSG_REBASE_EXPORT_FAILED_FMT = "メッシュの書き出しに失敗したため、送りませんでした。{message}"
+MSG_REBASE_CANCEL_SENT = "取り消しを送りました"
+# 契約に無い。仮: 確認で送らなかったときの文。
+MSG_REBASE_SEND_CANCELLED = "送りませんでした"
+# 契約に無い。仮: 想定外の失敗。例外の文と絶対パスは出さない。
+MSG_REBASE_SEND_FAILED = "Painterへ送れませんでした"
+MSG_REBASE_PARTIAL_FMT = "完了処理が途中で止まりました({step})。もう一度試します"
+# 契約に無い。仮: 再試行の上限を超えたときの文。
+MSG_REBASE_RETRY_EXHAUSTED = "完了処理を繰り返せませんでした。手動で確認してください"
+MSG_UVOLD_ATTACHED_FMT = "旧UVセット({name})を付けて送りました"
+MSG_UVOLD_SKIPPED_FMT = "旧UVセットは付けずに送りました({reason})。2D ビューの内容の再投影はできません"
+MSG_UVOLD_CLEANUP_FAILED_FMT = (
+    "一時的に作った旧UVセット({name})を削除できませんでした。"
+    "UV セットエディタで手動で削除してください: {shapes}"
+)
+# 契約に無い。仮: 完了しているのに切り替えを待っているときの短い文。
+MSG_REBASE_DONE_SKIPPED_FMT = {
+    "killswitch_off": "UV変換が無効のため、完了を待っています",
+    "scene_changed": "シーンが変わったため、完了を待っています",
+    "job_running": "変換が終わるまで、完了を待っています",
+}
+# 契約に無い。仮: 完了処理の再試行はこの回数まで。
+REBASE_COMPLETE_RETRY_MAX = 5
+REBASE_REQUEST_ID_ATTEMPTS = 5
+_REBASE_UNCONFIRMED = frozenset({
+    "result_missing",
+    "result_not_ok",
+    "result_request_id_mismatch",
+    "not_full_final",
+})
+_REBASE_SKIP_WAIT = frozenset({"killswitch_off", "scene_changed"})
+# done を最初に見てから、完了処理が終わるまで追従を止める秒数。過ぎたら止めるのをやめる。
+REBASE_DONE_FOLLOW_BLOCK_S = 60.0
 
 WARN_MESSAGES = {
     WARN_NO_FILE_NODES: MSG_NO_FILE_NODES,
@@ -486,6 +532,47 @@ def handle_record_request(controller, confirm_fn, inform_fn=None):
         return {"ok": False, "message": "基準UVの記録に失敗しました"}
 
 
+def handle_rebase_request(controller, confirm_fn, inform_fn=None):
+    """画面側: 送れる状態を先に見て、置き換えの確認は準備ができてから 1 回だけ出す。"""
+    checker = getattr(controller, "rebase_check_ready", None)
+    if not callable(checker):
+        return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+    try:
+        ready = checker()
+    except Exception:
+        ready = {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+    if not isinstance(ready, dict) or not ready.get("ok"):
+        text = ""
+        if isinstance(ready, dict):
+            raw = ready.get("message")
+            if isinstance(raw, str) and raw.strip():
+                text = raw
+        if not text:
+            text = MSG_REBASE_SEND_FAILED
+        _inform(inform_fn, text)
+        return {"ok": False, "message": text}
+    if ready.get("replace"):
+        accepted = False
+        try:
+            accepted = bool(confirm_fn(MSG_REBASE_CONFIRM_REPLACE))
+        except Exception:
+            accepted = False
+        if not accepted:
+            return {
+                "ok": False,
+                "cancelled": True,
+                "message": MSG_REBASE_SEND_CANCELLED,
+            }
+        try:
+            return controller.rebase_send(confirmed=True)
+        except Exception:
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+    try:
+        return controller.rebase_send()
+    except Exception:
+        return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+
+
 class UVRemapController:
     """基準記録・変換・原本復帰。どの公開メソッドも例外を外へ出さない。"""
 
@@ -501,6 +588,10 @@ class UVRemapController:
         runtime=None,
         history_fn=None,
         uv_fingerprints_fn=None,
+        time_fn=None,
+        utcnow_fn=None,
+        rebase_export_fn=None,
+        maya_version_fn=None,
     ):
         self.get_config = get_config
         self.save_config_fn = save_config_fn
@@ -529,6 +620,28 @@ class UVRemapController:
         self._follow_force_heavy = False
         self._follow_enabled_seen = None
         self._auto_input_as_is_emitted = False
+        # 2026.10.19(RB-d): 時計と書き出しは注入する。datetime.now() は呼ばない。
+        self._time_fn = time_fn if time_fn is not None else time.time
+        self._utcnow_fn = utcnow_fn if utcnow_fn is not None else (
+            lambda: datetime.now(timezone.utc)
+        )
+        self._rebase_export_fn = rebase_export_fn
+        self._maya_version_fn = maya_version_fn
+        self._rebase_blocks_follow = False
+        self._rebase_last_tick_s = None
+        self._rebase_discarded = set()
+        self._rebase_noted = set()
+        self._rebase_complete_tries = {}
+        self._rebase_exhausted = set()
+        self._rebase_guidance = set()
+        self._rebase_wait_text = {}
+        # このセッションで、終端になる前に見た依頼。起動時に既に終端の文は履歴へ重ねない。
+        self._rebase_live_ids = set()
+        self._rebase_done_seen_at = {}
+        self._rebase_frozen_view = {}
+        self._rebase_view_cache = None
+        # rebase_tick が最後にメッセージ欄へ返した文。同じ文は返さない。
+        self._rebase_emitted_text = None
         if runtime is None:
             import uvremap_runtime as _rt
             cfg = self._safe_config()
@@ -1053,6 +1166,9 @@ class UVRemapController:
         毎秒はキルスイッチ、プロジェクトのキー、Final フォルダ、印の mtime だけを見る。
         入力側 STALE を含む重い判定は、必要なときだけ行う。
         """
+        # 2026.10.19(RB-d): 非終端か、done を見てから 60 秒以内で完了前の依頼だけ止める。
+        if self._rebase_blocks_follow:
+            return {"ok": True, "message": ""}
         try:
             return self._follow_tick_impl(now_ns)
         except Exception:
@@ -1262,6 +1378,9 @@ class UVRemapController:
 
     def uv_tick(self, now_s):
         """UV 指紋を見て STALE と、任意の自動変換を進める。例外は出さない。"""
+        # 2026.10.19(RB-d): 上と同じ条件のときだけ UV の自動追従も止める。手動の変換は止めない。
+        if self._rebase_blocks_follow:
+            return {"ok": True, "message": ""}
         try:
             return self._uv_tick_impl(now_s)
         except Exception:
@@ -1430,6 +1549,843 @@ class UVRemapController:
         except Exception:
             pass
 
+    # --- 2026.10.19(RB-d): リベースの送信・取り消し・poll 相乗り ----------------
+
+    def rebase_check_ready(self):
+        """送る前提だけを見る。依頼も候補も作らない。"""
+        try:
+            return self._rebase_check_ready_impl()
+        except Exception:
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+
+    def rebase_send(self, confirm_fn=None, confirmed=None):
+        """新基準候補、メッシュ、依頼の順に作る。例外は外へ出さない。"""
+        try:
+            return self._rebase_send_impl(confirm_fn, confirmed)
+        except Exception:
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+
+    def rebase_cancel(self):
+        """この Maya が記録した最新の依頼を、取り消せるときだけ取り消す。"""
+        try:
+            return self._rebase_cancel_impl()
+        except Exception:
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+
+    def rebase_tick(self, now_s):
+        """状態ファイルを読み、done なら完了処理、終端なら候補を破棄する。
+
+        ``uvremap_rebase_poll_s`` 秒に 1 回だけ実処理をする。最初の呼び出しは待たない。
+        メッセージ欄への文は、前回返した文と違うときだけ返す。
+        """
+        try:
+            return self._rebase_tick_impl(now_s)
+        except Exception:
+            return {"ok": True, "message": ""}
+
+    def rebase_view(self):
+        """画面が描く現在の依頼。``rebase_tick`` が作った表示を返す。
+
+        依頼が無ければ text は空。状態ファイルはここでは読まない。
+        """
+        try:
+            return self._rebase_view_impl()
+        except Exception:
+            return {
+                "text": "",
+                "phase": "",
+                "can_cancel": False,
+                "can_send": False,
+                "request_id": None,
+                "terminal": False,
+            }
+
+    def _rebase_check_ready_impl(self):
+        if not self._enabled_from_config():
+            return {"ok": False, "message": MSG_REBASE_NEED_KILLSWITCH}
+        resolved = self._resolve_context()
+        if not isinstance(resolved, dict) or not resolved.get("ok"):
+            message = ""
+            if isinstance(resolved, dict):
+                raw = resolved.get("message")
+                if isinstance(raw, str) and raw.strip():
+                    message = raw
+            return {"ok": False, "message": message or MSG_NO_PROJECT}
+        scene_id = self._current_scene_id()
+        if not isinstance(scene_id, str) or not scene_id.strip():
+            return {"ok": False, "message": MSG_REBASE_NEED_SAVED_SCENE}
+        root = resolved["root"]
+        active_id = self._read_active_baseline_id(root)
+        if not active_id:
+            return {"ok": False, "message": MSG_REBASE_NEED_BASELINE}
+        final_dir = resolved.get("final_dir")
+        try:
+            sync = rb.read_sync_result(final_dir)
+        except Exception:
+            sync = None
+        if sync is None:
+            return {"ok": False, "message": MSG_REBASE_PLUGIN_UNKNOWN}
+        if not rb.plugin_supports_rebase(sync):
+            return {"ok": False, "message": rb.MSG_PLUGIN_UPDATE_REQUIRED}
+        now = self._time_fn()
+        try:
+            open_requests = rb.find_open_requests(root, resolved["project_key"], now)
+        except Exception:
+            open_requests = []
+        open_ids = []
+        for request in open_requests:
+            status_read = rb.read_status(root, request["request_id"])
+            cancel_requested = rb.cancel_exists(root, request["request_id"])
+            display = rb.decide_display(
+                request, status_read, now=now, cancel_requested=cancel_requested,
+            )
+            if display.phase == "locked":
+                return {"ok": False, "message": MSG_REBASE_LOCKED_NO_REPLACE}
+            open_ids.append(request["request_id"])
+        return {
+            "ok": True,
+            "message": "",
+            "replace": bool(open_ids),
+            "open_ids": open_ids,
+            "scene_id": scene_id,
+            "resolved": resolved,
+            "active_id": active_id,
+        }
+
+    def _rebase_send_impl(self, confirm_fn, confirmed):
+        ready = self._rebase_check_ready_impl()
+        if not ready.get("ok"):
+            return {
+                "ok": False,
+                "message": ready.get("message") or MSG_REBASE_SEND_FAILED,
+            }
+        if ready.get("replace"):
+            if confirmed is True:
+                accepted = True
+            elif confirmed is False:
+                accepted = False
+            else:
+                accepted = False
+                if callable(confirm_fn):
+                    try:
+                        accepted = bool(confirm_fn(MSG_REBASE_CONFIRM_REPLACE))
+                    except Exception:
+                        accepted = False
+            if not accepted:
+                return {
+                    "ok": False,
+                    "cancelled": True,
+                    "message": MSG_REBASE_SEND_CANCELLED,
+                }
+        return self._rebase_send_after_ready(ready)
+
+    def _rebase_send_after_ready(self, ready):
+        resolved = ready["resolved"]
+        root = resolved["root"]
+        project_key = resolved["project_key"]
+        scene_id = ready["scene_id"]
+        ts_names = list(resolved["ts_names"])
+        shape_paths = list(resolved["shape_paths"])
+        settings = rb.normalize_rebase_settings(self._safe_config())
+        try:
+            rb.cleanup_rebase_files(root, self._time_fn())
+        except Exception:
+            pass
+        request_id = self._rebase_new_request_id(root)
+        if not request_id:
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+        try:
+            baseline_id = self.runtime.record_baseline_candidate(
+                project_key, ts_names, shape_paths,
+            )
+        except Exception:
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+        meshes_dir = Path(root) / rb.MESHES_DIRNAME
+        active_snap = self._load_baseline_snapshot(root, ready.get("active_id"))
+        candidate_snap = self._load_baseline_snapshot(root, baseline_id)
+        try:
+            mesh, uvold = self._call_rebase_export(
+                shape_paths,
+                meshes_dir,
+                baseline_id,
+                triangulate=bool(settings.get("uvremap_rebase_triangulate")),
+                baseline_snapshot=active_snap,
+                candidate_snapshot=candidate_snap,
+            )
+        except Exception as exc:
+            self._discard_candidate(project_key, baseline_id)
+            message = self._export_fail_message(exc)
+            cleanup_line = self._uvold_cleanup_line(getattr(exc, "uvold_info", None))
+            if cleanup_line:
+                self._write_history(cleanup_line)
+                message = "{0} {1}".format(message, cleanup_line)
+            return {"ok": False, "message": message}
+        try:
+            self.runtime.register_rebase(
+                project_key,
+                request_id,
+                baseline_id,
+                ts_names,
+                scene_id=scene_id,
+            )
+        except Exception:
+            self._discard_candidate(project_key, baseline_id)
+            self._unlink_mesh(mesh)
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+        try:
+            request = rb.build_request(
+                request_id=request_id,
+                project_key=project_key,
+                created_at=self._time_fn(),
+                ttl_s=settings["uvremap_rebase_ttl_s"],
+                mesh=mesh,
+                baseline_id=baseline_id,
+                ts_names=ts_names,
+                final_full=True,
+                maya_version=self._rebase_maya_version(),
+                tool_version=None,
+            )
+            rb.write_request(root, request)
+        except Exception:
+            self._discard_candidate(project_key, baseline_id)
+            self._unlink_mesh(mesh)
+            return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
+        # ファイルが書けた時点で送れている。この後の例外で「送れませんでした」にしない。
+        self._rebase_blocks_follow = True
+        self._rebase_live_ids.add(request_id)
+        message = MSG_REBASE_SENT
+        try:
+            for old_id in ready.get("open_ids") or []:
+                if old_id == request_id:
+                    continue
+                try:
+                    rb.write_cancel(root, old_id)
+                except Exception:
+                    pass
+            history_line = "{0} {1}".format(
+                MSG_REBASE_SENT, self._uvold_history_line(uvold),
+            ).strip()
+            self._write_history(history_line)
+            cleanup_line = self._uvold_cleanup_line(uvold)
+            if cleanup_line:
+                self._write_history(cleanup_line)
+                message = cleanup_line
+            self._rebase_cache_current(self._time_fn())
+        except Exception:
+            pass
+        if self._rebase_emitted_text is None:
+            self._rebase_emitted_text = rb.MSG_WAITING
+        return {
+            "ok": True,
+            "message": message,
+            "request_id": request_id,
+            "baseline_id": baseline_id,
+            "uvold": uvold,
+        }
+
+    def _rebase_cancel_impl(self):
+        located = self._rebase_locate()
+        if located is None:
+            return {"ok": False, "message": MSG_NO_PROJECT}
+        project_key, root, _final_dir = located
+        now = self._time_fn()
+        rows = self._rebase_recorded_requests(root, project_key)
+        current = self._rebase_latest(rows)
+        if current is None:
+            return {"ok": False, "message": ""}
+        request, _record = current
+        rid = request["request_id"]
+        status_read = rb.read_status(root, rid)
+        cancel_requested = rb.cancel_exists(root, rid)
+        display = rb.decide_display(
+            request, status_read, now=now, cancel_requested=cancel_requested,
+        )
+        if not display.can_cancel:
+            if display.phase == "locked":
+                return {"ok": False, "message": rb.MSG_CANNOT_CANCEL}
+            return {"ok": False, "message": display.text or ""}
+        rb.write_cancel(root, rid)
+        try:
+            self._rebase_cache_current(now)
+        except Exception:
+            pass
+        return {"ok": True, "message": MSG_REBASE_CANCEL_SENT}
+
+    def _rebase_tick_impl(self, now_s):
+        due, now = self._rebase_due(now_s)
+        if not due:
+            return {"ok": True, "message": ""}
+        located = self._rebase_locate()
+        if located is None:
+            self._rebase_blocks_follow = False
+            self._rebase_store_view(self._rebase_blank_view())
+            return {"ok": True, "message": self._rebase_emit_message("")}
+        project_key, root, final_dir = located
+        rows = self._rebase_recorded_requests(root, project_key)
+        for request, record in rows:
+            self._rebase_tick_one(
+                project_key, root, final_dir, request, record, now,
+            )
+        # complete_rebase が completed を立てたあとの記録で、追従停止を更新する。
+        rows = self._rebase_recorded_requests(root, project_key)
+        self._rebase_update_block(root, final_dir, rows, now)
+        current = self._rebase_latest(rows)
+        if current is None:
+            view = self._rebase_blank_view()
+        else:
+            view = self._rebase_display_view(
+                root, final_dir, current[0], current[1], now,
+            )
+        self._rebase_store_view(view)
+        text = self._rebase_view_cache.get("text") or ""
+        return {"ok": True, "message": self._rebase_emit_message(text)}
+
+    def _rebase_view_impl(self):
+        enabled = bool(self._enabled_from_config())
+        if self._rebase_view_cache is None:
+            return {
+                "text": "",
+                "phase": "",
+                "can_cancel": False,
+                "can_send": enabled,
+                "request_id": None,
+                "terminal": False,
+            }
+        view = dict(self._rebase_view_cache)
+        view["can_send"] = enabled and view.get("phase") != "locked"
+        return view
+
+    def _rebase_blank_view(self):
+        return {
+            "text": "",
+            "phase": "",
+            "can_cancel": False,
+            "terminal": False,
+            "request_id": None,
+        }
+
+    def _rebase_store_view(self, view):
+        phase = view.get("phase") or ""
+        enabled = bool(self._enabled_from_config())
+        self._rebase_view_cache = {
+            "text": view.get("text") or "",
+            "phase": phase,
+            "can_cancel": bool(view.get("can_cancel")),
+            "can_send": enabled and phase != "locked",
+            "request_id": view.get("request_id"),
+            "terminal": bool(view.get("terminal")),
+        }
+
+    def _rebase_emit_message(self, text):
+        """前回返した文と同じなら空。終端・完了済みも、表示が変わったときだけ返す。"""
+        if not isinstance(text, str):
+            text = ""
+        if text == self._rebase_emitted_text:
+            return ""
+        self._rebase_emitted_text = text
+        return text
+
+    def _rebase_cache_current(self, now):
+        """送信や取り消しの直後に、画面用の表示を 1 回だけ作る。"""
+        located = self._rebase_locate()
+        if located is None:
+            self._rebase_store_view(self._rebase_blank_view())
+            self._rebase_emitted_text = ""
+            return
+        project_key, root, final_dir = located
+        rows = self._rebase_recorded_requests(root, project_key)
+        current = self._rebase_latest(rows)
+        if current is None:
+            view = self._rebase_blank_view()
+        else:
+            view = self._rebase_display_view(
+                root, final_dir, current[0], current[1], now,
+            )
+        self._rebase_store_view(view)
+        self._rebase_emitted_text = self._rebase_view_cache.get("text") or ""
+
+    def _rebase_is_settled(self, record, rid):
+        """候補を破棄済み、または完了済み。以降の tick では状態ファイルを読まない。"""
+        if isinstance(record, dict) and record.get("completed"):
+            return True
+        return rid in self._rebase_discarded
+
+    def _rebase_completed_view(self, rid):
+        if rid in self._rebase_guidance:
+            text = rb.MSG_DONE_GUIDANCE
+        else:
+            text = rb.MSG_DONE
+        return {
+            "text": text,
+            "phase": "done",
+            "can_cancel": False,
+            "terminal": True,
+            "request_id": rid,
+        }
+
+    def _rebase_display_view(self, root, final_dir, request, record, now):
+        rid = request.get("request_id")
+        if isinstance(record, dict) and record.get("completed"):
+            return self._rebase_completed_view(rid)
+        frozen = self._rebase_frozen_view.get(rid)
+        if rid in self._rebase_discarded and isinstance(frozen, dict):
+            return dict(frozen)
+        return self._rebase_present(root, final_dir, request, record, now)
+
+    def _rebase_due(self, now_s):
+        now = self._time_fn() if now_s is None else now_s
+        try:
+            now = float(now)
+        except (TypeError, ValueError):
+            return False, None
+        if now != now or now in (float("inf"), float("-inf")):
+            return False, None
+        interval = float(
+            rb.normalize_rebase_settings(self._safe_config())["uvremap_rebase_poll_s"]
+        )
+        last = self._rebase_last_tick_s
+        if last is not None and (now - float(last)) < interval:
+            return False, now
+        self._rebase_last_tick_s = now
+        return True, now
+
+    def _rebase_locate(self):
+        key = self._project_key()
+        if not key:
+            return None
+        try:
+            root = self._root_for_project(key)
+        except Exception:
+            return None
+        final_dir = None
+        try:
+            final_dir = self._call(self.final_dir_fn, key)
+        except Exception:
+            final_dir = None
+        return key, root, final_dir
+
+    def _rebase_recorded_requests(self, root, project_key):
+        try:
+            requests = rb.list_requests(root)
+        except Exception:
+            return []
+        rows = []
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            if request.get("project_key") != project_key:
+                continue
+            rid = request.get("request_id")
+            try:
+                record = self.runtime.rebase_record(project_key, rid)
+            except Exception:
+                record = None
+            if not isinstance(record, dict):
+                continue
+            rows.append((request, record))
+        rows.sort(key=lambda item: (
+            float(item[0].get("created_at") or 0),
+            str(item[0].get("request_id") or ""),
+        ))
+        return rows
+
+    def _rebase_latest(self, rows):
+        if not rows:
+            return None
+        return rows[-1]
+
+    def _rebase_state(self, status_read):
+        if getattr(status_read, "kind", None) != "ok":
+            return None
+        status = getattr(status_read, "status", None)
+        if not isinstance(status, dict):
+            return None
+        state = status.get("state")
+        return state if isinstance(state, str) else None
+
+    def _rebase_tick_one(self, project_key, root, final_dir, request, record, now):
+        rid = request.get("request_id")
+        if self._rebase_is_settled(record, rid):
+            return
+        status_read = rb.read_status(root, rid)
+        state = self._rebase_state(status_read)
+        if state == "done":
+            seen = self._rebase_done_seen_at.get(rid)
+            if seen is None:
+                self._rebase_done_seen_at[rid] = now
+            self._rebase_tick_done(
+                project_key, root, final_dir, request, record, status_read,
+            )
+            return
+        cancel_requested = rb.cancel_exists(root, rid)
+        display = rb.decide_display(
+            request, status_read, now=now, cancel_requested=cancel_requested,
+        )
+        if display.terminal:
+            self._rebase_discard_once(project_key, rid, request.get("baseline_id"))
+            self._rebase_frozen_view[rid] = {
+                "text": display.text,
+                "phase": display.phase,
+                "can_cancel": False,
+                "terminal": True,
+                "request_id": rid,
+            }
+            self._rebase_note_once((rid, "terminal"), display.text)
+            return
+        self._rebase_live_ids.add(rid)
+
+    def _rebase_tick_done(self, project_key, root, final_dir, request, record, status_read):
+        rid = request.get("request_id")
+        if rid in self._rebase_exhausted:
+            return
+        decision = self._rebase_judge(final_dir, request, record, status_read)
+        reason = getattr(decision, "reason", "")
+        if getattr(decision, "action", "") == "complete":
+            # この tick で完了処理を進める。起動前から done でも、実行した分は履歴に残す。
+            self._rebase_live_ids.add(rid)
+            self._rebase_run_complete(project_key, rid)
+            return
+        if reason in _REBASE_UNCONFIRMED:
+            self._rebase_note_once((rid, "unconfirmed"), rb.MSG_RESULT_UNCONFIRMED)
+            self._rebase_live_ids.add(rid)
+
+    def _rebase_run_complete(self, project_key, rid):
+        tries = int(self._rebase_complete_tries.get(rid, 0))
+        if tries >= REBASE_COMPLETE_RETRY_MAX:
+            self._rebase_mark_exhausted(rid)
+            return
+        kwargs = {}
+        if self.history_fn is not None:
+            kwargs["history_fn"] = self.history_fn
+        try:
+            result = self.runtime.complete_rebase(project_key, rid, **kwargs)
+        except Exception:
+            result = {"status": "partial", "reason": "", "failed_step": "不明"}
+        if not isinstance(result, dict):
+            result = {"status": "partial", "reason": "", "failed_step": "不明"}
+        status = result.get("status")
+        reason = result.get("reason") or ""
+        if status == "completed":
+            self._rebase_guidance.add(rid)
+            self._rebase_wait_text.pop(rid, None)
+            self._rebase_note_once((rid, "guidance"), rb.MSG_DONE_GUIDANCE)
+            return
+        if status == "already_completed" or (
+            status == "skipped" and reason == "no_local_record"
+        ):
+            self._rebase_wait_text.pop(rid, None)
+            return
+        if status == "skipped" and reason == "job_running":
+            # 回数は消費しない。次の poll で、ジョブが終わったかもう一度見る。
+            self._rebase_wait_text[rid] = MSG_REBASE_DONE_SKIPPED_FMT["job_running"]
+            return
+        if status == "partial":
+            tries += 1
+            self._rebase_complete_tries[rid] = tries
+            if tries >= REBASE_COMPLETE_RETRY_MAX:
+                self._rebase_mark_exhausted(rid)
+                return
+            step = result.get("failed_step") or "不明"
+            self._rebase_wait_text[rid] = MSG_REBASE_PARTIAL_FMT.format(step=step)
+            return
+        if reason in MSG_REBASE_DONE_SKIPPED_FMT:
+            self._rebase_wait_text[rid] = MSG_REBASE_DONE_SKIPPED_FMT[reason]
+
+    def _rebase_mark_exhausted(self, rid):
+        self._rebase_exhausted.add(rid)
+        self._rebase_wait_text.pop(rid, None)
+        self._rebase_note_once((rid, "exhausted"), MSG_REBASE_RETRY_EXHAUSTED)
+
+    def _rebase_judge(self, final_dir, request, record, status_read):
+        sync = None
+        if final_dir:
+            try:
+                sync = rb.read_sync_result(final_dir)
+            except Exception:
+                sync = None
+        try:
+            scene_now = self._current_scene_id()
+        except Exception:
+            scene_now = ""
+        return rb.judge_completion(
+            status_read=status_read,
+            sync_result=sync,
+            request=request,
+            enabled=self._enabled_from_config(),
+            scene_id_now=scene_now,
+            scene_id_request=record.get("scene_id"),
+            already_completed=bool(record.get("completed")),
+        )
+
+    def _rebase_present(self, root, final_dir, request, record, now):
+        rid = request.get("request_id")
+        try:
+            status_read = rb.read_status(root, rid)
+            cancel_requested = rb.cancel_exists(root, rid)
+            display = rb.decide_display(
+                request, status_read, now=now, cancel_requested=cancel_requested,
+            )
+        except Exception:
+            return {
+                "text": "",
+                "phase": "",
+                "can_cancel": False,
+                "terminal": False,
+                "request_id": rid,
+            }
+        text = display.text
+        phase = display.phase
+        can_cancel = display.can_cancel
+        terminal = display.terminal
+        state = self._rebase_state(status_read)
+        if record.get("completed"):
+            if rid in self._rebase_guidance:
+                text = rb.MSG_DONE_GUIDANCE
+            else:
+                text = rb.MSG_DONE
+            phase = "done"
+            can_cancel = False
+            terminal = True
+        elif state == "done":
+            if rid in self._rebase_exhausted:
+                text = MSG_REBASE_RETRY_EXHAUSTED
+                phase = "failed"
+                can_cancel = False
+                terminal = False
+            else:
+                decision = self._rebase_judge(
+                    final_dir, request, record, status_read,
+                )
+                reason = getattr(decision, "reason", "")
+                if reason in _REBASE_UNCONFIRMED:
+                    text = rb.MSG_RESULT_UNCONFIRMED
+                    phase = "failed"
+                    can_cancel = False
+                    terminal = False
+                elif reason in _REBASE_SKIP_WAIT:
+                    text = MSG_REBASE_DONE_SKIPPED_FMT.get(reason, text)
+                    phase = "working"
+                    can_cancel = False
+                    terminal = False
+                elif rid in self._rebase_guidance:
+                    text = rb.MSG_DONE_GUIDANCE
+                    phase = "done"
+                    can_cancel = False
+                    terminal = True
+                elif rid in self._rebase_wait_text:
+                    text = self._rebase_wait_text[rid]
+                    phase = "working"
+                    can_cancel = False
+                    terminal = False
+        return {
+            "text": text,
+            "phase": phase,
+            "can_cancel": bool(can_cancel),
+            "terminal": bool(terminal),
+            "request_id": rid,
+        }
+
+    def _rebase_same_scene(self, record):
+        try:
+            scene_now = self._current_scene_id()
+        except Exception:
+            scene_now = ""
+        scene_req = record.get("scene_id") if isinstance(record, dict) else None
+        if scene_now is None:
+            scene_now = ""
+        if scene_req is None:
+            scene_req = ""
+        return str(scene_now) == str(scene_req)
+
+    def _rebase_request_blocks_follow(self, root, final_dir, request, record, now):
+        """追従を止めるのは非終端と、done を見てから 60 秒以内で未完了の依頼だけ。"""
+        rid = request.get("request_id")
+        if self._rebase_is_settled(record, rid):
+            return False
+        try:
+            status_read = rb.read_status(root, rid)
+        except Exception:
+            return True
+        if self._rebase_state(status_read) != "done":
+            try:
+                cancel_requested = rb.cancel_exists(root, rid)
+                display = rb.decide_display(
+                    request, status_read, now=now, cancel_requested=cancel_requested,
+                )
+            except Exception:
+                return True
+            return not bool(display.terminal)
+        seen = self._rebase_done_seen_at.get(rid)
+        if seen is None:
+            self._rebase_done_seen_at[rid] = now
+            seen = now
+        try:
+            decision = self._rebase_judge(final_dir, request, record, status_read)
+        except Exception:
+            decision = None
+        reason = getattr(decision, "reason", "")
+        # scene_changed は、今開いているシーンの依頼ではない。追従は止めない。
+        if reason == "scene_changed" and not self._rebase_same_scene(record):
+            return False
+        try:
+            age = float(now) - float(seen)
+        except (TypeError, ValueError):
+            age = 0.0
+        if age > REBASE_DONE_FOLLOW_BLOCK_S:
+            return False
+        return True
+
+    def _rebase_update_block(self, root, final_dir, rows, now):
+        blocks = False
+        for request, record in rows:
+            if self._rebase_request_blocks_follow(
+                root, final_dir, request, record, now,
+            ):
+                blocks = True
+        self._rebase_blocks_follow = blocks
+
+    def _rebase_discard_once(self, project_key, rid, baseline_id):
+        if rid in self._rebase_discarded:
+            return
+        self._rebase_discarded.add(rid)
+        self._discard_candidate(project_key, baseline_id)
+
+    def _rebase_note_once(self, key, text):
+        if key in self._rebase_noted or not text:
+            return
+        self._rebase_noted.add(key)
+        rid = key[0] if isinstance(key, tuple) and key else None
+        # 起動時に既に終端・未確認だった依頼は、履歴へ重ねて書かない。
+        if rid not in self._rebase_live_ids:
+            return
+        self._write_history(text)
+
+    def _rebase_new_request_id(self, root):
+        for _attempt in range(REBASE_REQUEST_ID_ATTEMPTS):
+            try:
+                request_id = rb.generate_request_id(self._utcnow_fn())
+            except Exception:
+                return None
+            try:
+                if rb.request_path(root, request_id).exists():
+                    continue
+            except Exception:
+                continue
+            return request_id
+        return None
+
+    def _read_active_baseline_id(self, root):
+        # 2026.10.19(RB-d): 公開の読み出しが無いので RB-b の内部関数を使う。
+        # QUESTIONS_rb_d.md。active.json が指す基準が解決できるときだけ送る。
+        try:
+            import uvremap_runtime as runtime_mod
+            return runtime_mod._read_active_baseline(Path(root))
+        except Exception:
+            return None
+
+    def _load_baseline_snapshot(self, root, baseline_id):
+        if not baseline_id:
+            return None
+        try:
+            import uvremap_core
+            return uvremap_core.load_snapshot(Path(root) / "baseline" / str(baseline_id))
+        except Exception:
+            return None
+
+    def _call_rebase_export(self, shape_paths, meshes_dir, baseline_id, **kwargs):
+        fn = self._rebase_export_fn
+        if fn is None:
+            def fn(paths, directory, bid, **kw):
+                import uvremap_maya as um
+                return um.export_rebase_mesh_with_uvold(
+                    paths, directory, bid, **kw,
+                )
+        result = fn(shape_paths, meshes_dir, baseline_id, **kwargs)
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError("export")
+        mesh, uvold = result
+        if not isinstance(mesh, dict) or not isinstance(uvold, dict):
+            raise RuntimeError("export")
+        return mesh, uvold
+
+    def _rebase_maya_version(self):
+        fn = self._maya_version_fn
+        if fn is None:
+            try:
+                import maya.cmds as cmds
+                value = cmds.about(version=True)
+            except Exception:
+                return None
+        else:
+            try:
+                value = fn()
+            except Exception:
+                return None
+        if isinstance(value, str) and value.strip() and not _text_has_path(value):
+            return value
+        return None
+
+    def _discard_candidate(self, project_key, baseline_id):
+        try:
+            self.runtime.discard_baseline_candidate(project_key, baseline_id)
+        except Exception:
+            pass
+
+    def _unlink_mesh(self, mesh):
+        path = mesh.get("path") if isinstance(mesh, dict) else None
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _export_fail_message(self, exc):
+        detail = ""
+        try:
+            import uvremap_maya as um
+            if isinstance(exc, um.RebaseExportError):
+                detail = str(exc).strip()
+        except Exception:
+            detail = ""
+        if not detail or _text_has_path(detail):
+            detail = "メッシュの書き出しに失敗しました"
+        return MSG_REBASE_EXPORT_FAILED_FMT.format(message=detail)
+
+    def _uvold_history_line(self, uvold):
+        import uvremap_maya as um
+        if isinstance(uvold, dict) and uvold.get("applied"):
+            return MSG_UVOLD_ATTACHED_FMT.format(name=uvold.get("name") or "uvOld")
+        warnings = uvold.get("warnings") if isinstance(uvold, dict) else []
+        return MSG_UVOLD_SKIPPED_FMT.format(reason=um.uvold_reason_text(warnings))
+
+    def _uvold_cleanup_line(self, uvold):
+        if not isinstance(uvold, dict):
+            return ""
+        warnings = uvold.get("warnings") or []
+        if "uvold_cleanup_failed" not in warnings:
+            return ""
+        shapes = uvold.get("shapes") or []
+        if not isinstance(shapes, (list, tuple)):
+            shapes = []
+        shown = []
+        for name in shapes:
+            if isinstance(name, str) and name and not _text_has_path(name):
+                shown.append(name)
+        return MSG_UVOLD_CLEANUP_FAILED_FMT.format(
+            name=uvold.get("name") or "uvOld",
+            shapes="、".join(shown),
+        )
+
+
+def _text_has_path(text) -> bool:
+    """利用者向けの文に絶対パスが混ざっていないか。"""
+    if not isinstance(text, str):
+        return True
+    if "\\" in text or text.startswith("/") or ":/" in text or ":\\" in text:
+        return True
+    return False
+
 
 def _load_qt():
     try:
@@ -1591,7 +2547,11 @@ def _controller_from_window(window, history_fn=None):
 def run_poll_tick(controller, handle, now_ns=None):
     """on_tick の本体。poll の message が空でなければ set_message する。
 
-    poll の後に ``follow_tick``、続けて ``uv_tick`` を呼ぶ。例外は外へ出さない。
+    poll の直後、``follow_tick`` の前に ``rebase_tick`` を呼ぶ。
+    続けて ``follow_tick``、``uv_tick``。例外は外へ出さない。
+    ``rebase_tick`` が無いコントローラでは呼ばない。
+    リベースの message が空のときはメッセージ欄を変えない。送信直後の文、
+    uvOld の後始末失敗、他のボタンの結果は、別の文が出るまで残る。
     """
     try:
         result = controller.poll()
@@ -1601,10 +2561,22 @@ def run_poll_tick(controller, handle, now_ns=None):
     if isinstance(result, dict):
         raw = result.get("message") or ""
         text = raw if isinstance(raw, str) else ""
+    if now_ns is None:
+        now_ns = time.time_ns()
+    try:
+        rebase_tick = getattr(controller, "rebase_tick", None)
+        if callable(rebase_tick):
+            rebase_result = rebase_tick(now_ns / 1_000_000_000)
+            if isinstance(rebase_result, dict):
+                raw = rebase_result.get("message") or ""
+                rebase_text = raw if isinstance(raw, str) else ""
+                # 空は欄を上書きしない。同じ文は rebase_tick が空で返す。
+                if rebase_text:
+                    text = rebase_text
+    except Exception:
+        pass
     follow_result = None
     try:
-        if now_ns is None:
-            now_ns = time.time_ns()
         follow_result = controller.follow_tick(now_ns)
     except Exception:
         follow_result = None
@@ -1889,6 +2861,28 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         show_message(result.get("message") or "")
         refresh_open_views()
 
+    def on_rebase_send():
+        result = handle_rebase_request(controller, qt_confirm, qt_inform)
+        show_message(result.get("message") or "")
+        refresh_open_views()
+
+    def on_rebase_cancel():
+        cancel = getattr(controller, "rebase_cancel", None)
+        if not callable(cancel):
+            return
+        result = cancel()
+        show_message(result.get("message") or "")
+        refresh_open_views()
+
+    def get_rebase_view():
+        getter = getattr(controller, "rebase_view", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
     panel = UVRemapPanel(
         parent=detail,
         on_toggle_enabled=on_toggle_enabled,
@@ -1900,6 +2894,9 @@ def attach(window, parent_layout, controller=None, confirm_fn=None, inform_fn=No
         on_toggle_auto_follow=on_toggle_auto_follow,
         get_auto_follow_uv=get_auto_follow_uv,
         on_toggle_auto_follow_uv=on_toggle_auto_follow_uv,
+        on_rebase_send=on_rebase_send,
+        on_rebase_cancel=on_rebase_cancel,
+        get_rebase_view=get_rebase_view,
     )
     panel.setObjectName("uvremap_panel")
     detail_layout.addWidget(panel)

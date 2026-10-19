@@ -895,6 +895,7 @@ def test_install_and_uninstall_list_optional_uvremap_files():
         "uvremap_panel.py",
         "uvremap_integration.py",
         "uvremap_follow.py",
+        "uvremap_rebase.py",
     ]
     for name in expected:
         assert name in install_src
