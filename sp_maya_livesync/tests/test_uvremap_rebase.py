@@ -533,6 +533,147 @@ def test_parse_request_ignores_unknown_keys_and_keeps_string_versions():
     assert rb.parse_request([]) == (None, "bad_request")
 
 
+# ---------------------------------------------------------------------------
+# 4b. uv_old (RB-a2)
+# ---------------------------------------------------------------------------
+def test_uv_old_absent_keeps_previous_shape():
+    parsed, reason = rb.parse_request(_valid_raw())
+    assert reason is None
+    assert "uv_old" not in parsed
+    assert "uv_old" not in _build()
+    assert "uv_old" not in _build(uv_old=None)
+
+
+def test_parse_request_keeps_explicit_uv_old_null():
+    parsed, reason = rb.parse_request(_valid_raw(uv_old=None))
+    assert reason is None
+    assert parsed is not None
+    assert "uv_old" in parsed
+    assert parsed["uv_old"] is None
+
+
+def test_uv_old_roundtrip_write_read_list(tmp_path):
+    first = _build(uv_old={"name": "uvOld", "index": 1})
+    assert first["uv_old"] == {"name": "uvOld", "index": 1}
+    rb.write_request(tmp_path, first)
+    assert rb.read_request(tmp_path, RID)["uv_old"] == {"name": "uvOld", "index": 1}
+    assert rb.list_requests(tmp_path)[0]["uv_old"] == {"name": "uvOld", "index": 1}
+
+    second = _build(request_id=_rid(1), uv_old={"name": "uvOld_1", "index": 7})
+    assert second["uv_old"] == {"name": "uvOld_1", "index": 7}
+    rb.write_request(tmp_path, second)
+    assert rb.read_request(tmp_path, _rid(1))["uv_old"] == {"name": "uvOld_1", "index": 7}
+
+
+def test_parse_request_drops_unknown_keys_inside_uv_old():
+    raw = _valid_raw(uv_old={"name": "uvOld", "index": 1, "extra": True, "path": "x"})
+    parsed, reason = rb.parse_request(raw)
+    assert reason is None
+    assert parsed["uv_old"] == {"name": "uvOld", "index": 1}
+    built = _build(uv_old={"name": "uvOld", "index": 2, "unused": 0})
+    assert built["uv_old"] == {"name": "uvOld", "index": 2}
+
+
+def test_uv_old_name_of_64_chars_is_valid():
+    name64 = "A" + ("a" * 63)
+    assert len(name64) == 64
+    parsed, reason = rb.parse_request(_valid_raw(uv_old={"name": name64, "index": 1}))
+    assert reason is None
+    assert parsed["uv_old"] == {"name": name64, "index": 1}
+    assert _build(uv_old={"name": name64, "index": 1})["uv_old"]["name"] == name64
+
+
+@pytest.mark.parametrize("value", [
+    "uvOld",
+    ["uvOld"],
+    1,
+    True,
+    False,
+    {"index": 1},
+    {"name": "uvOld"},
+    {"name": 1, "index": 1},
+    {"name": "", "index": 1},
+    {"name": "A" + ("a" * 64), "index": 1},
+    {"name": "1abc", "index": 1},
+    {"name": "a-b", "index": 1},
+    {"name": "a b", "index": 1},
+    {"name": "日本語", "index": 1},
+    {"name": "uvOld\n", "index": 1},
+    {"name": None, "index": 1},
+    {"name": "uvOld", "index": 0},
+    {"name": "uvOld", "index": 8},
+    {"name": "uvOld", "index": -1},
+    {"name": "uvOld", "index": 1.0},
+    {"name": "uvOld", "index": "1"},
+    {"name": "uvOld", "index": True},
+    {"name": "uvOld", "index": None},
+])
+def test_invalid_uv_old_is_bad_request_and_write_creates_nothing(tmp_path, value):
+    parsed, reason = rb.parse_request(_valid_raw(uv_old=value))
+    assert parsed is None
+    assert reason == "bad_request"
+    with pytest.raises(ValueError):
+        _build(uv_old=value)
+    with pytest.raises(ValueError):
+        rb.write_request(tmp_path, _valid_raw(uv_old=value))
+    assert not rb.requests_dir(tmp_path).exists()
+
+
+def test_bad_uv_old_wins_over_bad_settings():
+    raw = _valid_raw(uv_old="uvOld")
+    raw["reload"] = {
+        "preserve_strokes": False,
+        "import_cameras": False,
+        "auto_unwrap": False,
+    }
+    assert rb.parse_request(raw) == (None, "bad_request")
+
+
+def test_parse_request_without_uv_old_matches_previous_result():
+    raw = {
+        "schema": 1,
+        "request_id": RID,
+        "project_key": "project-key",
+        "created_at": CREATED,
+        "expires_at": CREATED + TTL,
+        "mesh": {"path": MESH_PATH, "size": 123456, "sha1": SHA1},
+        "baseline_id": "bl-1",
+        "reload": {
+            "preserve_strokes": True,
+            "import_cameras": False,
+            "auto_unwrap": False,
+        },
+        "final_full": True,
+        "ts_names": ["Body"],
+    }
+    parsed, reason = rb.parse_request(raw)
+    assert reason is None
+    assert parsed == {
+        "schema": 1,
+        "request_id": RID,
+        "project_key": "project-key",
+        "created_at": CREATED,
+        "expires_at": CREATED + TTL,
+        "mesh": {"path": MESH_PATH, "size": 123456, "sha1": SHA1},
+        "baseline_id": "bl-1",
+        "reload": {
+            "preserve_strokes": True,
+            "import_cameras": False,
+            "auto_unwrap": False,
+        },
+        "final_full": True,
+        "ts_names": ["Body"],
+    }
+    assert rb.SCHEMA == 1
+    assert "UV_OLD_NAME_RE" in rb.__all__
+    assert "UV_OLD_NAME_MAX" in rb.__all__
+    assert "UV_OLD_INDEX_MIN" in rb.__all__
+    assert "UV_OLD_INDEX_MAX" in rb.__all__
+    assert rb.UV_OLD_NAME_MAX == 64
+    assert rb.UV_OLD_INDEX_MIN == 1
+    assert rb.UV_OLD_INDEX_MAX == 7
+
+
 @pytest.mark.parametrize("payload", [
     b"{",
     b"",

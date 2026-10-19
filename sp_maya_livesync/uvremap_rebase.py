@@ -48,6 +48,10 @@ __all__ = (
     "MIN_PLUGIN_VERSION",
     "REQUEST_RELOAD",
     "REQUEST_ID_RE",
+    "UV_OLD_NAME_RE",
+    "UV_OLD_NAME_MAX",
+    "UV_OLD_INDEX_MIN",
+    "UV_OLD_INDEX_MAX",
     "MSG_WAITING",
     "MSG_PREPARING",
     "MSG_AWAITING_APPROVAL",
@@ -204,6 +208,11 @@ REQUEST_RELOAD = {
 }
 
 REQUEST_ID_RE = re.compile(r"^rb-\d{8}-\d{6}-[0-9a-f]{4}$")
+# 2026.10.19(RB-a2): 依頼の任意キー uv_old。FBX に書いた UV セット名と番号。
+UV_OLD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+UV_OLD_NAME_MAX = 64
+UV_OLD_INDEX_MIN = 1
+UV_OLD_INDEX_MAX = 7
 # RB-b・RB-c と同じ。先頭は英数字、続きは英数字・アンダースコア・ハイフンで全体 1〜80 文字。
 _BASELINE_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,79}$")
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -547,11 +556,40 @@ def _copy_reload() -> dict:
     }
 
 
+def _parse_uv_old(value) -> tuple[bool, dict | None]:
+    """旧 UV セット記述を検査する。例外は出さない。
+
+    # 2026.10.19(RB-a2): ``None`` は有効で値は ``None``。
+    dict で ``name`` / ``index`` が規則どおりならその 2 キーだけ残す。
+    それ以外は無効。
+    """
+    if value is None:
+        return True, None
+    if not isinstance(value, dict):
+        return False, None
+    if "name" not in value or "index" not in value:
+        return False, None
+    name = value.get("name")
+    index = value.get("index")
+    if not isinstance(name, str) or name == "":
+        return False, None
+    if len(name) > UV_OLD_NAME_MAX:
+        return False, None
+    if UV_OLD_NAME_RE.fullmatch(name) is None:
+        return False, None
+    if isinstance(index, bool) or not isinstance(index, int):
+        return False, None
+    if index < UV_OLD_INDEX_MIN or index > UV_OLD_INDEX_MAX:
+        return False, None
+    return True, {"name": name, "index": index}
+
+
 def parse_request(raw) -> tuple[dict | None, str | None]:
     """正規化した依頼か ``(None, 理由コード)``。例外は出さない。
 
     不明なキーは落とす。``maya_version`` / ``tool_version`` は文字列のときだけ残す。
     ファイル名との一致は見ない(``read_request`` が確認する)。
+    ``uv_old`` が無い依頼は従来どおり有効で、結果にもキーを出さない。
     """
     if not isinstance(raw, dict):
         return None, "bad_request"
@@ -589,6 +627,14 @@ def parse_request(raw) -> tuple[dict | None, str | None]:
     ts_names = _parse_ts_names(raw.get("ts_names"))
     if ts_names is None:
         return None, "bad_request"
+    # 2026.10.19(RB-a2): uv_old は任意。不正は bad_request。
+    # reload の値違い(bad_settings)より先に見る。無いのは不正ではない。
+    has_uv_old = "uv_old" in raw
+    uv_old = None
+    if has_uv_old:
+        uv_ok, uv_old = _parse_uv_old(raw.get("uv_old"))
+        if not uv_ok:
+            return None, "bad_request"
     if reload_problem is not None:
         return None, reload_problem
     out = {
@@ -603,6 +649,8 @@ def parse_request(raw) -> tuple[dict | None, str | None]:
         "final_full": final_full,
         "ts_names": ts_names,
     }
+    if has_uv_old:
+        out["uv_old"] = uv_old
     for key in ("maya_version", "tool_version"):
         if key in raw and isinstance(raw[key], str):
             out[key] = raw[key]
@@ -621,10 +669,12 @@ def build_request(
     final_full=True,
     maya_version=None,
     tool_version=None,
+    uv_old=None,
 ) -> dict:
     """依頼の辞書を作る。``expires_at = created_at + ttl``。ttl は設定と同じ丸め。
 
     ``maya_version`` / ``tool_version`` が None のときはキー自体を出さない。
+    ``uv_old`` が None のときもキーを出さない(``null`` は書かない)。
     型が違えば ``ValueError``。``reload`` は ``REQUEST_RELOAD`` のコピー。
     """
     if not is_valid_request_id(request_id):
@@ -648,6 +698,13 @@ def build_request(
         raise ValueError("maya_version が不正です")
     if tool_version is not None and not isinstance(tool_version, str):
         raise ValueError("tool_version が不正です")
+    # 2026.10.19(RB-a2): None はキー無し。dict は正規化して入れる。
+    uv_old_out = None
+    if uv_old is not None:
+        uv_ok, parsed_uv_old = _parse_uv_old(uv_old)
+        if not uv_ok or parsed_uv_old is None:
+            raise ValueError("uv_old が不正です")
+        uv_old_out = parsed_uv_old
     out = {
         "schema": SCHEMA,
         "request_id": request_id,
@@ -664,6 +721,8 @@ def build_request(
         out["maya_version"] = maya_version
     if tool_version is not None:
         out["tool_version"] = tool_version
+    if uv_old_out is not None:
+        out["uv_old"] = uv_old_out
     return out
 
 

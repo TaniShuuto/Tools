@@ -461,6 +461,68 @@ def test_uvold_result_is_history_and_cleanup_is_prominent(tmp_path):
     assert "/" not in result["message"]
 
 
+def _export_uvold(*, applied, name, warnings=None, shapes=None):
+    def export(shape_paths, meshes_dir, baseline_id, triangulate=False, **kwargs):
+        path = Path(meshes_dir) / "{0}.fbx".format(baseline_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"FBX!")
+        return (
+            {"path": str(path), "size": 4, "sha1": SHA},
+            {
+                "applied": applied,
+                "name": name,
+                "warnings": list(warnings or []),
+                "shapes": list(shapes or []),
+            },
+        )
+    return export
+
+
+def test_rebase_send_writes_uv_old_when_applied(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    assert sent["ok"] is True
+    recs = rb.list_requests(ctrl._work)
+    assert recs[0]["uv_old"] == {"name": "uvOld", "index": 1}
+
+    ctrl2 = _make(tmp_path, export=_export_uvold(applied=True, name="uvOld_1"))
+    sent2 = ctrl2.rebase_send()
+    assert sent2["ok"] is True
+    recs2 = rb.list_requests(ctrl2._work)
+    assert recs2[0]["uv_old"] == {"name": "uvOld_1", "index": 1}
+
+
+def test_rebase_send_omits_uv_old_when_skipped(tmp_path):
+    ctrl = _make(
+        tmp_path,
+        export=_export_uvold(
+            applied=False,
+            name=None,
+            warnings=["uvold_topology_mismatch"],
+        ),
+    )
+    sent = ctrl.rebase_send()
+    assert sent["ok"] is True
+    recs = rb.list_requests(ctrl._work)
+    assert "uv_old" not in recs[0]
+
+
+def test_rebase_send_omits_uv_old_when_name_is_invalid(tmp_path):
+    ctrl = _make(tmp_path, export=_export_uvold(applied=True, name="bad name"))
+    sent = ctrl.rebase_send()
+    assert sent["ok"] is True
+    recs = rb.list_requests(ctrl._work)
+    assert "uv_old" not in recs[0]
+
+
+def test_rebase_send_omits_uv_old_when_applied_name_is_none(tmp_path):
+    ctrl = _make(tmp_path, export=_export_uvold(applied=True, name=None))
+    sent = ctrl.rebase_send()
+    assert sent["ok"] is True
+    recs = rb.list_requests(ctrl._work)
+    assert "uv_old" not in recs[0]
+
+
 def _arm_done(ctrl, request_id):
     _put_status(ctrl, request_id, "done")
     _put_result(ctrl, request_id)

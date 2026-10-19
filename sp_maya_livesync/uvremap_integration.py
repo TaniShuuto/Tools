@@ -1733,6 +1733,7 @@ class UVRemapController:
             self._unlink_mesh(mesh)
             return {"ok": False, "message": MSG_REBASE_SEND_FAILED}
         try:
+            # 2026.10.19(RB-a2): 旧 UV を付けたときだけ任意キー uv_old を載せる。
             request = rb.build_request(
                 request_id=request_id,
                 project_key=project_key,
@@ -1744,6 +1745,7 @@ class UVRemapController:
                 final_full=True,
                 maya_version=self._rebase_maya_version(),
                 tool_version=None,
+                uv_old=_uv_old_for_request(uvold),
             )
             rb.write_request(root, request)
         except Exception:
@@ -2376,6 +2378,24 @@ class UVRemapController:
             name=uvold.get("name") or "uvOld",
             shapes="、".join(shown),
         )
+
+
+def _uv_old_for_request(uvold):
+    """書き出し結果から依頼の ``uv_old`` を決める。載せないときは None。
+
+    # 2026.10.19(RB-a2): applied かつ名前が規則どおりのときだけ index 1。
+    名前が規則違反でも送信は落とさない(キー無し)。QUESTIONS_rb_a2.md。
+    """
+    if not isinstance(uvold, dict) or uvold.get("applied") is not True:
+        return None
+    name = uvold.get("name")
+    if not isinstance(name, str) or name == "":
+        return None
+    if len(name) > rb.UV_OLD_NAME_MAX:
+        return None
+    if rb.UV_OLD_NAME_RE.fullmatch(name) is None:
+        return None
+    return {"name": name, "index": 1}
 
 
 def _text_has_path(text) -> bool:
