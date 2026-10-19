@@ -1522,6 +1522,7 @@ def build_rebase_status(
     state,
     now,
     plugin_version,
+    *,
     reason=None,
     message="",
     backup_name=None,
@@ -1530,9 +1531,12 @@ def build_rebase_status(
 ):
     if not is_valid_rebase_request_id(request_id):
         raise ValueError("request_id が不正です")
-    if state not in _REBASE_STATE_SET:
+    # 2026.10.19(1.4.0 PB-b 0.5): state / reason が str でないときは
+    # TypeError ではなく ValueError(frozenset が unhashable を弾くため)。
+    if not isinstance(state, str) or state not in _REBASE_STATE_SET:
         raise ValueError("state が不正です")
-    if reason is not None and reason not in _REBASE_REASON_SET:
+    if reason is not None and (
+            not isinstance(reason, str) or reason not in _REBASE_REASON_SET):
         raise ValueError("reason が不正です")
     if not _rebase_is_finite_number(now):
         raise ValueError("updated_at が不正です")
@@ -1568,7 +1572,9 @@ def parse_rebase_status(raw):
     if not isinstance(request_id, str) or request_id == "":
         return None
     state = raw.get("state")
-    if state not in _REBASE_STATE_SET:
+    # 2026.10.19(1.4.0 PB-b 0.5): list / dict など unhashable な state で
+    # TypeError を出さない(1 秒タイマーから read → write する経路)。
+    if not isinstance(state, str) or state not in _REBASE_STATE_SET:
         return None
     updated_at = raw.get("updated_at")
     if not _rebase_is_finite_number(updated_at):
@@ -1603,6 +1609,12 @@ def read_rebase_status(root, rid):
 
 
 def is_valid_rebase_transition(prev_state, new_state):
+    # 2026.10.19(1.4.0 PB-b 0.5): unhashable な prev_state / new_state で
+    # TypeError を出さない。
+    if prev_state is not None and not isinstance(prev_state, str):
+        return False
+    if not isinstance(new_state, str):
+        return False
     allowed = _REBASE_TRANSITIONS.get(prev_state)
     if allowed is None:
         return False
@@ -1663,7 +1675,8 @@ def build_interrupted_status(prev_status, now, plugin_version):
     if not isinstance(prev_status, dict):
         return None
     state = prev_status.get("state")
-    if state not in _REBASE_STATE_SET or state in _REBASE_TERMINAL:
+    # 2026.10.19(1.4.0 PB-b 0.5): unhashable な state で例外を出さない。
+    if not isinstance(state, str) or state not in _REBASE_STATE_SET or state in _REBASE_TERMINAL:
         return None
     request_id = prev_status.get("request_id")
     return build_rebase_status(
@@ -1678,12 +1691,16 @@ def build_interrupted_status(prev_status, now, plugin_version):
     )
 
 
-def rebase_failure_message(reason, backup_name=None, detail=None):
-    text = REBASE_REASON_MESSAGES.get(reason, "")
+def rebase_failure_message(reason, *, backup_name=None, detail=None):
+    # 2026.10.19(1.4.0 PB-b 0.5): reason が str でないときは既定文。
+    if not isinstance(reason, str):
+        text = ""
+    else:
+        text = REBASE_REASON_MESSAGES.get(reason, "")
     if not text:
         text = "リベースに失敗しました"
     name = _rebase_filename_only(backup_name)
-    if reason in _REBASE_BACKUP_MESSAGE_REASONS and name:
+    if isinstance(reason, str) and reason in _REBASE_BACKUP_MESSAGE_REASONS and name:
         text = "{0} バックアップ: {1}".format(text, name)
     if isinstance(detail, str) and detail:
         text = "{0} {1}".format(text, detail)
@@ -1762,7 +1779,7 @@ def wait_timed_out(first_wait_at, now, settings):
 
 
 # --- 3.6 事前チェックの入力の組み立て(R-5.3) ---
-def mesh_precheck(mesh, cache, stat_fn=os.stat, hash_fn=None):
+def mesh_precheck(mesh, cache, *, stat_fn=os.stat, hash_fn=None):
     """(mesh_exists, mesh_sha1_ok, new_cache)。同じ size/mtime_ns では hash を再計算しない。"""
     if not isinstance(mesh, dict):
         return False, None, None
@@ -1819,6 +1836,49 @@ def mesh_precheck(mesh, cache, stat_fn=os.stat, hash_fn=None):
     return True, sha1_ok, new_cache
 
 
+# 2026.10.19(1.4.0 PB-b 0.5): mesh_precheck のキャッシュは依頼ごとに持つ。
+# 同じファイルを指す別依頼(sha1 / size が違う)へ古い sha1_ok を渡さない。
+# 関数 mesh_precheck 自体の挙動は変えない。
+_REBASE_PRECHECK_CACHE_MAX = 32
+
+
+class RebasePrecheckCaches(object):
+    """request_id -> mesh_precheck の cache。終端・閉じる・shutdown で捨てる。"""
+
+    def __init__(self, max_entries=_REBASE_PRECHECK_CACHE_MAX):
+        self._by_id = {}
+        self._max_entries = max(1, int(max_entries))
+
+    def get(self, request_id):
+        return self._by_id.get(request_id)
+
+    def put(self, request_id, cache):
+        if not isinstance(request_id, str) or request_id == "":
+            return
+        if request_id in self._by_id:
+            self._by_id.pop(request_id, None)
+        self._by_id[request_id] = cache
+        while len(self._by_id) > self._max_entries:
+            oldest = next(iter(self._by_id))
+            self._by_id.pop(oldest, None)
+
+    def drop(self, request_id):
+        self._by_id.pop(request_id, None)
+
+    def drop_if_terminal(self, request_id, state):
+        if isinstance(state, str) and state in _REBASE_TERMINAL:
+            self.drop(request_id)
+
+    def clear(self):
+        self._by_id.clear()
+
+    def __contains__(self, request_id):
+        return request_id in self._by_id
+
+    def __len__(self):
+        return len(self._by_id)
+
+
 def supports_auto_unwrap_settings(settings_cls):
     """MeshReloadingSettings が auto_unwrap_settings を持てるか。判定できなければ False。"""
     if settings_cls is None:
@@ -1846,6 +1906,7 @@ def compute_last_edit_age(now, last_edit_at):
 
 
 def build_painter_state(
+    *,
     now,
     is_open,
     in_edition,
@@ -1987,6 +2048,7 @@ def build_reload_settings_kwargs(request, supports_auto_unwrap):
 # --- 3.8 文言(R-8) ---
 def build_rebase_approval_text(
     request,
+    *,
     backup_dir,
     needs_saving=False,
     can_disable_auto_unwrap=True,

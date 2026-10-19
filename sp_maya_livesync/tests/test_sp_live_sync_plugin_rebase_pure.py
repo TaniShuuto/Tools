@@ -1287,3 +1287,173 @@ def test_roundtrip_to_done_with_maya(tmp_path):
         already_completed=False,
     )
     assert judged.action == "complete"
+
+
+# ---------------------------------------------------------------------------
+# 18. 0.5: unhashable な state / reason、keyword-only、依頼ごとのキャッシュ
+# ---------------------------------------------------------------------------
+_UNHASHABLE_VALUES = (
+    [],
+    {},
+    ["failed"],
+    {"a": 1},
+    1,
+    1.5,
+    True,
+    None,
+    b"failed",
+    set(),
+)
+
+
+@pytest.mark.parametrize("bad", _UNHASHABLE_VALUES)
+def test_unhashable_state_reason_do_not_raise_typeerror(bad):
+    assert plugin.parse_rebase_status({
+        "schema": 1,
+        "request_id": RID,
+        "state": bad,
+        "updated_at": 1,
+    }) is None
+    assert plugin.build_interrupted_status({"state": bad, "request_id": RID}, 1, PLUGIN_VERSION) is None
+    # None は遷移表の始点として合法。それ以外の非 str は False。
+    if bad is None:
+        assert plugin.is_valid_rebase_transition(bad, "received") is True
+    else:
+        assert plugin.is_valid_rebase_transition(bad, "received") is False
+    assert plugin.is_valid_rebase_transition("received", bad) is False
+    assert plugin.rebase_failure_message(bad) == "リベースに失敗しました"
+    with pytest.raises(ValueError):
+        plugin.build_rebase_status(RID, bad, 1, PLUGIN_VERSION)
+    if bad is None:
+        # reason=None は省略と同じで合法。
+        plugin.build_rebase_status(RID, "failed", 1, PLUGIN_VERSION, reason=None)
+    else:
+        with pytest.raises(ValueError):
+            plugin.build_rebase_status(RID, "failed", 1, PLUGIN_VERSION, reason=bad)
+
+
+def test_read_write_status_recovers_unhashable_existing_file(tmp_path):
+    path = Path(plugin.rebase_status_path(tmp_path, RID))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema": 1,
+            "request_id": RID,
+            "state": ["failed"],
+            "updated_at": 1,
+        }),
+        encoding="utf-8",
+    )
+    assert plugin.read_rebase_status(tmp_path, RID) is None
+    recovered = plugin.build_rebase_status(RID, "received", 2, PLUGIN_VERSION)
+    assert plugin.write_rebase_status(tmp_path, recovered) is True
+    got = plugin.read_rebase_status(tmp_path, RID)
+    assert got is not None
+    assert got["state"] == "received"
+
+    path.write_text(
+        json.dumps({
+            "schema": 1,
+            "request_id": RID,
+            "state": {"a": 1},
+            "updated_at": 1,
+        }),
+        encoding="utf-8",
+    )
+    assert plugin.read_rebase_status(tmp_path, RID) is None
+    again = plugin.build_rebase_status(RID, "rejected", 3, PLUGIN_VERSION, reason="bad_request")
+    assert plugin.write_rebase_status(tmp_path, again) is True
+    got2 = plugin.read_rebase_status(tmp_path, RID)
+    assert got2["state"] == "rejected"
+
+
+def _assert_keyword_only(fn, *names):
+    import inspect
+    params = inspect.signature(fn).parameters
+    for name in names:
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+
+
+def test_pb_a_functions_are_keyword_only():
+    _assert_keyword_only(
+        plugin.build_rebase_status,
+        "reason", "message", "backup_name", "result_export_id", "uv_fills",
+    )
+    _assert_keyword_only(plugin.rebase_failure_message, "backup_name", "detail")
+    _assert_keyword_only(plugin.mesh_precheck, "stat_fn", "hash_fn")
+    _assert_keyword_only(
+        plugin.build_painter_state,
+        "now", "is_open", "in_edition", "project_key", "saved_path",
+        "busy", "exporting", "needs_saving", "backup_includes_unsaved",
+        "mesh_exists", "mesh_sha1_ok", "superseded", "cancelled",
+        "can_disable_auto_unwrap", "last_edit_at",
+    )
+    _assert_keyword_only(
+        plugin.build_rebase_approval_text,
+        "backup_dir", "needs_saving", "can_disable_auto_unwrap",
+        "backup_includes_unsaved", "uv_fill_reproject",
+    )
+    with pytest.raises(TypeError):
+        plugin.build_rebase_status(RID, "failed", 1, PLUGIN_VERSION, "busy")
+    with pytest.raises(TypeError):
+        plugin.rebase_failure_message("export_failed", "keep.spp")
+    with pytest.raises(TypeError):
+        plugin.mesh_precheck({"path": "x"}, None, os.stat)
+    with pytest.raises(TypeError):
+        plugin.build_painter_state(
+            NOW, True, True, PROJECT_KEY, PROJECT_KEY,
+            False, False, False, False, True, True, False, False, True, None,
+        )
+    with pytest.raises(TypeError):
+        plugin.build_rebase_approval_text(_ok_request(), "backup")
+
+
+def test_precheck_cache_is_per_request(tmp_path):
+    path = tmp_path / "shared.fbx"
+    path.write_bytes(b"hello")
+    digest_a = hashlib.sha1(b"hello").hexdigest()
+    digest_b = "b" * 40
+    mesh_a = {"path": str(path), "size": 5, "sha1": digest_a}
+    mesh_b = {"path": str(path), "size": 5, "sha1": digest_b}
+    rid_a = _rid(21)
+    rid_b = _rid(22)
+    stores = plugin.RebasePrecheckCaches()
+    calls = []
+
+    def counting_hash(hash_path):
+        calls.append(hash_path)
+        return hashlib.sha1(Path(hash_path).read_bytes()).hexdigest()
+
+    exists_a, ok_a, cache_a = plugin.mesh_precheck(
+        mesh_a, cache=stores.get(rid_a), hash_fn=counting_hash)
+    stores.put(rid_a, cache_a)
+    assert exists_a is True and ok_a is True
+    assert len(calls) == 1
+
+    exists_b, ok_b, cache_b = plugin.mesh_precheck(
+        mesh_b, cache=stores.get(rid_b), hash_fn=counting_hash)
+    stores.put(rid_b, cache_b)
+    assert exists_b is True and ok_b is False
+    assert rid_a in stores and rid_b in stores
+    assert len(calls) == 2
+    leaked = plugin.mesh_precheck(mesh_b, cache=stores.get(rid_a), hash_fn=counting_hash)
+    assert leaked[1] is True
+    assert len(calls) == 2
+
+    exists_a2, ok_a2, cache_a2 = plugin.mesh_precheck(
+        mesh_a, cache=stores.get(rid_a), hash_fn=counting_hash)
+    exists_b2, ok_b2, cache_b2 = plugin.mesh_precheck(
+        mesh_b, cache=stores.get(rid_b), hash_fn=counting_hash)
+    assert exists_a2 is True and ok_a2 is True
+    assert exists_b2 is True and ok_b2 is False
+    assert cache_a2 is cache_a
+    assert cache_b2 is cache_b
+    assert len(calls) == 2
+
+    stores.drop_if_terminal(rid_a, "done")
+    stores.drop_if_terminal(rid_b, "preparing")
+    assert rid_a not in stores
+    assert rid_b in stores
+    stores.clear()
+    assert rid_b not in stores
+    assert len(stores) == 0
