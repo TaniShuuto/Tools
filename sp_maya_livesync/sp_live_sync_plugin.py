@@ -9,7 +9,7 @@ Substance 3D Painter 側プラグイン(SP Live Sync, B案:自前パイプライ
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
 #
 # 変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import os
 import re
@@ -3595,6 +3595,87 @@ class SetupWizard(QtWidgets.QWizard):
 
 
 # ---------------------------------------------------------------------------
+# 2026.10.19(1.3.1): 画面設定の未保存判定(純関数)
+# Qt / Painter に依存しない。書き出し処理には使わない。
+# ---------------------------------------------------------------------------
+
+PANEL_SETTING_KEYS = (
+    "staging_dir", "watch_dir", "final_export_dir",
+    "preview_resolution_log2", "final_resolution_log2",
+    "debounce_seconds", "final_cooldown_seconds",
+)
+
+# 画面の日本語ラベル。未保存ラベルのツールチップに並べる。
+# 折りたたみ設定グループの行ラベルと揃える。
+_PANEL_SETTING_LABELS = {
+    "staging_dir": "ステージングフォルダ",
+    "watch_dir": "監視フォルダ(プレビュー)",
+    "final_export_dir": "最終出力フォルダ(保存時)",
+    "preview_resolution_log2": "プレビュー解像度",
+    "final_resolution_log2": "最終出力解像度(高画質)",
+    "debounce_seconds": "デバウンス間隔",
+    "final_cooldown_seconds": "Final書き出しのクールダウン",
+}
+
+_PANEL_PATH_KEYS = ("staging_dir", "watch_dir", "final_export_dir")
+_PANEL_INT_DEFAULTS = {
+    "preview_resolution_log2": 9,
+    "final_resolution_log2": 12,
+}
+_PANEL_FLOAT_DEFAULTS = {
+    "debounce_seconds": 1.5,
+    "final_cooldown_seconds": 5.0,
+}
+
+
+def unsaved_setting_keys(panel_values, saved_config):
+    """画面の値と保存済みの値を比べ、食い違うキーを PANEL_SETTING_KEYS の順で返す。"""
+    panel_map = panel_values if isinstance(panel_values, dict) else {}
+    saved_map = saved_config if isinstance(saved_config, dict) else {}
+    dirty = []
+    for key in PANEL_SETTING_KEYS:
+        if not _panel_setting_matches(key, panel_map, saved_map):
+            dirty.append(key)
+    return dirty
+
+
+def _panel_setting_matches(key, panel_map, saved_map):
+    try:
+        if key in _PANEL_PATH_KEYS:
+            return _panel_paths_match(panel_map.get(key), saved_map.get(key))
+        if key in _PANEL_INT_DEFAULTS:
+            panel_n = int(panel_map[key])
+            if key not in saved_map:
+                saved_n = _PANEL_INT_DEFAULTS[key]
+            else:
+                saved_n = int(saved_map[key])
+            return panel_n == saved_n
+        if key in _PANEL_FLOAT_DEFAULTS:
+            panel_n = float(panel_map[key])
+            if key not in saved_map:
+                saved_n = _PANEL_FLOAT_DEFAULTS[key]
+            else:
+                saved_n = float(saved_map[key])
+            return abs(panel_n - saved_n) <= 1e-6
+    except (TypeError, ValueError, KeyError, AttributeError, OSError):
+        return False
+    return False
+
+
+def _panel_paths_match(panel_raw, saved_raw):
+    panel_text = str(panel_raw).strip()
+    saved_text = str(saved_raw).strip()
+    if panel_text == "" and saved_text == "":
+        return True
+    if panel_text == "" or saved_text == "":
+        return False
+    return (
+        os.path.normcase(os.path.normpath(panel_text))
+        == os.path.normcase(os.path.normpath(saved_text))
+    )
+
+
+# ---------------------------------------------------------------------------
 # GUI: ドッキングパネル
 # ---------------------------------------------------------------------------
 
@@ -3603,6 +3684,9 @@ class LiveSyncPanel(QtWidgets.QWidget):
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        # 2026.10.19(1.3.1): 設定読込中は未保存判定を止める。保存成功時刻は起動直後は空。
+        self._loading_panel_values = False
+        self._last_save_time = None
         self.setObjectName("SPMayaLiveSyncPanel")
         # パネルのタイトルにもバージョンを出し、ログを遡らなくても
         # 現在動作中のバージョンが一目で分かるようにする
@@ -3658,12 +3742,12 @@ class LiveSyncPanel(QtWidgets.QWidget):
         # UI導線改善(フェーズ1): 「今すぐ同期」は保存を待たずに手元の
         # 変更をすぐ反映したい時に押す操作で、層1の有効化チェックボックスに
         # 次いで頻度が高い。他のボタン群より一段階目立つ高さにして
-        # 単独行に配置する。engine.force_sync_now は引数を取らないメソッド
-        # のため、Qtのclicked(bool)シグナルの引数はそのまま無視される
-        # (force_sync_now側でboolを受け取る仮引数を持たないため安全)。
+        # 単独行に配置する。
+        # 2026.10.19(1.3.1): 未オープン案内と未保存確認を挟むため、
+        # engine.force_sync_now を直接接続せずパネル側ハンドラ経由にする。
         self.sync_now_btn = QtWidgets.QPushButton("今すぐ同期")
         self.sync_now_btn.setMinimumHeight(32)
-        self.sync_now_btn.clicked.connect(self.engine.force_sync_now)
+        self.sync_now_btn.clicked.connect(self._on_sync_now_clicked)
         layout.addWidget(self.sync_now_btn)
 
         # フォルダパス・解像度・デバウンス間隔は基本的に初回セットアップ時に
@@ -3721,6 +3805,10 @@ class LiveSyncPanel(QtWidgets.QWidget):
         btn_row = QtWidgets.QHBoxLayout()
         self.save_btn = QtWidgets.QPushButton("設定を保存")
         self.save_btn.clicked.connect(self._on_save_clicked)
+        # 2026.10.19(1.3.1): 設定グループを折りたたんでも見えるよう、
+        # 保存ボタン列(btn_row)の save_btn 直後に未保存/保存済みの状態を置く。
+        self.save_state_label = QtWidgets.QLabel("")
+        self.save_state_label.setWordWrap(True)
         self.history_btn = QtWidgets.QPushButton("同期履歴を開く")
         self.history_btn.setToolTip("SP側/Maya側共通の同期履歴ログ(テキストファイル)を開きます。")
         self.history_btn.clicked.connect(self._open_history_log)
@@ -3733,7 +3821,9 @@ class LiveSyncPanel(QtWidgets.QWidget):
             "クールダウン無視で即座に実行します。差分書き出しの内容が"
             "Maya側とズレていると感じた場合の手動リセット用です。"
         )
-        self.force_full_btn.clicked.connect(self.engine.force_full_final_sync)
+        # 2026.10.19(1.3.1): 未オープン案内と未保存確認を挟むため、
+        # engine.force_full_final_sync を直接接続せずパネル側ハンドラ経由にする。
+        self.force_full_btn.clicked.connect(self._on_force_full_clicked)
 
         self.more_btn = QtWidgets.QToolButton()
         self.more_btn.setText("その他の設定")
@@ -3747,6 +3837,7 @@ class LiveSyncPanel(QtWidgets.QWidget):
         self.more_btn.setMenu(more_menu)
 
         btn_row.addWidget(self.save_btn)
+        btn_row.addWidget(self.save_state_label)
         btn_row.addWidget(self.history_btn)
         btn_row.addWidget(self.force_full_btn)
         btn_row.addStretch(1)
@@ -3805,6 +3896,7 @@ class LiveSyncPanel(QtWidgets.QWidget):
         self.log_view.setVisible(False)
         layout.addWidget(self.log_view, stretch=1)
 
+        self._connect_unsaved_watchers()
         self._load_values_from_config()
         self._refresh_structure_list([], [], [])
 
@@ -3876,32 +3968,39 @@ class LiveSyncPanel(QtWidgets.QWidget):
             line_edit.setText(selected)
 
     def _load_values_from_config(self):
-        cfg = self.engine.config
-        self.staging_edit.setText(cfg.get("staging_dir", ""))
-        self.watch_edit.setText(cfg.get("watch_dir", ""))
-        self.final_edit.setText(cfg.get("final_export_dir", ""))
+        # 2026.10.19(1.3.1): 読込中の setText 等で未保存判定が走らないよう止める。
+        self._loading_panel_values = True
+        try:
+            cfg = self.engine.config
+            self.staging_edit.setText(cfg.get("staging_dir", ""))
+            self.watch_edit.setText(cfg.get("watch_dir", ""))
+            self.final_edit.setText(cfg.get("final_export_dir", ""))
 
-        target_log2 = int(cfg.get("preview_resolution_log2", 9))
-        for i in range(len(RESOLUTION_CHOICES)):
-            log2 = RESOLUTION_CHOICES[i][1]
-            if log2 == target_log2:
-                self.resolution_combo.setCurrentIndex(i)
-                break
+            target_log2 = int(cfg.get("preview_resolution_log2", 9))
+            for i in range(len(RESOLUTION_CHOICES)):
+                log2 = RESOLUTION_CHOICES[i][1]
+                if log2 == target_log2:
+                    self.resolution_combo.setCurrentIndex(i)
+                    break
 
-        target_final_log2 = int(cfg.get("final_resolution_log2", 12))
-        for i in range(len(RESOLUTION_CHOICES)):
-            log2 = RESOLUTION_CHOICES[i][1]
-            if log2 == target_final_log2:
-                self.final_resolution_combo.setCurrentIndex(i)
-                break
+            target_final_log2 = int(cfg.get("final_resolution_log2", 12))
+            for i in range(len(RESOLUTION_CHOICES)):
+                log2 = RESOLUTION_CHOICES[i][1]
+                if log2 == target_final_log2:
+                    self.final_resolution_combo.setCurrentIndex(i)
+                    break
 
-        self.debounce_spin.setValue(float(cfg.get("debounce_seconds", 1.5)))
-        self.final_cooldown_spin.setValue(float(cfg.get("final_cooldown_seconds", 5.0)))
+            self.debounce_spin.setValue(float(cfg.get("debounce_seconds", 1.5)))
+            self.final_cooldown_spin.setValue(float(cfg.get("final_cooldown_seconds", 5.0)))
+        finally:
+            self._loading_panel_values = False
+        self._refresh_unsaved_state()
 
-    def _on_save_clicked(self):
+    def _collect_panel_values(self):
+        # 2026.10.19(1.3.1): 保存と未保存判定で同じ画面値を使う。
         selected_log2 = RESOLUTION_CHOICES[self.resolution_combo.currentIndex()][1]
         selected_final_log2 = RESOLUTION_CHOICES[self.final_resolution_combo.currentIndex()][1]
-        new_values = {
+        return {
             "staging_dir": self.staging_edit.text().strip(),
             "watch_dir": self.watch_edit.text().strip(),
             "final_export_dir": self.final_edit.text().strip(),
@@ -3910,10 +4009,45 @@ class LiveSyncPanel(QtWidgets.QWidget):
             "debounce_seconds": self.debounce_spin.value(),
             "final_cooldown_seconds": self.final_cooldown_spin.value(),
         }
+
+    def _connect_unsaved_watchers(self):
+        # 2026.10.19(1.3.1): 画面の値が変わったら未保存表示を更新する。
+        self.staging_edit.textChanged.connect(self._refresh_unsaved_state)
+        self.watch_edit.textChanged.connect(self._refresh_unsaved_state)
+        self.final_edit.textChanged.connect(self._refresh_unsaved_state)
+        self.resolution_combo.currentIndexChanged.connect(self._refresh_unsaved_state)
+        self.final_resolution_combo.currentIndexChanged.connect(self._refresh_unsaved_state)
+        self.debounce_spin.valueChanged.connect(self._refresh_unsaved_state)
+        self.final_cooldown_spin.valueChanged.connect(self._refresh_unsaved_state)
+
+    def _refresh_unsaved_state(self, *args):
+        if self._loading_panel_values:
+            return
+        dirty = unsaved_setting_keys(self._collect_panel_values(), self.engine.config)
+        if dirty:
+            self.save_state_label.setText(
+                "● 未保存の変更があります(書き出しには保存済みの値が使われます)"
+            )
+            # 文字色のみ。色だけで意味を伝えないよう、文言に「未保存」を含む。
+            self.save_state_label.setStyleSheet("color: #e67e22;")
+            labels = [_PANEL_SETTING_LABELS.get(key, key) for key in dirty]
+            self.save_state_label.setToolTip("、".join(labels))
+            return
+        if self._last_save_time:
+            self.save_state_label.setText("保存しました({0})".format(self._last_save_time))
+            self.save_state_label.setStyleSheet("")
+            self.save_state_label.setToolTip("")
+            return
+        self.save_state_label.setText("")
+        self.save_state_label.setStyleSheet("")
+        self.save_state_label.setToolTip("")
+
+    def _on_save_clicked(self):
+        new_values = self._collect_panel_values()
         for key in ("staging_dir", "watch_dir", "final_export_dir"):
             if not new_values[key]:
                 QtWidgets.QMessageBox.warning(self, "Live Sync", "フォルダが未指定です: {0}".format(key))
-                return
+                return False
         warning = _duplicate_folder_warning(
             new_values["staging_dir"], new_values["watch_dir"], new_values["final_export_dir"]
         )
@@ -3924,12 +4058,70 @@ class LiveSyncPanel(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.No,
             )
             if reply != QtWidgets.QMessageBox.Yes:
+                return False
+        try:
+            self.engine.apply_and_save_config(new_values)
+        except Exception as e:
+            # 2026.10.19(1.3.1): 失敗はダイアログとログに出す。未保存表示は残す。
+            # Qt スロットから再送出すると Painter が不安定になる恐れがあるため、
+            # 握りつぶさず表面化したうえで False を返す。
+            _log("error", "設定を保存できませんでした: {0}".format(e))
+            QtWidgets.QMessageBox.warning(
+                self, "Live Sync",
+                "設定を保存できませんでした: {0}".format(e),
+            )
+            return False
+        self._last_save_time = datetime.datetime.now().strftime("%H:%M:%S")
+        self._refresh_unsaved_state()
+        return True
+
+    def _on_sync_now_clicked(self):
+        # 2026.10.19(1.3.1): 未オープン案内と未保存確認を挟んでから同期する。
+        self._run_manual_sync(self.engine.force_sync_now)
+
+    def _on_force_full_clicked(self):
+        # 2026.10.19(1.3.1): 未オープン案内と未保存確認を挟んでから全量同期する。
+        self._run_manual_sync(self.engine.force_full_final_sync)
+
+    def _run_manual_sync(self, action):
+        if not project.is_open():
+            QtWidgets.QMessageBox.information(
+                self, "Live Sync",
+                "プロジェクトが開かれていません。プロジェクトを開いてから実行してください。",
+            )
+            action()
+            return
+        dirty = unsaved_setting_keys(self._collect_panel_values(), self.engine.config)
+        if dirty:
+            if not self._confirm_unsaved_manual_sync():
                 return
-        self.engine.apply_and_save_config(new_values)
+        action()
+
+    def _confirm_unsaved_manual_sync(self):
+        """未保存のまま手動同期するときの3択。実行してよければ True。"""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Live Sync")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText(
+            "設定に未保存の変更があります。書き出しには保存済みの値が使われます。"
+        )
+        save_btn = box.addButton("保存して実行", QtWidgets.QMessageBox.AcceptRole)
+        skip_btn = box.addButton("保存せずに実行", QtWidgets.QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("キャンセル", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is save_btn:
+            return bool(self._on_save_clicked())
+        if clicked is skip_btn:
+            return True
+        return False
 
     def open_setup_wizard(self):
         wizard = SetupWizard(self.engine, self)
         if wizard.exec_() == QtWidgets.QDialog.Accepted:
+            # 2026.10.19(1.3.1): ウィザード完了は保存済みなので、未保存表示を戻す。
+            self._last_save_time = datetime.datetime.now().strftime("%H:%M:%S")
             self._load_values_from_config()
             # ウィザード完了時にLive Syncを自動的に有効化する。
             # (engine.set_enabled()を直接呼ぶのではなく、チェックボックス側を
