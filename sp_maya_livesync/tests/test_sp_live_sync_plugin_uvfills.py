@@ -253,6 +253,12 @@ def test_gates_and_uv_old_index(monkeypatch):
     summary = plugin.switch_uv_fills_for_project(
         api, [ts], ["Other"], enabled=True, uv_old_index=1, log=logs.append)
     assert summary.gate == "no_matching_texture_set"
+    for empty in ([], None, [""], ["", None]):
+        summary = plugin.switch_uv_fills_for_project(
+            api, [ts], empty, enabled=True, uv_old_index=1, log=logs.append)
+        assert summary.gate == "no_matching_texture_set"
+        assert summary.switched == 0
+    assert uv.mode == Mode.UV
     assert plugin.get_uv_old_index({"uv_old": {"name": "uvOld", "index": 1}}) == 1
     assert plugin.get_uv_old_index({"uv_old": {"name": "uvOld", "index": 7}}) == 7
     assert plugin.get_uv_old_index({"uv_old": {"name": "uvOld", "index": 2}}) == 2
@@ -307,6 +313,102 @@ def test_summary_status_and_message():
     message = summary.to_message()
     assert len(message) <= 500
     assert "切り替え" in message
+
+
+class _RecycleNode(object):
+    """呼ぶたびに子のラッパーを作り直す。uid() だけが安定している。"""
+
+    def __init__(self, uid, kind, child_uids, factory):
+        self._uid = uid
+        self._kind = kind
+        self._child_uids = child_uids
+        self._factory = factory
+        self.mode = Mode.UV
+        self.params = UVProjectionParams()
+
+    def uid(self):
+        return self._uid
+
+    def get_type(self):
+        if self._kind == "fill":
+            return "FillLayerNode"
+        return "GroupLayerNode"
+
+    def get_name(self):
+        return "n{0}".format(self._uid)
+
+    def sub_layers(self):
+        return [self._factory(child) for child in self._child_uids]
+
+
+class _RecycleFill(_RecycleNode):
+    def get_projection_mode(self):
+        return self.mode
+
+    def set_projection_mode(self, mode):
+        self.mode = mode
+
+    def get_projection_parameters(self):
+        return self.params
+
+    def set_projection_parameters(self, params):
+        self.params = params
+
+
+def _recycling_tree(count):
+    specs = {}
+    group_uids = []
+    for index in range(count):
+        fill_uid = 1000 + index
+        group_uid = index + 1
+        specs[fill_uid] = ("fill", [])
+        specs[group_uid] = ("group", [fill_uid])
+        group_uids.append(group_uid)
+    specs[0] = ("group", group_uids)
+
+    def factory(uid):
+        kind, children = specs[uid]
+        cls = _RecycleFill if kind == "fill" else _RecycleNode
+        return cls(uid, kind, children, factory)
+
+    return factory(0)
+
+
+@pytest.mark.parametrize("count", [90, 400])
+def test_recycling_wrappers_finds_every_fill(count):
+    root = _recycling_tree(count)
+    report = {"paint_layers": 0, "groups_unreadable": 0}
+    uids = []
+    for node in plugin.iter_uv_fill_nodes([root], report):
+        uids.append(node.uid())
+    assert uids == list(range(1000, 1000 + count))
+
+
+def test_logs_manual_check_and_missing_attrs():
+    logs = []
+    uv = FakeNode("FillLayerNode", Mode.UV, UVProjectionParams(), name="partial")
+    ts = TextureSetFake("Body", ["stack"])
+    api = _api([uv], params_cls=PartialUVSetParams)
+    summary = plugin.switch_uv_fills_for_project(
+        api, [ts], ["Body"], enabled=True, uv_old_index=1, log=logs.append)
+    assert "filtering_mode" in summary.missing_attrs
+    assert any("missing_attrs=" in line and "filtering_mode" in line for line in logs)
+    message = summary.to_message()
+    assert message.endswith("。")
+    assert "目視確認" in message
+    assert message.count("。") >= 1
+
+    logs.clear()
+    first = FakeNode("FillLayerNode", Mode.UV, UVProjectionParams(), name="ok")
+    second = FakeNode("FillLayerNode", Mode.UV, UVProjectionParams(), name="bad")
+    second.fail_set_params = True
+    first.fail_rollback = True
+    api = _api([first, second])
+    summary = plugin.switch_uv_fills_for_project(
+        api, [ts], ["Body"], enabled=True, uv_old_index=1, log=logs.append)
+    assert summary.needs_manual_check is True
+    assert any("needs_manual_check=true" in line for line in logs)
+    assert "目視確認" in summary.to_message()
 
 
 def test_panel38_names_still_exist():

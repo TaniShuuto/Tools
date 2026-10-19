@@ -22,6 +22,7 @@ import shutil
 import hashlib
 import math
 import inspect
+import functools
 import unicodedata
 import tempfile
 import datetime
@@ -1025,7 +1026,7 @@ REBASE_WORKFLOW_GUIDANCE = (
 REBASE_DONE_GUIDANCE = (
     "リベースが完了しました。ストロークは新しい UV に再投影されています。"
     "次を Painter で確認してください: 2D ビューのストローク、UV 投影のフィル、"
-    "ベイク済みのメッシュマップ(再ベイクが必要な場合があります)"
+    "ベイク済みのメッシュマップ(再ベイクが必要な場合があります)。"
 )
 REBASE_BUTTON_RUN = "実行する"
 REBASE_BUTTON_CANCEL = "やめる"
@@ -1220,6 +1221,21 @@ def effective_rebase_approval(settings):
     if isinstance(settings, dict) and settings.get("rebase_approval") == "auto":
         return "auto"
     return "ask"
+
+
+def needs_saving_for_rebase(snap, settings):
+    """needs_saving が読めないとき、ask は偽、auto だけ真(待つ)。
+
+    読めた値は従来どおり bool にする。設定が auto でも effective が ask なら偽。
+    """
+    if not isinstance(snap, dict):
+        snap = {}
+    if snap.get("needs_saving_missing"):
+        return effective_rebase_approval(settings) == "auto"
+    value = snap.get("needs_saving")
+    if value is None:
+        return False
+    return bool(value)
 
 
 # --- 3.3 依頼の読み取り(R-2.4) ---
@@ -2327,8 +2343,33 @@ def _node_has_projection_api(node):
     return True
 
 
+def _uv_fill_visit_key(node):
+    """訪問済み判定に使う安定した識別子。無ければ None。
+
+    id() は使わない。呼ぶたびに新しいラッパーを返す API では、
+    解放されたラッパーの id が次の未訪問ノードに再利用される。
+    """
+    uid_fn = getattr(node, "uid", None)
+    if not callable(uid_fn):
+        return None
+    try:
+        value = uid_fn()
+    except Exception:
+        return None
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        hash(value)
+    except TypeError:
+        return None
+    return value
+
+
 def iter_uv_fill_nodes(roots, report, *, max_depth=32, _seen=None, _depth=0):
-    """深さ優先。1 ノードの失敗で全体を止めない。循環と深さは打ち切る。"""
+    """深さ優先。1 ノードの失敗で全体を止めない。
+
+    訪問済みは uid() があるノードだけ。無いノードは判定せず、深さで打ち切る。
+    """
     if _seen is None:
         _seen = set()
     if roots is None:
@@ -2338,10 +2379,11 @@ def iter_uv_fill_nodes(roots, report, *, max_depth=32, _seen=None, _depth=0):
     except TypeError:
         nodes = [roots]
     for node in nodes:
-        marker = id(node)
-        if marker in _seen:
-            continue
-        _seen.add(marker)
+        key = _uv_fill_visit_key(node)
+        if key is not None:
+            if key in _seen:
+                continue
+            _seen.add(key)
         if _depth > max_depth:
             continue
         try:
@@ -2484,7 +2526,23 @@ class UvFillStackReport(object):
         self.paint_layers = 0
         self.groups_unreadable = 0
         self.needs_manual_check = False
+        self.missing_attrs = []
         self.switched_names = []
+
+
+def _remember_missing_attrs(report, detail):
+    if not isinstance(detail, dict):
+        return
+    raw = detail.get("missing_attrs")
+    if not isinstance(raw, list):
+        record = detail.get("record")
+        if isinstance(record, dict):
+            raw = record.get("missing_attrs")
+    if not isinstance(raw, list):
+        return
+    for attr in raw:
+        if isinstance(attr, str) and attr and attr not in report.missing_attrs:
+            report.missing_attrs.append(attr)
 
 
 def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
@@ -2501,6 +2559,7 @@ def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
         report.visited += 1
         report.uv_fills_found += 1
         result, detail = switch_uv_fill_node(node, api, source_uv_set)
+        _remember_missing_attrs(report, detail)
         if result == "switched":
             report.switched += 1
             name = None
@@ -2540,6 +2599,7 @@ class UvFillSummary(object):
         self.failed = 0
         self.rolled_back = 0
         self.needs_manual_check = False
+        self.missing_attrs = []
 
     def to_status_dict(self):
         return {
@@ -2563,7 +2623,16 @@ class UvFillSummary(object):
             parts.append("失敗 {0} 件".format(self.failed))
         if self.rolled_back:
             parts.append("ロールバック {0} 件".format(self.rolled_back))
-        text = "。".join(parts)
+        if self.needs_manual_check or self.missing_attrs:
+            parts.append("一部は目視確認が必要です")
+        cleaned = []
+        for part in parts:
+            if not isinstance(part, str) or part == "":
+                continue
+            cleaned.append(part.rstrip("。"))
+        text = "。".join(cleaned)
+        if text:
+            text += "。"
         return _rebase_clip_message(text)
 
 
@@ -2622,19 +2691,20 @@ def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_
             key = _texture_set_key(name)
             if key:
                 wanted.add(key)
+    # 空の依頼は全テクスチャセットに広げない。
+    if not wanted:
+        summary.gate = "no_matching_texture_set"
+        return summary
     matched = []
     skipped_not_in_request = 0
     for ts in texture_sets or []:
         name = _texture_set_name(ts)
         key = _texture_set_key(name)
-        if wanted and key not in wanted:
+        if key not in wanted:
             skipped_not_in_request += 1
             continue
-        if wanted and key in wanted:
-            matched.append((name or key, ts))
-        elif not wanted:
-            matched.append((name or key, ts))
-    if wanted and not matched:
+        matched.append((name or key, ts))
+    if not matched:
         summary.gate = "no_matching_texture_set"
         summary.skipped += skipped_not_in_request
         return summary
@@ -2660,19 +2730,25 @@ def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_
             summary.rolled_back += report.rolled_back
             if report.needs_manual_check:
                 summary.needs_manual_check = True
+            for attr in report.missing_attrs:
+                if attr not in summary.missing_attrs:
+                    summary.missing_attrs.append(attr)
             if report.switched_names and callable(log):
                 log("UV フィル切り替え レイヤー: {0}".format(
                     ", ".join(report.switched_names)))
         summary.per_texture_set[name] = counts
         if callable(log):
+            missing = ", ".join(report.missing_attrs) if report.missing_attrs else "-"
             log(
-                "UV フィル切り替え [{0}] 発見 {1} / 切り替え {2} / UV 以外 {3} / 失敗 {4} / ロールバック {5}".format(
+                "UV フィル切り替え [{0}] 発見 {1} / 切り替え {2} / UV 以外 {3} / 失敗 {4} / ロールバック {5} / needs_manual_check={6} / missing_attrs={7}".format(
                     name,
                     counts["found"],
                     counts["switched"],
                     counts["skipped_not_uv"],
                     counts["failed"],
                     counts["rolled_back"],
+                    "true" if report.needs_manual_check else "false",
+                    missing,
                 )
             )
     return summary
@@ -2819,6 +2895,7 @@ class RebaseJob(object):
         self.backup_name = None
         self._reload_status = None
         self._reload_started_at = None
+        self._reload_busy_since = None
         self._reload_called = False
         self._export_started_at = None
         self._next_action_at = None
@@ -2861,7 +2938,7 @@ class RebaseJob(object):
         self.outcome = "failed"
         self.reporter.finished("failed")
 
-    def _done(self, result_export_id, message):
+    def _done(self, result_export_id):
         uv_dict = None
         extra = ""
         if self.uv_fills is not None:
@@ -2870,10 +2947,10 @@ class RebaseJob(object):
                 extra = self.uv_fills.to_message()
             except Exception:
                 uv_dict = None
-        parts = [message]
+        # 案内文がすでに「リベースが完了しました。」で始まる。先頭には重ねない。
+        parts = [REBASE_DONE_GUIDANCE]
         if extra:
             parts.append(extra)
-        parts.append(REBASE_DONE_GUIDANCE)
         text = _rebase_clip_message(" ".join(part for part in parts if part))
         self._write(
             "done",
@@ -3021,10 +3098,20 @@ class RebaseJob(object):
         self._retry_attempt = 0
         self._write("reloading")
 
+    def _reload_busy_wait_exceeded(self, now, timeout_s):
+        if self._reload_busy_since is None:
+            self._reload_busy_since = now
+            return False
+        return (now - self._reload_busy_since) > timeout_s
+
     def _tick_reloading(self, now):
+        timeout_s = self.settings.get("rebase_reload_timeout_s", 600.0)
         if not self._reload_called:
             if self.api.is_busy():
+                if self._reload_busy_wait_exceeded(now, timeout_s):
+                    self._fail("reload_timeout")
                 return
+            self._reload_busy_since = None
             try:
                 supports = self.api.supports_auto_unwrap()
             except Exception:
@@ -3051,9 +3138,9 @@ class RebaseJob(object):
                 return
             self._reload_called = True
             self._reload_started_at = now
+            self._reload_busy_since = None
             self._write("reloading")
             return
-        timeout_s = self.settings.get("rebase_reload_timeout_s", 600.0)
         if self._reload_status is None:
             if self._reload_started_at is not None and (now - self._reload_started_at) > timeout_s:
                 self._fail("reload_timeout")
@@ -3061,7 +3148,10 @@ class RebaseJob(object):
         kind = classify_reload_status(self._reload_status)
         if kind == "success":
             if self.api.is_busy():
+                if self._reload_busy_wait_exceeded(now, timeout_s):
+                    self._fail("reload_timeout")
                 return
+            self._reload_busy_since = None
             self._switch_uv_fills()
             self._retry_attempt = 0
             self._write("exporting")
@@ -3082,20 +3172,15 @@ class RebaseJob(object):
             return
         fill_api = None
         texture_sets = []
-        names = []
         if isinstance(ctx, dict):
             fill_api = ctx.get("api")
             texture_sets = ctx.get("texture_sets") or []
-            names = ctx.get("ts_names") or []
         elif isinstance(ctx, (tuple, list)) and ctx:
             fill_api = ctx[0]
             if len(ctx) > 1:
                 texture_sets = ctx[1] or []
-            if len(ctx) > 2:
-                names = ctx[2] or []
+        # 空の ts_names をプロジェクト全件で埋めない。
         request_names = self.request.get("ts_names")
-        if names and not request_names:
-            request_names = names
         try:
             self.uv_fills = switch_uv_fills_for_project(
                 fill_api,
@@ -3163,7 +3248,7 @@ class RebaseJob(object):
             self.reporter.log(
                 "warning: メッシュ記録に失敗しました。リベースは完了とします: {0}".format(exc)
             )
-        self._done(export_id, "リベースが完了しました。")
+        self._done(export_id)
 
 
 def _is_project_error(exc):
@@ -3315,10 +3400,14 @@ class RebaseCoordinator(object):
             return
         self._load_settings(now)
         if self._job is not None:
-            self._job.tick(now)
-            if self._job.finished:
+            self._decline_preparing_if_cancelled()
+            if self._job is not None:
+                self._job.tick(now)
+            if self._job is not None and self._job.finished:
+                if self._terminal_write_pending():
+                    return
                 self._on_job_finished()
-            else:
+            if self._job is not None:
                 return
         key = self._current_key()
         if _is_unsaved_project_key(key):
@@ -3338,6 +3427,45 @@ class RebaseCoordinator(object):
         if self._dialog_action:
             self._handle_dialog_action(now)
         self._process_active(root, now)
+
+    def _terminal_write_pending(self):
+        """終端の書き込みが失敗したまま、再試行の上限に達していなければ真。"""
+        job = self._job
+        if job is None:
+            return False
+        reporter = getattr(job, "reporter", None)
+        if reporter is None:
+            return False
+        if getattr(reporter, "_pending_terminal", None) is None:
+            return False
+        tries = getattr(reporter, "_terminal_tries", 0)
+        return tries < REBASE_TERMINAL_WRITE_MAX
+
+    def _decline_preparing_if_cancelled(self):
+        """preparing までのジョブは .cancel を見て declined で止める。"""
+        job = self._job
+        if job is None or job.finished:
+            return
+        state = getattr(job, "state", None)
+        if state not in REBASE_CANCELABLE_STATES:
+            return
+        rid = self._job_request_id
+        root = self._root
+        if not isinstance(rid, str) or not root:
+            return
+        cancelled = rid in self._cancelled
+        if not cancelled:
+            try:
+                cancelled = os.path.isfile(rebase_cancel_path(root, rid))
+            except OSError:
+                cancelled = False
+        if not cancelled:
+            return
+        self._cancelled.add(rid)
+        try:
+            job._end_reject("cancelled", state)
+        except Exception as exc:
+            self._log("error", "rebase: preparing 中の取り消しに失敗しました: {0}".format(exc))
 
     def _on_job_finished(self):
         rid = self._job_request_id
@@ -3609,15 +3737,19 @@ class RebaseCoordinator(object):
         exporting = snap.get("exporting")
         if exporting is None:
             exporting = True
-        needs_saving = snap.get("needs_saving")
-        if needs_saving is None:
-            needs_saving = False
         if snap.get("needs_saving_missing") and not self._needs_saving_missing_logged:
             self._needs_saving_missing_logged = True
-            self._log(
-                "warning",
-                "project.needs_saving が無いため未保存判定は偽です。要実機確認。",
-            )
+            if effective_rebase_approval(self._settings) == "auto":
+                self._log(
+                    "warning",
+                    "project.needs_saving が読めないため、auto では未保存として待ちます。要実機確認。",
+                )
+            else:
+                self._log(
+                    "warning",
+                    "project.needs_saving が読めないため、未保存判定は偽です。要実機確認。",
+                )
+        needs_saving = needs_saving_for_rebase(snap, self._settings)
         can_disable = snap.get("can_disable_auto_unwrap")
         if can_disable is None:
             can_disable = False
@@ -3973,8 +4105,7 @@ class LiveSyncEngine(QtCore.QObject):
                 self._rebase.shutdown()
         except Exception as exc:
             _log("warning", "rebase 司令塔の後始末に失敗しました: {0}".format(exc))
-        if self._rebase_api is not None:
-            self._rebase_api.closed = True
+        self._break_rebase_cycles()
         pairs = [
             (event.TextureStateEvent, self.on_texture_state),
             (event.ProjectSaved, self.on_project_saved),
@@ -3999,6 +4130,23 @@ class LiveSyncEngine(QtCore.QObject):
                 timer.stop()
             except Exception:
                 pass
+
+    def _break_rebase_cycles(self):
+        """engine とフック・API の相互参照を切る。司令塔自体は残す。"""
+        api = self._rebase_api
+        coord = self._rebase
+        if api is not None:
+            api.closed = True
+            api.engine = None
+        if coord is not None:
+            hooks = getattr(coord, "hooks", None)
+            if hooks is not None:
+                hooks.engine = None
+            held = getattr(coord, "api", None)
+            if held is not None and held is not api:
+                held_engine = getattr(held, "engine", None)
+                if held_engine is self:
+                    held.engine = None
 
     # -- 設定 -----------------------------------------------------------
 
@@ -4650,13 +4798,10 @@ class LiveSyncEngine(QtCore.QObject):
                 "ロック解除待ちで諦めました。「今すぐ全量同期」ボタンから"
                 "手動で再試行できます。")
 
-    def _resume_safe_export_after_busy(self):
+    def _resume_safe_export_after_busy(self, preview, on_locked, force_full, export_request_id):
+        """busy 解除後の再開。引数は呼び出しごとの partial が持つ。"""
         if self._shutting_down:
             return
-        args = getattr(self, "_busy_export_args", None)
-        if not args:
-            return
-        preview, on_locked, force_full, export_request_id = args
         self._safe_export(
             preview=preview,
             _on_project_locked=on_locked,
@@ -4704,9 +4849,13 @@ class LiveSyncEngine(QtCore.QObject):
             return skipped
         if project.is_busy():
             self._emit_status("Painterがbusyのため、解除後に再試行します。")
-            self._busy_export_args = (
-                preview, _on_project_locked, force_full, export_request_id)
-            project.execute_when_not_busy(self._resume_safe_export_after_busy)
+            project.execute_when_not_busy(functools.partial(
+                self._resume_safe_export_after_busy,
+                preview,
+                _on_project_locked,
+                force_full,
+                export_request_id,
+            ))
             self._last_export_attempt = skipped
             return skipped
         if self.exporting:
@@ -6204,6 +6353,22 @@ class PainterRebaseApi(object):
             superseded = rid in coord._superseded
         if not exists:
             sha1_ok = None
+        settings = None
+        if coord is not None:
+            settings = coord._settings
+        if snap.get("needs_saving_missing") and self.engine is not None:
+            if not getattr(self.engine, "_needs_saving_missing_logged", False):
+                self.engine._needs_saving_missing_logged = True
+                if effective_rebase_approval(settings) == "auto":
+                    _log(
+                        "warning",
+                        "project.needs_saving が読めないため、auto では未保存として待ちます。要実機確認。",
+                    )
+                else:
+                    _log(
+                        "warning",
+                        "project.needs_saving が読めないため、未保存判定は偽です。要実機確認。",
+                    )
         painter_state = build_painter_state(
             now=self.now() if not callable(getattr(self.engine, "_rebase", None)) else (
                 self.engine._rebase.clock() if self.engine._rebase is not None else self.now()
@@ -6214,7 +6379,7 @@ class PainterRebaseApi(object):
             saved_path=snap.get("saved_path"),
             busy=snap.get("busy"),
             exporting=snap.get("exporting"),
-            needs_saving=snap.get("needs_saving"),
+            needs_saving=needs_saving_for_rebase(snap, settings),
             backup_includes_unsaved=BACKUP_INCLUDES_UNSAVED,
             mesh_exists=exists,
             mesh_sha1_ok=sha1_ok,
@@ -6223,9 +6388,6 @@ class PainterRebaseApi(object):
             can_disable_auto_unwrap=snap.get("can_disable_auto_unwrap"),
             last_edit_at=snap.get("last_edit_at"),
         )
-        settings = None
-        if coord is not None:
-            settings = coord._settings
         return decide_approval(request, painter_state, settings)
 
     def project_file_path(self):
@@ -6525,19 +6687,28 @@ def close_plugin():
             ui.delete_ui_element(panel)
         except Exception as e:
             _log("error", "パネルの後始末に失敗しました: {0}".format(e))
+    # S4: 循環を切ったあと、ローカルの panel も外してから回収を確認する。
+    # deleteLater はまだ入れない。
+    ref = None
     if engine is not None:
         try:
             import weakref
             ref = weakref.ref(engine)
         except Exception:
             ref = None
-        engine = None
-        if ref is not None:
-            if ref() is None:
-                _log("info", "LiveSyncEngine は解放されました")
-            else:
-                _log(
-                    "warning",
-                    "LiveSyncEngine が残っています(要実機確認 S4)。deleteLater は入れていません",
-                )
+    engine = None
+    panel = None
+    if ref is not None:
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        if ref() is None:
+            _log("info", "LiveSyncEngine は解放されました")
+        else:
+            _log(
+                "warning",
+                "LiveSyncEngine が残っています(要実機確認 S4)。deleteLater は入れていません",
+            )
     _log("info", "SP -> Maya Live Sync プラグインを停止しました。")

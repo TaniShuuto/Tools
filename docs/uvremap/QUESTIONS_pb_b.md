@@ -51,7 +51,7 @@ Maya の `parse_status` は未知のキーを落とす。`_sync_result.json` に
 
 FBX の中身は調べない。`uv_old` が無い(キー無し・`None`・不正)依頼では切り替えない
 (`uvold_absent`)。`name` は照合に使えない(ログだけ。Painter は UV セット一覧を API で取れない)。
-`ts_names` に一致するテクスチャセットだけを扱う。
+`ts_names` に一致するテクスチャセットだけを扱う。空のときは全件にしない(l)。
 
 ## j. Maya のバージョンゲート
 
@@ -66,7 +66,7 @@ FBX の中身は調べない。`uv_old` が無い(キー無し・`None`・不正
 | S1 | 修正。`_safe_export` 先頭で `_shutting_down` なら何もしない。busy 待ちは名前付きメソッドで、中でも確認する。 |
 | S2 | 修正。Save As 経路の匿名 `singleShot` を名前付き `_preview_migration_timer` に置き換え、`shutdown` / `on_project_closing` で止める。ソースに新しい `QTimer.singleShot` は残していない。 |
 | S3 | 修正。`close_plugin` はグローバルを先に `None` にし、`shutdown` と `delete_ui_element(_panel)` を個別の `try/except` で守る。 |
-| S4 | 一部。S1・S2 を直したうえで、`close_plugin` の終わりで `weakref` により「解放された / 残っている」を 1 行出す。`deleteLater()` は確認前に入れていない。要実機確認。 |
+| S4 | 修正。`shutdown` で API とフックから engine への参照を外す。`close_plugin` はローカルの `panel` を外してから `gc.collect()` し、そのあと weakref を見る。`deleteLater()` はまだ入れない。要実機確認。 |
 | S5 | 修正 + 要実機確認。`_shutting_down` が真なら `final_pending_changed` も設定書き込みも省く。`ProjectAboutToClose` と `close_plugin` の順序は実機で確かめる(7 の 19)。 |
 | S6 | 修正 + 要実機確認。4 つの `disconnect` の成功/失敗をログに出す。失敗時は S7 のガードで止める。 |
 | S7 | 修正。4 つのイベントハンドラ先頭に `if self._shutting_down: return`。`on_texture_state` はガードの後・`enabled` の前に最後の編集時刻を記録する。 |
@@ -87,3 +87,44 @@ FBX の中身は調べない。`uv_old` が無い(キー無し・`None`・不正
 4. `engine.config` は同じ dict のまま。5 秒ごとの `load_config()` は別変数。
 5. `reload_mesh` のコールバックはフラグだけ。続きは `tick`。
 6. 12.1.5 でプロジェクトの自動ラップ解除が「すべて再計算」のとき、`auto_unwrap_settings=None` で新 UV が保たれるかは要実機確認(項目 23)。勝手には決めていない。
+
+## l. 修正依頼 1 で決めたこと
+
+### 終端状態の書き込み
+
+`done` などの終端を書くのに失敗したとき、司令塔は同じ tick ではジョブを捨てない。
+次の tick から `retry_terminal` で書き直す。上限は `REBASE_TERMINAL_WRITE_MAX`(10)。
+上限を超えたらエラーログを残してジョブを手放す。状態ファイルは最後に書けた状態のまま残る。
+そのセッションでは依頼をやり直さない。
+
+### UV フィルの訪問済み
+
+`id(node)` は使わない。`uid()` がハッシュできる値を返すときだけ訪問済みにする。
+`uid()` が無いノードは訪問済み判定をせず、深さの上限だけで循環を止める。
+
+### preparing 中の取り消し
+
+ジョブがある間も、その依頼の `.cancel` を見る。
+状態が `preparing` まで(取り消し可能な状態)なら `declined`(理由 `cancelled`)にして止める。
+バックアップと `reload_mesh` には進まない。`backing_up` 以降は無視する。
+
+### busy 待ちの引数
+
+`_busy_export_args` の 1 スロット共有はやめた。
+呼び出しごとに `functools.partial` で引数を持たせ、再開メソッドの中で shutdown を確認する。
+
+### 空の ts_names
+
+依頼の `ts_names` が空(無し、空リスト、名前が空)のときは、全テクスチャセットには切り替えない。
+`no_matching_texture_set` にする。コンテキスト側のテクスチャセット名では埋めない。
+
+### needs_saving が読めないとき
+
+`"ask"` は従来どおり偽(待たない)。`"auto"` のときだけ真にし、未保存として待つ。
+effective が `ask` に落ちる場合も偽。読めたときの挙動は変えていない。
+
+### そのほかこの修正で入れたもの
+
+- `needs_manual_check` と `missing_attrs` はログに出す。完了メッセージには、どちらかがあれば目視確認の一言を足す。
+- 完了メッセージは「リベースが完了しました。」を重ねない。案内文の末尾と UV フィルの文に句点を付ける。
+- `reload_mesh` の前と、SUCCESS のあと `is_busy()` が真のあいだは `rebase_reload_timeout_s` を上限に待つ。超えたら `reload_timeout`。コールバックそのものの待ちは従来どおり。

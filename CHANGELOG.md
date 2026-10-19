@@ -1218,4 +1218,7 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
     rebase_approval の既定は "ask"。"auto" は 3D ビューのみで描く運用向け。
     画面のレイアウトは変えていない。終了時の安全(1 秒タイマーと
     ProjectAboutToClose の後始末、S1〜S7)。
+    終端状態の書き込み失敗はジョブを保持して再試行する。UV フィルの訪問済みは
+    uid() で判定する。preparing 中の .cancel は declined。空の ts_names は
+    全テクスチャセットに切り替えない。needs_saving が読めないとき auto だけ待つ。
 ```

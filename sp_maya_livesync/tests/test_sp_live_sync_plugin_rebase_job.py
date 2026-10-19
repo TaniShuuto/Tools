@@ -380,6 +380,9 @@ def test_job_happy_path_order(tmp_path):
     raw = plugin.read_json_safe(plugin.rebase_status_path(str(root), RID))
     assert raw.get("uv_fills") is not None
     assert job.uv_fills is not None
+    message = status["message"]
+    assert message.count("リベースが完了しました。") == 1
+    assert message.endswith("。")
 
 
 def test_backup_failures_skip_reload(tmp_path):
@@ -1096,8 +1099,8 @@ def test_shutdown_safety(tmp_path, engine):
     engine._shutting_down = True
     engine._safe_export(preview=True)
     assert engine._last_export_attempt.executed is False
-    engine._busy_export_args = (True, None, False, None)
-    engine._resume_safe_export_after_busy()
+    engine._resume_safe_export_after_busy(True, None, False, None)
+    assert engine._last_export_attempt.executed is False
     engine._shutting_down = False
     tree = ast.parse(inspect.getsource(plugin))
     for node in ast.walk(tree):
@@ -1181,3 +1184,280 @@ def test_no_lambda_connect_or_new_threads():
                     continue
                 for arg in child.args:
                     assert not isinstance(arg, ast.Lambda), ast.dump(arg)
+
+
+def test_terminal_write_failure_keeps_job_for_retry(tmp_path, monkeypatch):
+    coord, api, hooks, clock, _dialogs, jobs = _coord(
+        tmp_path, settings=_settings(rebase_approval="auto"))
+    request = _request(tmp_path, final_full=False)
+    root = _write_req(tmp_path, request)
+    real_write = plugin.write_rebase_status
+    pending = {"fails": 2}
+
+    def flaky(path_root, status):
+        if isinstance(status, dict) and status.get("state") in plugin.REBASE_TERMINAL_STATES:
+            if pending["fails"] > 0:
+                pending["fails"] -= 1
+                return False
+        return real_write(path_root, status)
+
+    monkeypatch.setattr(plugin, "write_rebase_status", flaky)
+    held = False
+    for _ in range(16):
+        coord.tick(clock())
+        if api.reload_callback is not None and not getattr(api, "_fired", False):
+            api.fire_reload(ReloadStatus("SUCCESS"))
+            api._fired = True
+        if (
+            coord._job is not None
+            and getattr(coord._job, "finished", False)
+            and pending["fails"] >= 0
+            and plugin.read_rebase_status(root, RID).get("state") != "done"
+        ):
+            held = True
+        if coord._job is None and jobs and jobs[0].finished and pending["fails"] == 0:
+            break
+    assert held
+    assert coord._job is None
+    status = plugin.read_rebase_status(root, RID)
+    assert status["state"] == "done"
+    assert any("終端状態" in text for _level, text in hooks.logs)
+
+
+def test_terminal_write_giveup_is_logged(tmp_path, monkeypatch):
+    coord, api, hooks, clock, _dialogs, jobs = _coord(
+        tmp_path, settings=_settings(rebase_approval="auto"))
+    request = _request(tmp_path, final_full=False)
+    root = _write_req(tmp_path, request)
+    real_write = plugin.write_rebase_status
+
+    def always_fail(path_root, status):
+        if isinstance(status, dict) and status.get("state") in plugin.REBASE_TERMINAL_STATES:
+            return False
+        return real_write(path_root, status)
+
+    monkeypatch.setattr(plugin, "write_rebase_status", always_fail)
+    for _ in range(40):
+        if coord._job is None and jobs and jobs[0].finished:
+            break
+        coord.tick(clock())
+        if api.reload_callback is not None and not getattr(api, "_fired", False):
+            api.fire_reload(ReloadStatus("SUCCESS"))
+            api._fired = True
+    assert jobs and jobs[0].finished
+    assert coord._job is None
+    status = plugin.read_rebase_status(root, RID)
+    assert status["state"] != "done"
+    assert any("終端状態の書き込みを" in text for _level, text in hooks.logs)
+
+
+def test_cancel_during_preparing_skips_backup_and_reload(tmp_path):
+    coord, api, _hooks, clock, _dialogs, jobs = _coord(
+        tmp_path, settings=_settings(rebase_approval="auto"))
+    request = _request(tmp_path)
+    root = _write_req(tmp_path, request)
+    coord.tick(clock())
+    assert jobs and jobs[0].state == "preparing"
+    rb.write_cancel(root, RID)
+    coord.tick(clock())
+    assert jobs[0].state == "declined"
+    assert jobs[0].outcome == "declined"
+    assert coord._job is None
+    names = [c[0] if isinstance(c, tuple) else c for c in api.calls]
+    assert "save_as_copy" not in names
+    assert "reload_mesh" not in names
+    status = plugin.read_rebase_status(root, RID)
+    assert status["state"] == "declined"
+    assert status["reason"] == "cancelled"
+
+
+def test_cancel_after_backing_up_still_continues(tmp_path):
+    coord, api, _hooks, clock, _dialogs, jobs = _coord(
+        tmp_path, settings=_settings(rebase_approval="auto"))
+    request = _request(tmp_path)
+    root = _write_req(tmp_path, request)
+    coord.tick(clock())
+    coord.tick(clock())
+    assert jobs[0].state == "backing_up"
+    rb.write_cancel(root, RID)
+    coord.tick(clock())
+    names = [c[0] if isinstance(c, tuple) else c for c in api.calls]
+    assert "save_as_copy" in names
+    assert jobs[0].state != "declined"
+    status = plugin.read_rebase_status(root, RID)
+    assert status["state"] != "declined"
+
+
+def test_busy_waits_around_reload_time_out(tmp_path):
+    job, api, _reporter, clock, root = _job(
+        tmp_path, settings=_settings(rebase_reload_timeout_s=30))
+    api.busy = True
+    job.run()
+    job.tick(clock())
+    job.tick(clock())
+    assert job.state == "reloading"
+    job.tick(clock())
+    assert not any(isinstance(c, tuple) and c[0] == "reload_mesh" for c in api.calls)
+    clock.advance(31)
+    job.tick(clock())
+    assert plugin.read_rebase_status(str(root), RID)["reason"] == "reload_timeout"
+    assert job.state == "failed"
+
+    job, api, _reporter, clock, root = _job(
+        tmp_path, settings=_settings(rebase_reload_timeout_s=30))
+    job.run()
+    job.tick(clock())
+    job.tick(clock())
+    job.tick(clock())
+    api.fire_reload(ReloadStatus("SUCCESS"))
+    api.busy = True
+    job.tick(clock())
+    assert job.state == "reloading"
+    clock.advance(31)
+    job.tick(clock())
+    assert job.state == "failed"
+    assert plugin.read_rebase_status(str(root), RID)["reason"] == "reload_timeout"
+
+
+def test_empty_ts_names_is_not_all_texture_sets(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    request["ts_names"] = []
+    job, api, _reporter, clock, _root = _job(tmp_path, request=request)
+    calls = []
+
+    def spy(stack, fill_api, label, source):
+        calls.append(label)
+        return plugin.UvFillStackReport(label)
+
+    monkeypatch.setattr(plugin, "switch_uv_fills_in_stack", spy)
+
+    class _Ts(object):
+        def name(self):
+            return "Body"
+
+        def all_stacks(self):
+            return ["stack"]
+
+    api.uv_ctx = {
+        "api": object(),
+        "texture_sets": [_Ts()],
+        "ts_names": ["Body", "Trim"],
+    }
+    job.run()
+    job.tick(clock())
+    job.tick(clock())
+    job.tick(clock())
+    api.fire_reload(ReloadStatus("SUCCESS"))
+    job.tick(clock())
+    assert calls == []
+    assert job.uv_fills is not None
+    assert job.uv_fills.gate == "no_matching_texture_set"
+
+
+def test_unreadable_needs_saving_ask_false_auto_waits(tmp_path, monkeypatch):
+    api = FakeApi(tmp_path)
+    api.needs_saving = False
+    api.needs_saving_missing = True
+    coord, api, hooks, clock, dialogs, jobs = _coord(
+        tmp_path, api=api, settings=_settings(rebase_approval="auto"))
+    root = _write_req(tmp_path, _request(tmp_path))
+    coord.tick(clock())
+    assert jobs == []
+    assert plugin.read_rebase_status(root, RID)["state"] == "received"
+    assert any("auto" in text for _level, text in hooks.logs)
+
+    monkeypatch.setattr(plugin.project, "is_open", lambda: True)
+    monkeypatch.setattr(plugin.project, "is_busy", lambda: False)
+    monkeypatch.setattr(plugin.project, "name", lambda: "Demo")
+    monkeypatch.setattr(plugin.project, "file_path", lambda: PROJECT_KEY)
+    monkeypatch.setattr(
+        plugin.project, "is_in_edition_state", lambda: True, raising=False)
+
+    def _needs_saving():
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(plugin.project, "needs_saving", _needs_saving, raising=False)
+
+    def _mesh_settings(auto_unwrap_settings=None, **kwargs):
+        return kwargs
+
+    monkeypatch.setattr(
+        plugin.project, "MeshReloadingSettings", _mesh_settings, raising=False)
+
+    class _Pre(object):
+        def get(self, rid):
+            return None
+
+        def put(self, rid, cache):
+            return None
+
+    class _Coord(object):
+        def __init__(self, approval):
+            self._settings = _settings(rebase_approval=approval)
+            self._cancelled = set()
+            self._superseded = set()
+            self._precheck = _Pre()
+
+        def clock(self):
+            return NOW
+
+    class _Eng(object):
+        def __init__(self, approval):
+            self._shutting_down = False
+            self.exporting = False
+            # recheck の時刻は PainterRebaseApi.now() (実時刻)。アイドルはそれを基準にする。
+            self._last_texture_event_at = time.time() - 100
+            self._needs_saving_missing_logged = False
+            self._rebase = _Coord(approval)
+
+    request = _request(tmp_path, created_at=time.time(), ttl_s=1800)
+    auto_api = plugin.PainterRebaseApi(_Eng("auto"))
+    auto_decision = auto_api.recheck(request)
+    assert auto_decision.action == "wait"
+    assert auto_decision.reason == "unsaved_changes"
+    ask_api = plugin.PainterRebaseApi(_Eng("ask"))
+    ask_decision = ask_api.recheck(request)
+    assert ask_decision.action == "ask"
+
+
+def test_busy_export_callbacks_keep_their_args(engine, monkeypatch):
+    queued = []
+    monkeypatch.setattr(plugin.project, "is_open", lambda: True)
+    monkeypatch.setattr(plugin.project, "is_busy", lambda: True)
+    monkeypatch.setattr(plugin.project, "execute_when_not_busy", queued.append)
+    engine._safe_export(preview=True, export_request_id=None)
+    engine._safe_export(
+        preview=False, force_full=True, export_request_id=RID)
+    assert len(queued) == 2
+    assert queued[0] is not queued[1]
+    seen = []
+
+    def fake_do_export(
+        preview=True, dirty_stack_ids=None, force_full=False, export_request_id=None,
+    ):
+        seen.append((preview, force_full, export_request_id))
+
+    monkeypatch.setattr(engine, "_do_export", fake_do_export)
+    monkeypatch.setattr(plugin.project, "is_busy", lambda: False)
+    queued[0]()
+    queued[1]()
+    assert seen == [(True, False, None), (False, True, RID)]
+    engine._shutting_down = True
+    queued[0]()
+    assert seen == [(True, False, None), (False, True, RID)]
+
+
+def test_close_plugin_reports_engine_released(monkeypatch):
+    logs = []
+
+    def capture(level, text):
+        logs.append((level, text))
+
+    monkeypatch.setattr(plugin, "_log", capture)
+    plugin._engine = plugin.LiveSyncEngine()
+    plugin._panel = types.SimpleNamespace(engine=plugin._engine)
+    plugin.close_plugin()
+    assert plugin._engine is None
+    assert plugin._panel is None
+    assert any("解放されました" in text for _level, text in logs)
+    assert not any("残っています" in text for _level, text in logs)
