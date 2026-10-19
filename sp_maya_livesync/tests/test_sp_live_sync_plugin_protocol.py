@@ -150,7 +150,8 @@ def _install_stubs():
     qtcore.QObject = _QObject
     qtcore.Signal = _Signal
     qtcore.QTimer = _QTimer
-    qtcore.Qt = types.SimpleNamespace(TextSelectableByMouse=0, ToolButtonTextOnly=0)
+    qtcore.Qt = types.SimpleNamespace(
+        TextSelectableByMouse=0, ToolButtonTextOnly=0, NonModal="NonModal")
 
     qtwidgets = _install_module("PySide2.QtWidgets", types.ModuleType("PySide2.QtWidgets"))
     for name in (
@@ -292,7 +293,7 @@ def test_mesh_record_hashes_then_reuses_when_size_and_mtime_match(tmp_path):
     assert first["sha1"] == hashlib.sha1(b"hello-mesh").hexdigest()
     assert len(first["sha1"]) == 40
     assert first["size"] == len(b"hello-mesh")
-    assert first["plugin_version"] == "1.3.1"
+    assert first["plugin_version"] == plugin.__version__
     assert first["recorded_at"] == 1000.0
 
     st = mesh.stat()
@@ -452,7 +453,7 @@ def test_do_export_writes_result_before_flag(engine, isolated, monkeypatch):
     assert body["texture_sets"] == ["Body"]
     assert body["flag_written"] is True
     assert body["request_id"] is None
-    assert body["plugin_version"] == "1.3.1"
+    assert body["plugin_version"] == plugin.__version__
     assert len(body["export_id"]) == 32
     assert int(body["export_id"], 16) >= 0
     result_path = next(isolated.rglob("_sync_result.json"))
