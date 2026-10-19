@@ -6521,6 +6521,24 @@ class PainterRebaseApi(object):
         return True
 
 
+def approval_action_from_role(role, accept_role):
+    """ボタンの役割から action を決める。AcceptRole のときだけ "run"。
+
+    None、RejectRole、未知の値、比較の例外は "cancel"。
+    ボタンのラッパー同士の同一性や、ラベルの文字列では比べない。
+    AcceptRole は 0 なので、値の真偽では判定しない。
+    """
+    if role is None:
+        return "cancel"
+    try:
+        matched = role == accept_role
+    except Exception:
+        return "cancel"
+    if matched:
+        return "run"
+    return "cancel"
+
+
 class RebaseApprovalDialogHost(object):
     """非モーダルの確認ダイアログ。シグナルはメソッドへつなぎ、shutdown で切る。"""
 
@@ -6534,7 +6552,12 @@ class RebaseApprovalDialogHost(object):
                 parent = getter()
             except Exception:
                 parent = None
-        self.box = QtWidgets.QMessageBox(parent) if parent is not None else QtWidgets.QMessageBox()
+        # 親ラッパーを保持しないと、PySide が子ボタンを無効にする(12.1.5)。
+        self._parent = parent
+        if parent is not None:
+            self.box = QtWidgets.QMessageBox(parent)
+        else:
+            self.box = QtWidgets.QMessageBox()
         self.box.setWindowTitle(REBASE_DIALOG_TITLE)
         self.box.setText(text)
         self._run_btn = self.box.addButton(
@@ -6544,17 +6567,23 @@ class RebaseApprovalDialogHost(object):
         self.box.setDefaultButton(self._run_btn)
         self.box.setEscapeButton(self._cancel_btn)
         self.box.finished.connect(self._on_finished)
+        # 既定は ApplicationModal。仕様は出したまま操作できる非モーダル。
+        self.box.setWindowModality(QtCore.Qt.NonModal)
         self.box.show()
 
     def _on_finished(self, _result=None):
         if self._closed:
             return
-        clicked = None
+        action = "cancel"
         try:
             clicked = self.box.clickedButton()
+            if clicked is not None:
+                action = approval_action_from_role(
+                    self.box.buttonRole(clicked),
+                    QtWidgets.QMessageBox.AcceptRole,
+                )
         except Exception:
-            clicked = None
-        action = "run" if clicked is self._run_btn else "cancel"
+            action = "cancel"
         if callable(self._on_result):
             self._on_result(action)
 
@@ -6565,11 +6594,13 @@ class RebaseApprovalDialogHost(object):
             pass
 
     def close(self):
+        # finished より先。終了処理の close を declined として扱わない。
         self._closed = True
         try:
             self.box.close()
         except Exception:
             pass
+        self._parent = None
 
     def deleteLater(self):
         fn = getattr(self.box, "deleteLater", None)
@@ -6578,6 +6609,7 @@ class RebaseApprovalDialogHost(object):
                 fn()
             except Exception:
                 pass
+        self._parent = None
 
 
 def make_rebase_approval_dialog(text, on_result):

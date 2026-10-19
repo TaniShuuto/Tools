@@ -1461,3 +1461,242 @@ def test_close_plugin_reports_engine_released(monkeypatch):
     assert plugin._panel is None
     assert any("解放されました" in text for _level, text in logs)
     assert not any("残っています" in text for _level, text in logs)
+
+
+class _BoxSignal(object):
+    def __init__(self):
+        self.slots = []
+        self.ever = []
+
+    def connect(self, fn):
+        self.slots.append(fn)
+        self.ever.append(fn)
+
+    def disconnect(self, fn=None):
+        if fn is None:
+            self.slots = []
+            return
+        self.slots = [slot for slot in self.slots if slot is not fn]
+
+    def emit_ever(self, *args):
+        # 切断のあとでも finished が届く場合を含めて、一度つながったスロットを呼ぶ。
+        for slot in list(self.ever):
+            slot(*args)
+
+
+class _RecordingMessageBox(object):
+    """ボタンのラッパーが作り直されても、役割だけで action を決めるための偽 Qt。"""
+
+    # PySide の AcceptRole は 0。真偽値で落とさないことをテストで固定する。
+    AcceptRole = 0
+    RejectRole = 1
+
+    def __init__(self, parent=None):
+        self.parent_arg = parent
+        self.calls = []
+        self.finished = _BoxSignal()
+        self.foreign_clicked = object()
+        self.role_for_clicked = self.AcceptRole
+        self.click_error = None
+        self.role_error = None
+        self.on_close = None
+        self.escape_button = None
+
+    def setWindowTitle(self, title):
+        self.calls.append(("setWindowTitle", title))
+
+    def setText(self, text):
+        self.calls.append(("setText", text))
+
+    def addButton(self, label, role):
+        button = object()
+        self.calls.append(("addButton", label, role))
+        return button
+
+    def setDefaultButton(self, button):
+        self.calls.append(("setDefaultButton", button))
+
+    def setEscapeButton(self, button):
+        self.escape_button = button
+        self.calls.append(("setEscapeButton", button))
+
+    def setWindowModality(self, modality):
+        self.calls.append(("setWindowModality", modality))
+
+    def setModal(self, modal):
+        self.calls.append(("setModal", modal))
+
+    def show(self):
+        self.calls.append(("show",))
+
+    def clickedButton(self):
+        if self.click_error is not None:
+            raise self.click_error
+        return self.foreign_clicked
+
+    def buttonRole(self, button):
+        if self.role_error is not None:
+            raise self.role_error
+        return self.role_for_clicked
+
+    def close(self):
+        self.calls.append(("close",))
+        if self.on_close is not None:
+            self.on_close()
+        self.finished.emit_ever(0)
+
+    def deleteLater(self):
+        self.calls.append(("deleteLater",))
+
+
+def _patch_approval_qt(monkeypatch):
+    monkeypatch.setattr(plugin.QtWidgets, "QMessageBox", _RecordingMessageBox)
+    parent = object()
+    monkeypatch.setattr(plugin.ui, "get_main_window", lambda: parent, raising=False)
+    return parent
+
+
+def test_approval_action_from_role():
+    accept_role = 0
+    reject_role = 1
+
+    class _Unequal(object):
+        def __eq__(self, other):
+            raise RuntimeError("eq")
+
+    assert plugin.approval_action_from_role(accept_role, accept_role) == "run"
+    assert plugin.approval_action_from_role(reject_role, accept_role) == "cancel"
+    assert plugin.approval_action_from_role(None, accept_role) == "cancel"
+    assert plugin.approval_action_from_role(object(), accept_role) == "cancel"
+    assert plugin.approval_action_from_role(_Unequal(), accept_role) == "cancel"
+
+
+def test_approval_dialog_uses_role_and_is_nonmodal_before_show(monkeypatch):
+    parent = _patch_approval_qt(monkeypatch)
+    actions = []
+    host = plugin.RebaseApprovalDialogHost("確認", actions.append)
+    box = host.box
+    assert host._parent is parent
+    assert box.parent_arg is parent
+    assert box.foreign_clicked is not host._run_btn
+    assert box.foreign_clicked is not host._cancel_btn
+    names = [call[0] for call in box.calls]
+    modality_at = names.index("setWindowModality")
+    show_at = names.index("show")
+    assert modality_at < show_at
+    assert box.calls[modality_at] == ("setWindowModality", plugin.QtCore.Qt.NonModal)
+    assert "setModal" not in names
+    assert box.escape_button is host._cancel_btn
+    host._on_finished()
+    assert actions == ["run"]
+    box.role_for_clicked = _RecordingMessageBox.RejectRole
+    host._on_finished()
+    box.foreign_clicked = None
+    host._on_finished()
+    box.foreign_clicked = object()
+    box.role_for_clicked = "NoRole"
+    host._on_finished()
+    box.click_error = RuntimeError("clicked")
+    host._on_finished()
+    box.click_error = None
+    box.role_error = RuntimeError("role")
+    host._on_finished()
+    assert actions == ["run", "cancel", "cancel", "cancel", "cancel", "cancel"]
+    closed_at = []
+    box.on_close = lambda: closed_at.append(host._closed)
+    before = len(actions)
+    host.close()
+    assert closed_at == [True]
+    assert host._parent is None
+    assert len(actions) == before
+    host2 = plugin.RebaseApprovalDialogHost("確認", actions.append)
+    assert host2._parent is parent
+    host2.deleteLater()
+    assert host2._parent is None
+
+
+def _approval_host_factory(hosts, actions, closed_flags):
+    def factory(text, on_result):
+        def wrapped(action):
+            actions.append(action)
+            on_result(action)
+
+        host = plugin.RebaseApprovalDialogHost(text, wrapped)
+        host.box.on_close = lambda: closed_flags.append(host._closed)
+        hosts.append(host)
+        return host
+
+    return factory
+
+
+def _host_closed_on_close(on_result):
+    host = plugin.RebaseApprovalDialogHost("確認", on_result)
+    flags = []
+    host.box.on_close = lambda: flags.append(host._closed)
+    return host, flags
+
+
+def test_closing_approval_dialog_does_not_decline(tmp_path, monkeypatch, engine):
+    _patch_approval_qt(monkeypatch)
+    request = _request(tmp_path)
+    root = _write_req(tmp_path, request)
+
+    def _open():
+        hosts = []
+        actions = []
+        closed_flags = []
+        coord, _api, _hooks, clock, _dialogs, _jobs = _coord(tmp_path)
+        coord.dialog_factory = _approval_host_factory(hosts, actions, closed_flags)
+        coord.tick(clock())
+        assert plugin.read_rebase_status(root, RID)["state"] == "awaiting_approval"
+        assert len(hosts) == 1
+        return coord, clock, actions, closed_flags
+
+    coord, clock, actions, closed_flags = _open()
+    before = plugin.read_rebase_status(root, RID)
+    coord.shutdown()
+    assert closed_flags == [True]
+    assert actions == []
+    after = plugin.read_rebase_status(root, RID)
+    assert after["state"] == "awaiting_approval"
+    assert after["reason"] == before["reason"]
+    coord.tick(clock())
+    assert plugin.read_rebase_status(root, RID)["state"] == "awaiting_approval"
+
+    coord, clock, actions, closed_flags = _open()
+    coord.on_project_closing()
+    assert closed_flags == [True]
+    assert actions == []
+    assert plugin.read_rebase_status(root, RID)["state"] == "awaiting_approval"
+    coord.tick(clock())
+    again = plugin.read_rebase_status(root, RID)
+    assert again["state"] == "awaiting_approval"
+    assert again.get("reason") != "declined"
+
+    actions = []
+    host, flags = _host_closed_on_close(actions.append)
+    engine._rebase._dialog = host
+    engine._rebase._dialog_rid = RID
+    engine.on_project_closing(None)
+    assert flags == [True]
+    assert actions == []
+
+    actions = []
+    host, flags = _host_closed_on_close(actions.append)
+    engine._rebase._dialog = host
+    engine._rebase._dialog_rid = RID
+    engine.shutdown()
+    assert flags == [True]
+    assert actions == []
+
+    actions = []
+    eng = plugin.LiveSyncEngine()
+    host, flags = _host_closed_on_close(actions.append)
+    eng._rebase._dialog = host
+    eng._rebase._dialog_rid = RID
+    plugin._engine = eng
+    plugin._panel = None
+    plugin.close_plugin()
+    assert flags == [True]
+    assert actions == []
+    assert plugin._engine is None

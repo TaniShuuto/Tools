@@ -150,7 +150,8 @@ def _install_stubs():
     qtcore.QObject = _QObject
     qtcore.Signal = _Signal
     qtcore.QTimer = _QTimer
-    qtcore.Qt = types.SimpleNamespace(TextSelectableByMouse=0, ToolButtonTextOnly=0)
+    qtcore.Qt = types.SimpleNamespace(
+        TextSelectableByMouse=0, ToolButtonTextOnly=0, NonModal="NonModal")
 
     qtwidgets = _install_module("PySide2.QtWidgets", types.ModuleType("PySide2.QtWidgets"))
     for name in (

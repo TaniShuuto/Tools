@@ -1221,4 +1221,6 @@ Phase 3(実機テストのフィードバックを受けた恒久対応 + GUI直
     終端状態の書き込み失敗はジョブを保持して再試行する。UV フィルの訪問済みは
     uid() で判定する。preparing 中の .cancel は declined。空の ts_names は
     全テクスチャセットに切り替えない。needs_saving が読めないとき auto だけ待つ。
+    実機確認で見つかった承認ダイアログの修正: 親ウィンドウを保持し、ボタンは AcceptRole で判定する。
+    確認ダイアログは show の前に NonModal にする。終了時は declined にせず awaiting_approval のまま残す。
 ```
