@@ -9,7 +9,7 @@ Substance 3D Painter 側プラグイン(SP Live Sync, B案:自前パイプライ
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
 #
 # 変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 import os
 import re
@@ -2181,6 +2181,1628 @@ def _duplicate_folder_warning(staging_dir, watch_dir, final_export_dir):
 
 
 # ---------------------------------------------------------------------------
+# 2026.10.19(1.4.0 PB-b): リベースの状態機械と UV フィル(Qt 非依存)
+# ---------------------------------------------------------------------------
+# --- 2026.10.19(1.4.0 PB-b): 拒否の状態、UV フィル、ジョブ、司令塔 ---
+REBASE_EXPORT_DEFERRED_STATUS = (
+    "リベース中のため、書き出しはリベースの終了後に行います"
+)
+REBASE_UV_FILL_PROGRESS = (
+    "UV 投影のフィルを旧 UV セット経由に切り替えています"
+)
+REBASE_AUTO_UNWRAP_UNSUPPORTED_LOG = (
+    "この版は自動展開の設定を渡せません。プロジェクトの自動ラップ解除の設定に従います"
+)
+REBASE_TERMINAL_WRITE_MAX = 10
+_REBASE_CFG_RELOAD_S = 5.0
+_UV_FILL_PARAM_ATTRS = ("filtering_mode", "uv_wrapping_mode", "uv_transformation")
+_UV_FILL_GATE_MESSAGES = {
+    "disabled_by_setting": "UV 投影のフィル切り替えは設定で無効です",
+    "no_api": "UV 投影フィルの API が使えません",
+    "uvold_absent": "依頼に旧 UV セットが無いため、UV 投影のフィルは切り替えていません",
+    "no_matching_texture_set": "依頼のテクスチャセットに一致するものがありません",
+}
+
+
+def rebase_reject_state(reason, prev_state):
+    """decide_approval の reject 理由と今の状態から、書く (state, reason) を決める。
+
+    今の状態が None のときは理由によらず rejected(None からは received / rejected だけ)。
+    """
+    if not isinstance(reason, str) or reason == "":
+        reason = "bad_request"
+    if prev_state is None:
+        return ("rejected", reason)
+    if reason == "cancelled":
+        return ("declined", "cancelled")
+    if reason == "superseded":
+        return ("superseded", "superseded")
+    if reason == "expired":
+        if prev_state in ("received", "awaiting_approval"):
+            return ("expired", "expired")
+        return ("failed", "expired")
+    if prev_state == "received":
+        return ("rejected", reason)
+    if prev_state in ("awaiting_approval", "preparing"):
+        return ("failed", reason)
+    return ("failed", reason)
+
+
+def get_uv_old_index(request):
+    """依頼の uv_old.index。1〜7 の int だけ。無ければ None。例外は出さない。"""
+    if not isinstance(request, dict):
+        return None
+    uv_old = request.get("uv_old")
+    if not isinstance(uv_old, dict):
+        return None
+    index = uv_old.get("index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+    if index < REBASE_UV_OLD_INDEX_MIN or index > REBASE_UV_OLD_INDEX_MAX:
+        return None
+    return index
+
+
+def get_uv_old_name(request):
+    """ログ用。照合には使わない(要実機確認: Painter は UV セット名を API で取れない)。"""
+    if not isinstance(request, dict):
+        return None
+    uv_old = request.get("uv_old")
+    if not isinstance(uv_old, dict):
+        return None
+    name = uv_old.get("name")
+    if isinstance(name, str) and name:
+        return name
+    return None
+
+
+UvFillApi = namedtuple(
+    "UvFillApi",
+    ["get_root_layer_nodes", "ProjectionMode", "UVSetToUVSetProjectionParams"],
+)
+
+
+def make_uv_fill_api(layerstack_module):
+    """必須 3 点が揃わなければ None。未確認の名前は getattr で守る(要実機確認)。"""
+    if layerstack_module is None:
+        return None
+    get_roots = getattr(layerstack_module, "get_root_layer_nodes", None)
+    mode = getattr(layerstack_module, "ProjectionMode", None)
+    params_cls = getattr(layerstack_module, "UVSetToUVSetProjectionParams", None)
+    if not callable(get_roots) or mode is None or params_cls is None:
+        return None
+    if not hasattr(mode, "UV") or not hasattr(mode, "UVSetToUVSet"):
+        return None
+    return UvFillApi(get_roots, mode, params_cls)
+
+
+def node_type_token(node):
+    try:
+        raw = node.get_type()
+    except Exception:
+        return ""
+    name = getattr(raw, "name", None)
+    if isinstance(name, str) and name:
+        token = name
+    else:
+        token = str(raw)
+    if "." in token:
+        token = token.rsplit(".", 1)[-1]
+    return token.lower()
+
+
+def _safe_call(obj, name, *args, **kwargs):
+    fn = getattr(obj, name, None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _iter_named_children(node, names):
+    for name in names:
+        got = _safe_call(node, name)
+        if got is None:
+            continue
+        if isinstance(got, (list, tuple)):
+            return list(got)
+        try:
+            return list(got)
+        except TypeError:
+            continue
+    return None
+
+
+def _node_has_projection_api(node):
+    for name in (
+        "get_projection_mode",
+        "set_projection_mode",
+        "get_projection_parameters",
+        "set_projection_parameters",
+    ):
+        if not callable(getattr(node, name, None)):
+            return False
+    return True
+
+
+def iter_uv_fill_nodes(roots, report, *, max_depth=32, _seen=None, _depth=0):
+    """深さ優先。1 ノードの失敗で全体を止めない。循環と深さは打ち切る。"""
+    if _seen is None:
+        _seen = set()
+    if roots is None:
+        return
+    try:
+        nodes = list(roots)
+    except TypeError:
+        nodes = [roots]
+    for node in nodes:
+        marker = id(node)
+        if marker in _seen:
+            continue
+        _seen.add(marker)
+        if _depth > max_depth:
+            continue
+        try:
+            token = node_type_token(node)
+            if "paint" in token and not _node_has_projection_api(node):
+                report["paint_layers"] = report.get("paint_layers", 0) + 1
+            if _node_has_projection_api(node):
+                yield node
+            children = _iter_named_children(
+                node,
+                ("sub_layers", "get_sub_layers", "children", "get_children", "get_nodes"),
+            )
+            is_group = (
+                "group" in token
+                or children is not None
+                or any(
+                    callable(getattr(node, name, None))
+                    for name in ("sub_layers", "get_sub_layers", "children", "get_children")
+                )
+            )
+            if is_group and children is None:
+                report["groups_unreadable"] = report.get("groups_unreadable", 0) + 1
+            if children:
+                for child in iter_uv_fill_nodes(
+                    children, report, max_depth=max_depth, _seen=_seen, _depth=_depth + 1
+                ):
+                    yield child
+            has_mask = _safe_call(node, "has_mask")
+            if has_mask:
+                effects = _iter_named_children(node, ("mask_effects", "get_mask_effects"))
+                if effects:
+                    for child in iter_uv_fill_nodes(
+                        effects, report, max_depth=max_depth, _seen=_seen, _depth=_depth + 1
+                    ):
+                        yield child
+            content = _iter_named_children(
+                node, ("content_effects", "get_content_effects"))
+            if content:
+                for child in iter_uv_fill_nodes(
+                    content, report, max_depth=max_depth, _seen=_seen, _depth=_depth + 1
+                ):
+                    yield child
+        except Exception:
+            continue
+
+
+def switch_uv_fill_node(node, api, source_uv_set):
+    """戻りは (結果, 記録または理由)。結果は switched / skipped / failed。"""
+    record = {
+        "old_mode": None,
+        "old_params": None,
+        "copied_attrs": [],
+        "missing_attrs": [],
+        "name": None,
+    }
+    try:
+        record["name"] = node.get_name()
+    except Exception:
+        record["name"] = None
+    try:
+        mode = node.get_projection_mode()
+    except Exception as exc:
+        return "failed", {"reason": "get_mode", "error": "{0}".format(exc)}
+    if mode != api.ProjectionMode.UV:
+        return "skipped", "not_uv"
+    record["old_mode"] = mode
+    try:
+        old_params = node.get_projection_parameters()
+    except Exception as exc:
+        return "failed", {"reason": "get_params", "error": "{0}".format(exc)}
+    record["old_params"] = old_params
+    try:
+        new_params = api.UVSetToUVSetProjectionParams()
+    except Exception as exc:
+        return "failed", {"reason": "make_params", "error": "{0}".format(exc)}
+    for attr in _UV_FILL_PARAM_ATTRS:
+        if old_params is not None and hasattr(old_params, attr) and hasattr(new_params, attr):
+            try:
+                setattr(new_params, attr, getattr(old_params, attr))
+                record["copied_attrs"].append(attr)
+            except Exception:
+                record["missing_attrs"].append(attr)
+        else:
+            record["missing_attrs"].append(attr)
+    try:
+        new_params.source_uv_set = source_uv_set
+    except Exception as exc:
+        return "failed", {"reason": "set_source", "error": "{0}".format(exc)}
+    # 要実機確認: set_projection_mode と set_projection_parameters の順序。
+    try:
+        node.set_projection_mode(api.ProjectionMode.UVSetToUVSet)
+        node.set_projection_parameters(new_params)
+    except Exception as exc:
+        rollback_uv_fill_node(node, record, api)
+        return "failed", {"reason": "set", "error": "{0}".format(exc), "record": record}
+    try:
+        new_mode = node.get_projection_mode()
+        if new_mode != api.ProjectionMode.UVSetToUVSet:
+            rollback_uv_fill_node(node, record, api)
+            return "failed", {"reason": "verify_mode", "record": record}
+        read_params = node.get_projection_parameters()
+        source = getattr(read_params, "source_uv_set", None)
+        if source is not None and source != source_uv_set:
+            rollback_uv_fill_node(node, record, api)
+            return "failed", {"reason": "verify_source", "record": record}
+    except Exception as exc:
+        rollback_uv_fill_node(node, record, api)
+        return "failed", {"reason": "verify", "error": "{0}".format(exc), "record": record}
+    return "switched", record
+
+
+def rollback_uv_fill_node(node, record, api):
+    if not isinstance(record, dict):
+        return False
+    ok = True
+    old_mode = record.get("old_mode")
+    old_params = record.get("old_params")
+    try:
+        if old_mode is not None and callable(getattr(node, "set_projection_mode", None)):
+            node.set_projection_mode(old_mode)
+    except Exception:
+        ok = False
+    try:
+        if old_params is not None and callable(getattr(node, "set_projection_parameters", None)):
+            node.set_projection_parameters(old_params)
+    except Exception:
+        ok = False
+    return ok
+
+
+class UvFillStackReport(object):
+    def __init__(self, label=""):
+        self.label = label
+        self.visited = 0
+        self.uv_fills_found = 0
+        self.switched = 0
+        self.skipped_not_uv = 0
+        self.failed = 0
+        self.rolled_back = 0
+        self.paint_layers = 0
+        self.groups_unreadable = 0
+        self.needs_manual_check = False
+        self.switched_names = []
+
+
+def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
+    report = UvFillStackReport(label)
+    walk = {"paint_layers": 0, "groups_unreadable": 0}
+    try:
+        roots = api.get_root_layer_nodes(stack)
+    except Exception:
+        report.needs_manual_check = True
+        return report
+    applied = []
+    failed = False
+    for node in iter_uv_fill_nodes(roots, walk):
+        report.visited += 1
+        report.uv_fills_found += 1
+        result, detail = switch_uv_fill_node(node, api, source_uv_set)
+        if result == "switched":
+            report.switched += 1
+            name = None
+            if isinstance(detail, dict):
+                name = detail.get("name")
+                applied.append((node, detail))
+            else:
+                applied.append((node, {}))
+            if isinstance(name, str) and name:
+                report.switched_names.append(name)
+        elif result == "skipped":
+            report.skipped_not_uv += 1
+        else:
+            report.failed += 1
+            failed = True
+            break
+    report.paint_layers = walk.get("paint_layers", 0)
+    report.groups_unreadable = walk.get("groups_unreadable", 0)
+    if failed:
+        for node, rec in applied:
+            if rollback_uv_fill_node(node, rec, api):
+                report.rolled_back += 1
+            else:
+                report.needs_manual_check = True
+        report.switched = 0
+        report.switched_names = []
+    return report
+
+
+class UvFillSummary(object):
+    def __init__(self):
+        self.enabled = False
+        self.gate = None
+        self.per_texture_set = {}
+        self.switched = 0
+        self.skipped = 0
+        self.failed = 0
+        self.rolled_back = 0
+        self.needs_manual_check = False
+
+    def to_status_dict(self):
+        return {
+            "enabled": bool(self.enabled),
+            "switched": int(self.switched),
+            "skipped": int(self.skipped),
+            "failed": int(self.failed),
+            "rolled_back": int(self.rolled_back),
+        }
+
+    def to_message(self):
+        parts = []
+        if self.switched >= 1:
+            parts.append(
+                "UV 投影のフィル {0} 件を旧 UV セット経由に切り替えました".format(
+                    self.switched)
+            )
+        elif self.gate:
+            parts.append(_UV_FILL_GATE_MESSAGES.get(self.gate, self.gate))
+        if self.failed:
+            parts.append("失敗 {0} 件".format(self.failed))
+        if self.rolled_back:
+            parts.append("ロールバック {0} 件".format(self.rolled_back))
+        text = "。".join(parts)
+        return _rebase_clip_message(text)
+
+
+def _texture_set_name(ts):
+    for name in ("name", "get_name"):
+        fn = getattr(ts, name, None)
+        if callable(fn):
+            try:
+                value = fn()
+            except Exception:
+                continue
+            if isinstance(value, str):
+                return value
+        elif isinstance(fn, str):
+            return fn
+    if isinstance(ts, str):
+        return ts
+    return None
+
+
+def _texture_set_key(name):
+    if not isinstance(name, str):
+        return ""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _iter_texture_set_stacks(ts):
+    # 要実機確認: ts.all_stacks() / ts.get_stack()
+    stacks = _safe_call(ts, "all_stacks")
+    if stacks:
+        try:
+            return list(stacks)
+        except TypeError:
+            pass
+    stack = _safe_call(ts, "get_stack")
+    if stack is not None:
+        return [stack]
+    return []
+
+
+def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_index, log):
+    summary = UvFillSummary()
+    summary.enabled = bool(enabled)
+    if not enabled:
+        summary.gate = "disabled_by_setting"
+        return summary
+    if api is None:
+        summary.gate = "no_api"
+        return summary
+    if uv_old_index is None:
+        summary.gate = "uvold_absent"
+        return summary
+    wanted = set()
+    if isinstance(ts_names, (list, tuple)):
+        for name in ts_names:
+            key = _texture_set_key(name)
+            if key:
+                wanted.add(key)
+    matched = []
+    skipped_not_in_request = 0
+    for ts in texture_sets or []:
+        name = _texture_set_name(ts)
+        key = _texture_set_key(name)
+        if wanted and key not in wanted:
+            skipped_not_in_request += 1
+            continue
+        if wanted and key in wanted:
+            matched.append((name or key, ts))
+        elif not wanted:
+            matched.append((name or key, ts))
+    if wanted and not matched:
+        summary.gate = "no_matching_texture_set"
+        summary.skipped += skipped_not_in_request
+        return summary
+    summary.skipped += skipped_not_in_request
+    for name, ts in matched:
+        counts = {
+            "found": 0,
+            "switched": 0,
+            "skipped_not_uv": 0,
+            "failed": 0,
+            "rolled_back": 0,
+        }
+        for stack in _iter_texture_set_stacks(ts):
+            report = switch_uv_fills_in_stack(stack, api, name, uv_old_index)
+            counts["found"] += report.uv_fills_found
+            counts["switched"] += report.switched
+            counts["skipped_not_uv"] += report.skipped_not_uv
+            counts["failed"] += report.failed
+            counts["rolled_back"] += report.rolled_back
+            summary.switched += report.switched
+            summary.skipped += report.skipped_not_uv
+            summary.failed += report.failed
+            summary.rolled_back += report.rolled_back
+            if report.needs_manual_check:
+                summary.needs_manual_check = True
+            if report.switched_names and callable(log):
+                log("UV フィル切り替え レイヤー: {0}".format(
+                    ", ".join(report.switched_names)))
+        summary.per_texture_set[name] = counts
+        if callable(log):
+            log(
+                "UV フィル切り替え [{0}] 発見 {1} / 切り替え {2} / UV 以外 {3} / 失敗 {4} / ロールバック {5}".format(
+                    name,
+                    counts["found"],
+                    counts["switched"],
+                    counts["skipped_not_uv"],
+                    counts["failed"],
+                    counts["rolled_back"],
+                )
+            )
+    return summary
+
+
+class ExportAttempt(object):
+    def __init__(
+        self,
+        executed=False,
+        ok=False,
+        status=None,
+        export_id=None,
+        message="",
+        locked_error=None,
+        error=None,
+    ):
+        self.executed = bool(executed)
+        self.ok = bool(ok)
+        self.status = status
+        self.export_id = export_id
+        self.message = message if isinstance(message, str) else "{0}".format(message)
+        self.locked_error = locked_error
+        self.error = error
+
+
+class RebaseReporter(object):
+    def __init__(
+        self,
+        root,
+        request_id,
+        clock,
+        log_fn,
+        emit_status_fn,
+        shutting_down_fn,
+        plugin_version,
+    ):
+        self.root = root
+        self.request_id = request_id
+        self.clock = clock
+        self._log_fn = log_fn
+        self._emit_status_fn = emit_status_fn
+        self._shutting_down_fn = shutting_down_fn
+        self.plugin_version = plugin_version
+        self.last_state = None
+        self._pending_terminal = None
+        self._terminal_tries = 0
+        self.outcome = None
+
+    def _shutting_down(self):
+        if not callable(self._shutting_down_fn):
+            return False
+        try:
+            return bool(self._shutting_down_fn())
+        except Exception:
+            return False
+
+    def log(self, text):
+        line = "{0}".format(text)
+        if callable(self._log_fn):
+            try:
+                self._log_fn("info", line)
+            except Exception:
+                pass
+        if self._shutting_down():
+            try:
+                _append_history("SP", line)
+            except Exception:
+                pass
+            return
+        if callable(self._emit_status_fn):
+            try:
+                self._emit_status_fn(line)
+            except Exception:
+                pass
+
+    def state(self, name, **fields):
+        try:
+            status = build_rebase_status(
+                self.request_id,
+                name,
+                self.clock(),
+                self.plugin_version,
+                reason=fields.get("reason"),
+                message=fields.get("message", ""),
+                backup_name=fields.get("backup_name"),
+                result_export_id=fields.get("result_export_id"),
+                uv_fills=fields.get("uv_fills"),
+            )
+        except ValueError as exc:
+            self.log("warning: rebase 状態を組み立てられませんでした: {0}".format(exc))
+            return False
+        ok = write_rebase_status(self.root, status)
+        if name in _REBASE_TERMINAL:
+            if ok:
+                self._pending_terminal = None
+                self.last_state = name
+                return True
+            self._pending_terminal = status
+            self._terminal_tries += 1
+            if self._terminal_tries >= REBASE_TERMINAL_WRITE_MAX:
+                self.log("error: 終端状態の書き込みを {0} 回失敗しました".format(
+                    REBASE_TERMINAL_WRITE_MAX))
+            else:
+                self.log("warning: 終端状態の書き込みに失敗しました。再試行します")
+            return False
+        if not ok:
+            self.log("warning: 状態ファイルの書き込みに失敗しました({0})".format(name))
+            return False
+        self.last_state = name
+        return True
+
+    def retry_terminal(self):
+        if self._pending_terminal is None:
+            return True
+        if self._terminal_tries >= REBASE_TERMINAL_WRITE_MAX:
+            return False
+        ok = write_rebase_status(self.root, self._pending_terminal)
+        self._terminal_tries += 1
+        if ok:
+            self.last_state = self._pending_terminal.get("state")
+            self._pending_terminal = None
+            return True
+        if self._terminal_tries >= REBASE_TERMINAL_WRITE_MAX:
+            self.log("error: 終端状態の書き込みを {0} 回失敗しました".format(
+                REBASE_TERMINAL_WRITE_MAX))
+        return False
+
+    def finished(self, outcome):
+        self.outcome = outcome
+
+
+class RebaseJob(object):
+    def __init__(self, request, reporter, api, settings, *, clock=time.time, approved=True):
+        self.request = request if isinstance(request, dict) else {}
+        self.reporter = reporter
+        self.api = api
+        self.settings = normalize_rebase_settings(settings)
+        self.clock = clock
+        self.approved = bool(approved)
+        self.state = None
+        self.finished = False
+        self.outcome = None
+        self.uv_fills = None
+        self.backup_name = None
+        self._reload_status = None
+        self._reload_started_at = None
+        self._reload_called = False
+        self._export_started_at = None
+        self._next_action_at = None
+        self._retry_attempt = 0
+        self._retry_stage = None
+        self._stage_entered_at = None
+        self._auto_unwrap_logged = False
+        self._cancel_ignored = False
+
+    def _now(self, now=None):
+        if now is not None:
+            return now
+        if callable(self.clock):
+            return self.clock()
+        return time.time()
+
+    def _request_id(self):
+        return self.request.get("request_id")
+
+    def _write(self, name, **fields):
+        if self.backup_name and "backup_name" not in fields:
+            fields["backup_name"] = self.backup_name
+        if self.uv_fills is not None and "uv_fills" not in fields:
+            try:
+                fields["uv_fills"] = self.uv_fills.to_status_dict()
+            except Exception:
+                pass
+        self.reporter.state(name, **fields)
+        self.state = name
+
+    def _fail(self, reason, message=None, detail=None):
+        if self.finished:
+            return
+        text = message
+        if text is None:
+            text = rebase_failure_message(
+                reason, backup_name=self.backup_name, detail=detail)
+        self._write("failed", reason=reason, message=text)
+        self.finished = True
+        self.outcome = "failed"
+        self.reporter.finished("failed")
+
+    def _done(self, result_export_id, message):
+        uv_dict = None
+        extra = ""
+        if self.uv_fills is not None:
+            try:
+                uv_dict = self.uv_fills.to_status_dict()
+                extra = self.uv_fills.to_message()
+            except Exception:
+                uv_dict = None
+        parts = [message]
+        if extra:
+            parts.append(extra)
+        parts.append(REBASE_DONE_GUIDANCE)
+        text = _rebase_clip_message(" ".join(part for part in parts if part))
+        self._write(
+            "done",
+            message=text,
+            result_export_id=result_export_id,
+            uv_fills=uv_dict,
+            backup_name=self.backup_name,
+        )
+        self.reporter.log(REBASE_DONE_GUIDANCE)
+        self.finished = True
+        self.outcome = "done"
+        self.reporter.finished("done")
+
+    def _end_reject(self, reason, prev_state):
+        new_state, new_reason = rebase_reject_state(reason, prev_state)
+        text = rebase_failure_message(new_reason, backup_name=self.backup_name)
+        self._write(new_state, reason=new_reason, message=text)
+        self.finished = True
+        self.outcome = new_state
+        self.reporter.finished(new_state)
+
+    def run(self):
+        self.state = "preparing"
+        self._stage_entered_at = self._now()
+        self._write("preparing")
+
+    def on_reload_status(self, status):
+        if self.finished:
+            return
+        if self.api is not None and getattr(self.api, "closed", False):
+            return
+        if self._reload_status is not None:
+            self.reporter.log("reload_mesh の追加のコールバックを無視します")
+            return
+        self._reload_status = status
+
+    def abort(self, reason, message):
+        if self.finished:
+            return
+        text = message
+        if not text:
+            text = rebase_failure_message(reason, backup_name=self.backup_name)
+        self._write("failed", reason=reason, message=text)
+        self.finished = True
+        self.outcome = "failed"
+        self.reporter.finished("failed")
+
+    def ignore_cancel(self):
+        self._cancel_ignored = True
+
+    def tick(self, now=None):
+        try:
+            self._tick_impl(now)
+        except Exception as exc:
+            try:
+                self.reporter.log("error: RebaseJob.tick: {0}".format(exc))
+            except Exception:
+                pass
+
+    def _tick_impl(self, now):
+        now = self._now(now)
+        if self.finished:
+            self.reporter.retry_terminal()
+            return
+        if self.api is not None and getattr(self.api, "closed", False):
+            return
+        if self._next_action_at is not None and now < self._next_action_at:
+            return
+        if self.state == "preparing":
+            self._tick_preparing(now)
+        elif self.state == "backing_up":
+            self._tick_backing_up(now)
+        elif self.state == "reloading":
+            self._tick_reloading(now)
+        elif self.state == "exporting":
+            self._tick_exporting(now)
+
+    def _tick_preparing(self, now):
+        decision = self.api.recheck(self.request)
+        action = getattr(decision, "action", None)
+        reason = getattr(decision, "reason", None)
+        if action in ("ask", "run"):
+            self._retry_attempt = 0
+            self._write("backing_up")
+            return
+        if action == "wait":
+            return
+        if action == "reject":
+            self._end_reject(reason, "preparing")
+            return
+
+    def _schedule_retry(self, now, stage):
+        self._retry_attempt += 1
+        delay = rebase_retry_delay(
+            self._retry_attempt, self.settings.get("rebase_retry_max"))
+        if delay is None:
+            return False
+        self._retry_stage = stage
+        self._next_action_at = now + delay
+        self.reporter.log(
+            "プロジェクトがロック中のため {0} 秒後に再試行します({1})".format(
+                delay, self._retry_attempt)
+        )
+        return True
+
+    def _tick_backing_up(self, now):
+        spp_before = self.api.project_file_path()
+        try:
+            full, name, backup_dir = rebase_backup_path(
+                spp_before, self._request_id(), self.api.file_exists)
+        except ValueError:
+            self._fail("backup_failed")
+            return
+        self.backup_name = name
+        self._write("backing_up", backup_name=name)
+        try:
+            self.api.make_dirs(backup_dir)
+            self.api.save_as_copy(full)
+        except Exception as exc:
+            if _is_project_error(exc):
+                if not self._schedule_retry(now, "backing_up"):
+                    self._fail("project_locked")
+                return
+            self._fail("backup_failed", detail="{0}".format(exc))
+            return
+        if not self.api.file_exists(full):
+            self._fail("backup_failed")
+            return
+        size_fn = getattr(self.api, "file_size", None)
+        try:
+            if callable(size_fn):
+                size = size_fn(full)
+            else:
+                size = os.path.getsize(full)
+        except Exception:
+            size = None
+        if size is not None and size <= 0:
+            self._fail("backup_failed")
+            return
+        spp_after = self.api.project_file_path()
+        if spp_after != spp_before:
+            self._fail("backup_failed")
+            return
+        self.reporter.log("バックアップ: {0}".format(name))
+        self._retry_attempt = 0
+        self._write("reloading")
+
+    def _tick_reloading(self, now):
+        if not self._reload_called:
+            if self.api.is_busy():
+                return
+            try:
+                supports = self.api.supports_auto_unwrap()
+            except Exception:
+                supports = False
+            if not supports and not self._auto_unwrap_logged:
+                self.reporter.log(REBASE_AUTO_UNWRAP_UNSUPPORTED_LOG)
+                self._auto_unwrap_logged = True
+            try:
+                kwargs = build_reload_settings_kwargs(self.request, supports)
+            except ValueError:
+                self._fail("bad_settings")
+                return
+            try:
+                settings_obj = self.api.make_reload_settings(**kwargs)
+                mesh = self.request.get("mesh") or {}
+                path = mesh.get("path")
+                self.api.reload_mesh(path, settings_obj, self.on_reload_status)
+            except Exception as exc:
+                if _is_project_error(exc):
+                    if not self._schedule_retry(now, "reloading"):
+                        self._fail("project_locked")
+                    return
+                self._fail("reload_error", detail="{0}".format(exc))
+                return
+            self._reload_called = True
+            self._reload_started_at = now
+            self._write("reloading")
+            return
+        timeout_s = self.settings.get("rebase_reload_timeout_s", 600.0)
+        if self._reload_status is None:
+            if self._reload_started_at is not None and (now - self._reload_started_at) > timeout_s:
+                self._fail("reload_timeout")
+            return
+        kind = classify_reload_status(self._reload_status)
+        if kind == "success":
+            if self.api.is_busy():
+                return
+            self._switch_uv_fills()
+            self._retry_attempt = 0
+            self._write("exporting")
+            return
+        if kind == "error":
+            self._fail("reload_error")
+            return
+        self._fail("reload_timeout")
+
+    def _switch_uv_fills(self):
+        self._write("reloading", message=REBASE_UV_FILL_PROGRESS)
+        try:
+            ctx = self.api.uv_fill_context()
+        except Exception as exc:
+            self.reporter.log("UV フィル切り替えをスキップしました: {0}".format(exc))
+            self.uv_fills = UvFillSummary()
+            self.uv_fills.gate = "no_api"
+            return
+        fill_api = None
+        texture_sets = []
+        names = []
+        if isinstance(ctx, dict):
+            fill_api = ctx.get("api")
+            texture_sets = ctx.get("texture_sets") or []
+            names = ctx.get("ts_names") or []
+        elif isinstance(ctx, (tuple, list)) and ctx:
+            fill_api = ctx[0]
+            if len(ctx) > 1:
+                texture_sets = ctx[1] or []
+            if len(ctx) > 2:
+                names = ctx[2] or []
+        request_names = self.request.get("ts_names")
+        if names and not request_names:
+            request_names = names
+        try:
+            self.uv_fills = switch_uv_fills_for_project(
+                fill_api,
+                texture_sets,
+                request_names,
+                enabled=bool(self.settings.get("rebase_reproject_uv_fills")),
+                uv_old_index=get_uv_old_index(self.request),
+                log=self.reporter.log,
+            )
+        except Exception as exc:
+            self.reporter.log("UV フィル切り替えで例外: {0}".format(exc))
+            self.uv_fills = UvFillSummary()
+            self.uv_fills.gate = "no_api"
+
+    def _tick_exporting(self, now):
+        if self._export_started_at is None:
+            self._export_started_at = now
+            self._write("exporting")
+        if not self.request.get("final_full"):
+            self._finish_success(None)
+            return
+        timeout_s = self.settings.get("rebase_reload_timeout_s", 600.0)
+        try:
+            attempt = self.api.run_final_export(self._request_id())
+        except Exception as exc:
+            if _is_project_error(exc):
+                if not self._schedule_retry(now, "exporting"):
+                    self._fail(
+                        "project_locked",
+                        detail="メッシュは読み直し済み。Final の書き出しをやり直してください",
+                    )
+                return
+            self._fail("export_failed", detail="{0}".format(exc))
+            return
+        if attempt is None:
+            attempt = ExportAttempt(executed=False)
+        if not attempt.executed:
+            if (now - self._export_started_at) > timeout_s:
+                self._fail("export_failed")
+            return
+        if attempt.locked_error is not None:
+            if not self._schedule_retry(now, "exporting"):
+                self._fail(
+                    "project_locked",
+                    detail="メッシュは読み直し済み。Final の書き出しをやり直してください",
+                )
+            return
+        if (not attempt.ok) or attempt.error is not None:
+            detail = attempt.message
+            if detail and (
+                "メッシュは読み直し済み" in detail
+                or "やり直してください" in detail
+            ):
+                detail = None
+            self._fail("export_failed", detail=detail)
+            return
+        self._finish_success(attempt.export_id)
+
+    def _finish_success(self, export_id):
+        try:
+            ok = self.api.record_painter_mesh(self.request)
+            if ok is False:
+                self.reporter.log("warning: メッシュ記録に失敗しました。リベースは完了とします")
+        except Exception as exc:
+            self.reporter.log(
+                "warning: メッシュ記録に失敗しました。リベースは完了とします: {0}".format(exc)
+            )
+        self._done(export_id, "リベースが完了しました。")
+
+
+def _is_project_error(exc):
+    try:
+        return isinstance(exc, sp_exception.ProjectError)
+    except Exception:
+        return type(exc).__name__ == "ProjectError"
+
+
+class RebaseCoordinator(object):
+    def __init__(self, api, dialog_factory, job_factory, clock=time.time, hooks=None):
+        self.api = api
+        self.dialog_factory = dialog_factory
+        self.job_factory = job_factory
+        self.clock = clock if callable(clock) else time.time
+        self.hooks = hooks
+        self._precheck = RebasePrecheckCaches()
+        self._job = None
+        self._job_request_id = None
+        self._dialog = None
+        self._dialog_rid = None
+        self._dialog_action = None
+        self._entries = {}
+        self._cancelled = set()
+        self._superseded = set()
+        self._prev_scan = None
+        self._recover_key = None
+        self._cfg = None
+        self._settings = None
+        self._last_cfg_at = None
+        self._shutting_down = False
+        self._root = None
+        self._last_wait_reason = {}
+        self._needs_saving_missing_logged = False
+        self._can_disable_cache = None
+        self._read_counts = {}
+
+    def _now(self, now=None):
+        if now is not None:
+            return now
+        return self.clock()
+
+    def _log(self, level, text):
+        if self.hooks is not None and callable(getattr(self.hooks, "log", None)):
+            try:
+                self.hooks.log(level, text)
+                return
+            except Exception:
+                pass
+        _log(level, text)
+
+    def _emit(self, text):
+        if self._shutting_down:
+            self._log("info", text)
+            try:
+                _append_history("SP", text)
+            except Exception:
+                pass
+            return
+        if self.hooks is not None and callable(getattr(self.hooks, "emit_status", None)):
+            try:
+                self.hooks.emit_status(text)
+                return
+            except Exception:
+                pass
+        _log("info", text)
+
+    def _is_closed(self):
+        if self._shutting_down:
+            return True
+        if self.api is not None and getattr(self.api, "closed", False):
+            return True
+        if self.hooks is not None and callable(getattr(self.hooks, "is_shutting_down", None)):
+            try:
+                return bool(self.hooks.is_shutting_down())
+            except Exception:
+                return False
+        return False
+
+    def _set_blocks(self, value):
+        if self.hooks is not None and callable(getattr(self.hooks, "set_blocks_exports", None)):
+            try:
+                self.hooks.set_blocks_exports(bool(value))
+            except Exception:
+                pass
+
+    def _resume_blocked(self):
+        if self.hooks is not None and callable(getattr(self.hooks, "resume_blocked_exports", None)):
+            try:
+                self.hooks.resume_blocked_exports()
+            except Exception:
+                pass
+
+    def _load_settings(self, now):
+        if self._last_cfg_at is not None and (now - self._last_cfg_at) < _REBASE_CFG_RELOAD_S:
+            return
+        loader = load_config
+        if self.hooks is not None and callable(getattr(self.hooks, "load_config", None)):
+            loader = self.hooks.load_config
+        try:
+            self._cfg = loader()
+        except Exception as exc:
+            self._log("error", "rebase: 設定の再読込に失敗しました: {0}".format(exc))
+            if self._cfg is None:
+                self._cfg = {}
+        self._settings = normalize_rebase_settings(self._cfg)
+        self._last_cfg_at = now
+
+    def _project_open(self):
+        if self.api is not None and callable(getattr(self.api, "project_open", None)):
+            try:
+                return bool(self.api.project_open())
+            except Exception:
+                return False
+        return False
+
+    def _current_key(self):
+        if self.hooks is not None and callable(getattr(self.hooks, "current_project_key", None)):
+            try:
+                return self.hooks.current_project_key()
+            except Exception:
+                return None
+        if self.api is not None and callable(getattr(self.api, "current_project_key", None)):
+            try:
+                return self.api.current_project_key()
+            except Exception:
+                return None
+        return None
+
+    def _subfolder(self):
+        if self.hooks is not None and callable(getattr(self.hooks, "project_subfolder", None)):
+            try:
+                return self.hooks.project_subfolder()
+            except Exception:
+                return None
+        return None
+
+    def tick(self, now=None):
+        try:
+            self._tick_impl(now)
+        except Exception as exc:
+            self._log("error", "RebaseCoordinator.tick: {0}".format(exc))
+
+    def _tick_impl(self, now):
+        now = self._now(now)
+        if self._is_closed():
+            return
+        if not self._project_open():
+            return
+        self._load_settings(now)
+        if self._job is not None:
+            self._job.tick(now)
+            if self._job.finished:
+                self._on_job_finished()
+            else:
+                return
+        key = self._current_key()
+        if _is_unsaved_project_key(key):
+            return
+        subfolder = self._subfolder()
+        root = resolve_uvremap_root(self._cfg, subfolder)
+        self._root = root
+        if not root:
+            return
+        requests_dir = rebase_requests_dir(root)
+        if not os.path.isdir(requests_dir):
+            return
+        self._recover_if_needed(root, key, now)
+        self._scan_and_ingest(root, now)
+        self._apply_cancels(root)
+        self._apply_superseded()
+        if self._dialog_action:
+            self._handle_dialog_action(now)
+        self._process_active(root, now)
+
+    def _on_job_finished(self):
+        rid = self._job_request_id
+        if rid:
+            state = getattr(self._job, "state", None)
+            self._precheck.drop_if_terminal(rid, state)
+            entry = self._entries.get(rid)
+            if entry is not None:
+                entry["state"] = state
+        self._job = None
+        self._job_request_id = None
+        self._set_blocks(False)
+        self._resume_blocked()
+
+    def _recover_if_needed(self, root, key, now):
+        if self._recover_key == key:
+            return
+        self._recover_key = key
+        for rid in _iter_status_ids(root):
+            if self._job is not None and rid == self._job_request_id:
+                continue
+            prev = read_rebase_status(root, rid)
+            if prev is None:
+                continue
+            state = prev.get("state")
+            if state in ("preparing", "backing_up", "reloading", "exporting"):
+                interrupted = build_interrupted_status(prev, now, __version__)
+                if interrupted is not None:
+                    write_rebase_status(root, interrupted)
+                    self._precheck.drop(rid)
+            elif state in _REBASE_TERMINAL:
+                continue
+
+    def _scan_and_ingest(self, root, now):
+        scan = scan_rebase_dir(root)
+        diff = diff_rebase_scan(self._prev_scan, scan)
+        self._prev_scan = scan
+        for rid in diff.new_cancel_ids:
+            entry = self._entries.get(rid)
+            state = entry.get("state") if entry else None
+            if self._job is not None and rid == self._job_request_id:
+                job_state = getattr(self._job, "state", None)
+                if job_state in REBASE_LOCKED_STATES:
+                    continue
+            if state in REBASE_CANCELABLE_STATES or state is None:
+                self._cancelled.add(rid)
+        for rid in diff.changed_ids:
+            existing = read_rebase_status(root, rid)
+            if existing is not None and existing.get("state") in _REBASE_TERMINAL:
+                self._precheck.drop(rid)
+                continue
+            request, reason = read_rebase_request_with_reason(root, rid)
+            self._read_counts[rid] = self._read_counts.get(rid, 0) + 1
+            if request is None:
+                if existing is None:
+                    reject_reason = reason or "bad_request"
+                    self._write_once(
+                        root, rid, "rejected", now, reason=reject_reason,
+                        message=rebase_failure_message(reject_reason),
+                    )
+                continue
+            entry = self._entries.get(rid) or {}
+            entry["request"] = request
+            if existing is None:
+                if entry.get("state") is None:
+                    self._write_once(root, rid, "received", now)
+                    entry["state"] = "received"
+            else:
+                entry["state"] = existing.get("state")
+            self._entries[rid] = entry
+
+    def _apply_cancels(self, root):
+        for rid in list(self._cancelled):
+            entry = self._entries.get(rid)
+            if entry is None:
+                continue
+            state = entry.get("state")
+            if state not in REBASE_CANCELABLE_STATES:
+                continue
+            if self._job is not None and rid == self._job_request_id:
+                if getattr(self._job, "state", None) in REBASE_LOCKED_STATES:
+                    continue
+            self._finish_request(
+                root, rid, "declined", reason="cancelled",
+                message=rebase_failure_message("cancelled"),
+            )
+            if self._dialog_rid == rid:
+                self._close_dialog()
+
+    def _apply_superseded(self):
+        live = []
+        for rid, entry in self._entries.items():
+            state = entry.get("state")
+            if state in _REBASE_TERMINAL:
+                continue
+            request = entry.get("request")
+            if request:
+                live.append(request)
+        if not live:
+            return
+        for rid in find_superseded_ids(live):
+            entry = self._entries.get(rid)
+            if entry is None:
+                continue
+            state = entry.get("state")
+            if self._job is not None and rid == self._job_request_id:
+                if getattr(self._job, "state", None) in REBASE_LOCKED_STATES:
+                    continue
+            if state not in REBASE_CANCELABLE_STATES:
+                continue
+            self._superseded.add(rid)
+            self._finish_request(
+                self._root, rid, "superseded", reason="superseded",
+                message=rebase_failure_message("superseded"),
+            )
+            if self._dialog_rid == rid:
+                self._close_dialog()
+
+    def _handle_dialog_action(self, now):
+        action = self._dialog_action
+        rid = self._dialog_rid
+        self._dialog_action = None
+        if not rid:
+            return
+        entry = self._entries.get(rid)
+        if action == "run":
+            self._close_dialog()
+            if entry and entry.get("request"):
+                self._start_job(entry["request"], approved=True)
+            return
+        self._close_dialog()
+        if entry and entry.get("state") not in _REBASE_TERMINAL:
+            self._finish_request(
+                self._root, rid, "declined", reason="declined",
+                message=rebase_failure_message("declined"),
+            )
+
+    def _process_active(self, root, now):
+        if self._job is not None:
+            return
+        active = self._newest_nonterminal()
+        if active is None:
+            return
+        rid, entry = active
+        request = entry.get("request")
+        if request is None:
+            return
+        mesh = request.get("mesh")
+        exists, sha1_ok, new_cache = mesh_precheck(
+            mesh, cache=self._precheck.get(rid))
+        self._precheck.put(rid, new_cache)
+        painter_state = self._build_state(
+            request, now, exists, sha1_ok, rid)
+        decision = decide_approval(request, painter_state, self._settings)
+        action = decision.action
+        reason = decision.reason
+        current = entry.get("state")
+        if action == "reject":
+            new_state, new_reason = rebase_reject_state(reason, current)
+            self._finish_request(
+                root, rid, new_state, reason=new_reason,
+                message=rebase_failure_message(new_reason),
+            )
+            if self._dialog_rid == rid:
+                self._close_dialog()
+            return
+        if action == "wait":
+            self._note_wait(rid, reason, now, root, current)
+            return
+        self._last_wait_reason.pop(rid, None)
+        entry.pop("first_wait_at", None)
+        if action == "ask":
+            if self._dialog is not None and self._dialog_rid == rid:
+                self._refresh_open_dialog(root, rid, request, painter_state, now)
+                return
+            if current != "awaiting_approval":
+                self._write_once(root, rid, "awaiting_approval", now)
+                entry["state"] = "awaiting_approval"
+            self._open_dialog(request, painter_state)
+            return
+        if action == "run":
+            self._start_job(request, approved=True)
+
+    def _refresh_open_dialog(self, root, rid, request, painter_state, now):
+        if bool(painter_state.get("cancelled")):
+            self._finish_request(
+                root, rid, "declined", reason="cancelled",
+                message=rebase_failure_message("cancelled"),
+            )
+            self._close_dialog()
+            return
+        if bool(painter_state.get("superseded")):
+            self._finish_request(
+                root, rid, "superseded", reason="superseded",
+                message=rebase_failure_message("superseded"),
+            )
+            self._close_dialog()
+            return
+        expires_at = request.get("expires_at")
+        if _rebase_is_finite_number(expires_at) and now > expires_at:
+            self._finish_request(
+                root, rid, "expired", reason="expired",
+                message=rebase_failure_message("expired"),
+            )
+            self._close_dialog()
+            return
+        rounded = self._settings or {}
+        if rounded.get("rebase_enabled") is False:
+            self._finish_request(
+                root, rid, "failed", reason="disabled",
+                message=rebase_failure_message("disabled"),
+            )
+            self._close_dialog()
+
+    def _note_wait(self, rid, reason, now, root, current):
+        entry = self._entries.get(rid) or {}
+        if entry.get("first_wait_at") is None:
+            entry["first_wait_at"] = now
+            self._entries[rid] = entry
+        prev_reason = self._last_wait_reason.get(rid)
+        if prev_reason != reason:
+            self._last_wait_reason[rid] = reason
+            self._emit("rebase 待機: {0}".format(reason))
+        if wait_timed_out(entry.get("first_wait_at"), now, self._settings):
+            if current in ("received", "awaiting_approval"):
+                self._finish_request(
+                    root, rid, "expired", reason="expired",
+                    message=rebase_failure_message("expired"),
+                )
+                if self._dialog_rid == rid:
+                    self._close_dialog()
+
+    def _newest_nonterminal(self):
+        best = None
+        best_created = None
+        for rid, entry in self._entries.items():
+            if entry.get("state") in _REBASE_TERMINAL:
+                continue
+            request = entry.get("request")
+            if not request:
+                continue
+            created = request.get("created_at")
+            if best is None or (
+                _rebase_is_finite_number(created)
+                and (best_created is None or created > best_created)
+            ):
+                best = (rid, entry)
+                best_created = created
+        return best
+
+    def _build_state(self, request, now, mesh_exists, mesh_sha1_ok, rid):
+        snap = {}
+        if self.api is not None and callable(getattr(self.api, "snapshot", None)):
+            try:
+                snap = self.api.snapshot() or {}
+            except Exception:
+                snap = {}
+        is_open = snap.get("is_open")
+        if is_open is None:
+            is_open = False
+        in_edition = snap.get("in_edition")
+        if in_edition is None:
+            in_edition = False
+        project_key = snap.get("project_key")
+        saved_path = snap.get("saved_path")
+        busy = snap.get("busy")
+        if busy is None:
+            busy = True
+        exporting = snap.get("exporting")
+        if exporting is None:
+            exporting = True
+        needs_saving = snap.get("needs_saving")
+        if needs_saving is None:
+            needs_saving = False
+        if snap.get("needs_saving_missing") and not self._needs_saving_missing_logged:
+            self._needs_saving_missing_logged = True
+            self._log(
+                "warning",
+                "project.needs_saving が無いため未保存判定は偽です。要実機確認。",
+            )
+        can_disable = snap.get("can_disable_auto_unwrap")
+        if can_disable is None:
+            can_disable = False
+        last_edit_at = snap.get("last_edit_at")
+        if not mesh_exists:
+            mesh_sha1_ok = None
+        return build_painter_state(
+            now=now,
+            is_open=is_open,
+            in_edition=in_edition,
+            project_key=project_key,
+            saved_path=saved_path,
+            busy=busy,
+            exporting=exporting,
+            needs_saving=needs_saving,
+            backup_includes_unsaved=BACKUP_INCLUDES_UNSAVED,
+            mesh_exists=mesh_exists,
+            mesh_sha1_ok=mesh_sha1_ok,
+            superseded=rid in self._superseded,
+            cancelled=rid in self._cancelled,
+            can_disable_auto_unwrap=can_disable,
+            last_edit_at=last_edit_at,
+        )
+
+    def _write_once(self, root, rid, state, now, reason=None, message=""):
+        entry = self._entries.get(rid) or {}
+        if entry.get("state") == state and entry.get("reason") == reason:
+            return False
+        status = build_rebase_status(
+            rid, state, now, __version__, reason=reason, message=message)
+        ok = write_rebase_status(root, status)
+        if not ok:
+            self._log("warning", "rebase: 状態 {0} の書き込みに失敗しました".format(state))
+        entry["state"] = state
+        entry["reason"] = reason
+        self._entries[rid] = entry
+        if state in _REBASE_TERMINAL:
+            self._precheck.drop(rid)
+        self._emit("rebase {0}: {1}".format(rid, state))
+        return ok
+
+    def _finish_request(self, root, rid, state, reason=None, message=""):
+        now = self._now()
+        self._write_once(root, rid, state, now, reason=reason, message=message)
+        self._precheck.drop_if_terminal(rid, state)
+
+    def _open_dialog(self, request, painter_state):
+        if not callable(self.dialog_factory):
+            return
+        rid = request.get("request_id")
+        backup_dir = REBASE_BACKUP_DIRNAME
+        try:
+            spp = self.api.project_file_path() if self.api is not None else None
+            _full, _name, backup_dir = rebase_backup_path(
+                spp, rid, self.api.file_exists if self.api is not None else os.path.exists)
+        except Exception:
+            backup_dir = REBASE_BACKUP_DIRNAME
+        uv_fill_reproject = bool(
+            (self._settings or {}).get("rebase_reproject_uv_fills")
+        ) and get_uv_old_index(request) is not None
+        text = build_rebase_approval_text(
+            request,
+            backup_dir=backup_dir,
+            needs_saving=bool(painter_state.get("needs_saving")),
+            can_disable_auto_unwrap=bool(
+                painter_state.get("can_disable_auto_unwrap")),
+            backup_includes_unsaved=BACKUP_INCLUDES_UNSAVED,
+            uv_fill_reproject=uv_fill_reproject,
+        )
+        self._dialog_action = None
+        self._dialog_rid = rid
+        self._dialog = self.dialog_factory(text, self._on_dialog_result)
+
+    def _on_dialog_result(self, action):
+        if self._is_closed():
+            return
+        self._dialog_action = action
+
+    def _close_dialog(self):
+        dialog = self._dialog
+        self._dialog = None
+        self._dialog_rid = None
+        if dialog is None:
+            return
+        for name in ("disconnect_all", "disconnect"):
+            fn = getattr(dialog, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        for name in ("close", "deleteLater"):
+            fn = getattr(dialog, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+    def _start_job(self, request, approved=True):
+        if self._job is not None:
+            return
+        if not callable(self.job_factory):
+            return
+        rid = request.get("request_id")
+        reporter = RebaseReporter(
+            root=self._root,
+            request_id=rid,
+            clock=self.clock,
+            log_fn=self._log,
+            emit_status_fn=self._emit,
+            shutting_down_fn=self._is_closed,
+            plugin_version=__version__,
+        )
+        cache = self._precheck.get(rid)
+        job = self.job_factory(
+            request, reporter, self.api, self._settings,
+            clock=self.clock, approved=approved,
+        )
+        if cache is not None and hasattr(job, "_precheck_cache"):
+            job._precheck_cache = cache
+        self._job = job
+        self._job_request_id = rid
+        self._set_blocks(True)
+        entry = self._entries.get(rid) or {}
+        entry["state"] = "preparing"
+        self._entries[rid] = entry
+        self._emit("rebase ジョブ開始: {0}".format(rid))
+        job.run()
+
+    def shutdown(self):
+        self._shutting_down = True
+        self._close_dialog()
+        if self._job is not None and not self._job.finished:
+            try:
+                self._job.abort(
+                    "interrupted",
+                    rebase_failure_message(
+                        "interrupted", backup_name=getattr(self._job, "backup_name", None)),
+                )
+            except Exception:
+                pass
+        self._job = None
+        self._job_request_id = None
+        self.api = None
+        self._precheck.clear()
+        self._entries.clear()
+        self._set_blocks(False)
+
+    def on_project_closing(self):
+        self._close_dialog()
+        if self._job is not None and not self._job.finished:
+            try:
+                self._job.abort(
+                    "interrupted",
+                    rebase_failure_message(
+                        "interrupted", backup_name=getattr(self._job, "backup_name", None)),
+                )
+            except Exception:
+                pass
+            self._on_job_finished()
+        self._precheck.clear()
+        self._prev_scan = None
+        self._entries.clear()
+        self._cancelled.clear()
+        self._superseded.clear()
+        self._recover_key = None
+        self._last_wait_reason.clear()
+
+
+def _iter_status_ids(root):
+    directory = rebase_status_dir(root)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".tmp"):
+            continue
+        rid = name[:-5]
+        if is_valid_rebase_request_id(rid):
+            yield rid
+
+
+# ---------------------------------------------------------------------------
 # 同期ロジック本体
 # ---------------------------------------------------------------------------
 
@@ -2281,10 +3903,37 @@ class LiveSyncEngine(QtCore.QObject):
         self._mesh_record_timer.setSingleShot(True)
         self._mesh_record_timer.timeout.connect(self._on_mesh_record_timer)
 
+        # 2026.10.19(1.4.0 PB-b): Save As 後の Preview 再書き出し。
+        # 匿名 singleShot は shutdown から止められない(S2)。
+        self._preview_migration_timer = QtCore.QTimer(self)
+        self._preview_migration_timer.setSingleShot(True)
+        self._preview_migration_timer.timeout.connect(self._on_preview_migration_timer)
+
         # 2026.07.19-01: shutdown() 後に上記タイマーが万一発火しても
         # 実処理へ進ませないための最終ガード(タイマーのstop()と合わせた
         # 二重の安全策)。
         self._shutting_down = False
+
+        # 2026.10.19(1.4.0 PB-b): リベースの 1 秒タイマーと司令塔。
+        self._rebase_blocks_exports = False
+        self._rebase_block_status_emitted = False
+        self._last_texture_event_at = None
+        self._last_export_attempt = None
+        self._export_last_meta = None
+        self._rebase_tick_guard = False
+        self._needs_saving_missing_logged = False
+        self._rebase_timer = QtCore.QTimer(self)
+        if hasattr(self._rebase_timer, "setObjectName"):
+            self._rebase_timer.setObjectName("rebase_watch")
+        self._rebase_timer.timeout.connect(self._on_rebase_timer)
+        self._rebase_api = PainterRebaseApi(self)
+        self._rebase = RebaseCoordinator(
+            self._rebase_api,
+            make_rebase_approval_dialog,
+            default_rebase_job_factory,
+            clock=time.time,
+            hooks=RebaseEngineHooks(self),
+        )
 
         event.DISPATCHER.connect_strong(event.TextureStateEvent, self.on_texture_state)
         event.DISPATCHER.connect_strong(event.ProjectSaved, self.on_project_saved)
@@ -2311,6 +3960,21 @@ class LiveSyncEngine(QtCore.QObject):
         self._final_export_timer も明示的に停止する。
         """
         self._shutting_down = True
+        try:
+            self._rebase_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._rebase_timer.timeout.disconnect(self._on_rebase_timer)
+        except Exception:
+            pass
+        try:
+            if self._rebase is not None:
+                self._rebase.shutdown()
+        except Exception as exc:
+            _log("warning", "rebase 司令塔の後始末に失敗しました: {0}".format(exc))
+        if self._rebase_api is not None:
+            self._rebase_api.closed = True
         pairs = [
             (event.TextureStateEvent, self.on_texture_state),
             (event.ProjectSaved, self.on_project_saved),
@@ -2320,21 +3984,21 @@ class LiveSyncEngine(QtCore.QObject):
         for evt_cls, cb in pairs:
             try:
                 event.DISPATCHER.disconnect(evt_cls, cb)
+                _log("info", "イベント購読を解除しました({0})".format(
+                    getattr(evt_cls, "__name__", evt_cls)))
             except Exception as e:
                 _log("warning", "イベント購読解除に失敗しました({0}): {1}".format(
                     getattr(evt_cls, "__name__", evt_cls), e))
-        try:
-            self.debounce_timer.stop()
-        except Exception:
-            pass
-        try:
-            self._final_export_timer.stop()
-        except Exception:
-            pass
-        try:
-            self._mesh_record_timer.stop()
-        except Exception:
-            pass
+        for timer in (
+            self.debounce_timer,
+            self._final_export_timer,
+            self._mesh_record_timer,
+            self._preview_migration_timer,
+        ):
+            try:
+                timer.stop()
+            except Exception:
+                pass
 
     # -- 設定 -----------------------------------------------------------
 
@@ -2355,7 +4019,8 @@ class LiveSyncEngine(QtCore.QObject):
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = "[{0}] {1}".format(stamp, text)
         _log("info", text)
-        self.status_changed.emit(line)
+        if not self._shutting_down:
+            self.status_changed.emit(line)
         _append_history("SP", text)
 
     # -- 有効/無効 --------------------------------------------------------
@@ -2370,7 +4035,80 @@ class LiveSyncEngine(QtCore.QObject):
 
     # -- イベントハンドラ --------------------------------------------------
 
+    def start_rebase_watch(self):
+        """1 秒タイマーを開始する。rebase_enabled が偽でも動かす。"""
+        if self._shutting_down:
+            return
+        try:
+            self._rebase_timer.start(1000)
+        except Exception as exc:
+            _log("warning", "rebase タイマーの開始に失敗しました: {0}".format(exc))
+
+    def _on_rebase_timer(self):
+        if self._shutting_down:
+            return
+        if self._rebase_tick_guard:
+            return
+        self._rebase_tick_guard = True
+        try:
+            if self._rebase is not None:
+                self._rebase.tick()
+        finally:
+            self._rebase_tick_guard = False
+
+    def _on_preview_migration_timer(self):
+        if self._shutting_down:
+            return
+        self._safe_export(preview=True, force_full=True)
+
+    def run_rebase_final_export(self, request_id):
+        """リベース用の全量 Final。Live Sync の有効/無効は見ない。"""
+        empty = ExportAttempt(executed=False, ok=False, message="skipped")
+        try:
+            if not project.is_open() or project.is_busy() or self.exporting:
+                self._last_export_attempt = empty
+                return empty
+        except Exception:
+            self._last_export_attempt = empty
+            return empty
+
+        def _capture_locked(_error):
+            return None
+
+        self._safe_export(
+            preview=False,
+            _on_project_locked=_capture_locked,
+            force_full=True,
+            export_request_id=request_id,
+        )
+        return self._last_export_attempt or empty
+
+    def _emit_rebase_block_status(self):
+        if self._rebase_block_status_emitted:
+            return
+        self._rebase_block_status_emitted = True
+        self._emit_status(REBASE_EXPORT_DEFERRED_STATUS)
+
+    def _set_rebase_blocks_exports(self, value):
+        self._rebase_blocks_exports = bool(value)
+        if not value:
+            self._rebase_block_status_emitted = False
+
+    def _resume_blocked_exports(self):
+        if self._shutting_down:
+            return
+        if self.pending_final:
+            self._request_final_export(_FINAL_EXPORT_QUEUED_DELAY_MS)
+        elif self.pending_reexport:
+            try:
+                self.debounce_timer.start(200)
+            except Exception:
+                pass
+
     def on_texture_state(self, evt):
+        if self._shutting_down:
+            return
+        self._last_texture_event_at = time.time()
         if not self.enabled:
             return
         if evt.action not in (
@@ -2387,6 +4125,8 @@ class LiveSyncEngine(QtCore.QObject):
         self.debounce_timer.start(interval_ms)
 
     def on_project_saved(self, evt):
+        if self._shutting_down:
+            return
         # 2026.07.16(緊急修正): on_project_edition_entered() は
         # プロジェクトを開いた/作成した"その瞬間"の _current_project_key()
         # しか記録しない。テンプレートから新規プロジェクトを作成した
@@ -2452,11 +4192,10 @@ class LiveSyncEngine(QtCore.QObject):
             # でした」と状態バーに表示されるため、ユーザーは「今すぐ同期」
             # で手動リトライできる)、shutdown()後に発火しても実処理へ
             # 進まないようガードする。
-            def _fire_preview_migration_export():
-                if self._shutting_down:
-                    return
-                self._safe_export(preview=True, force_full=True)
-            QtCore.QTimer.singleShot(_FINAL_EXPORT_INITIAL_DELAY_MS, _fire_preview_migration_export)
+            try:
+                self._preview_migration_timer.start(_FINAL_EXPORT_INITIAL_DELAY_MS)
+            except Exception as exc:
+                _log("warning", "Save As 後の Preview 予約に失敗しました: {0}".format(exc))
             self._request_final_export(0, bypass_cooldown=True, force_full=True)
             return
 
@@ -2510,6 +4249,18 @@ class LiveSyncEngine(QtCore.QObject):
         return migrated_any
 
     def on_project_closing(self, evt):
+        if self._shutting_down:
+            try:
+                if self._rebase is not None:
+                    self._rebase.on_project_closing()
+            except Exception:
+                pass
+            return
+        try:
+            if self._rebase is not None:
+                self._rebase.on_project_closing()
+        except Exception as exc:
+            _log("warning", "rebase のプロジェクト閉鎖処理に失敗しました: {0}".format(exc))
         self.debounce_timer.stop()
         # Phase 2 最適化: プロジェクトが切り替わるので、猶予カウンタを
         # リセットしておく(次のプロジェクトの検出に前プロジェクトの
@@ -2562,6 +4313,12 @@ class LiveSyncEngine(QtCore.QObject):
             self._mesh_record_timer.stop()
         except Exception:
             pass
+        try:
+            self._preview_migration_timer.stop()
+        except Exception:
+            pass
+        if self._shutting_down:
+            return
         self.final_pending_changed.emit(False)
         # Phase 3: プロジェクトが閉じられたので、Maya側に「今SPで開いている
         # プロジェクトは無い」ことを伝える。
@@ -2569,6 +4326,14 @@ class LiveSyncEngine(QtCore.QObject):
         save_config({"active_project_key": None})
 
     def on_project_edition_entered(self, evt):
+        if self._shutting_down:
+            return
+        try:
+            if self._rebase is not None:
+                self._rebase._recover_key = None
+                self._rebase._precheck.clear()
+        except Exception:
+            pass
         # 新しいプロジェクト(または既存プロジェクト)を開いた直後に
         # 基準となるテクスチャセット構成を記録する。
         # Phase 3: どのプロジェクトを開いたかをMaya側と共有する
@@ -2885,7 +4650,21 @@ class LiveSyncEngine(QtCore.QObject):
                 "ロック解除待ちで諦めました。「今すぐ全量同期」ボタンから"
                 "手動で再試行できます。")
 
-    def _safe_export(self, preview=True, _on_project_locked=None, force_full=False):
+    def _resume_safe_export_after_busy(self):
+        if self._shutting_down:
+            return
+        args = getattr(self, "_busy_export_args", None)
+        if not args:
+            return
+        preview, on_locked, force_full, export_request_id = args
+        self._safe_export(
+            preview=preview,
+            _on_project_locked=on_locked,
+            force_full=force_full,
+            export_request_id=export_request_id,
+        )
+
+    def _safe_export(self, preview=True, _on_project_locked=None, force_full=False, export_request_id=None):
         """
         _on_project_locked: 省略時(None)は従来通りの挙動。
         substance_painter.exception.ProjectError が発生した場合も他の
@@ -2904,20 +4683,39 @@ class LiveSyncEngine(QtCore.QObject):
         書き出す。「今すぐ全量同期」ボタン、および差分書き出しの基準が
         まだ確立していない(このセッションで一度もFinalに成功していない)
         場合の自動フォールバックで使われる。
+        export_request_id: 2026.10.19(1.4.0 PB-b)。リベースの全量 Final で
+        結果ファイルへ依頼 ID を最初から入れる。1.3.0 の呼び出しは None。
         """
+        self._last_export_attempt = None
+        skipped = ExportAttempt(executed=False, ok=False, message="skipped")
+        if self._shutting_down:
+            self._last_export_attempt = skipped
+            return skipped
+        if self._rebase_blocks_exports and export_request_id is None:
+            if preview:
+                self.pending_reexport = True
+            else:
+                self.pending_final = True
+            self._emit_rebase_block_status()
+            self._last_export_attempt = skipped
+            return skipped
         if not project.is_open():
-            return
+            self._last_export_attempt = skipped
+            return skipped
         if project.is_busy():
             self._emit_status("Painterがbusyのため、解除後に再試行します。")
-            project.execute_when_not_busy(
-                lambda: self._safe_export(preview, _on_project_locked, force_full))
-            return
+            self._busy_export_args = (
+                preview, _on_project_locked, force_full, export_request_id)
+            project.execute_when_not_busy(self._resume_safe_export_after_busy)
+            self._last_export_attempt = skipped
+            return skipped
         if self.exporting:
             self.pending_reexport = True
             if not preview:
                 self.pending_final = True
             self.debounce_timer.start(300)
-            return
+            self._last_export_attempt = skipped
+            return skipped
 
         dirty_ids = self.dirty_stack_ids
         self.dirty_stack_ids = set()
@@ -2930,8 +4728,15 @@ class LiveSyncEngine(QtCore.QObject):
         # 書き出しが終わったときに増やす。早期スキップ・キャンセル・
         # 全部スキップでは増やさない。
         self._export_moved_count = 0
+        self._export_last_meta = None
+        other_error = None
         try:
-            self._do_export(preview=preview, dirty_stack_ids=dirty_ids, force_full=force_full)
+            self._do_export(
+                preview=preview,
+                dirty_stack_ids=dirty_ids,
+                force_full=force_full,
+                export_request_id=export_request_id,
+            )
         except sp_exception.ProjectError as e:
             self.stats["error_count"] += 1
             locked_error = e
@@ -2939,6 +4744,7 @@ class LiveSyncEngine(QtCore.QObject):
                 self._emit_status("エラー: プロジェクトがロック中のため書き出せませんでした ({0})".format(e))
         except Exception as e:
             self.stats["error_count"] += 1
+            other_error = e
             self._emit_status("エラー: {0}".format(e))
         finally:
             # 2026.07.19-02: self.exporting=False をここ(finally先頭)では
@@ -2986,8 +4792,19 @@ class LiveSyncEngine(QtCore.QObject):
         # した後)に呼び出し元へ通知する。呼び出し元が渡したコールバック
         # の中身(再試行のスケジューリング等)がここでの後始末と競合
         # しないようにするため。
+        meta = self._export_last_meta or {}
+        self._last_export_attempt = ExportAttempt(
+            executed=True,
+            ok=bool(meta.get("ok")) and locked_error is None and other_error is None,
+            status=meta.get("status"),
+            export_id=meta.get("export_id"),
+            message=meta.get("message") or "",
+            locked_error=locked_error,
+            error=other_error,
+        )
         if locked_error is not None and _on_project_locked is not None:
             _on_project_locked(locked_error)
+        return self._last_export_attempt
 
     def _export_status_of(self, result):
         """ExportStatus を結果ファイル用の名前にする。
@@ -3042,7 +4859,7 @@ class LiveSyncEngine(QtCore.QObject):
             return
         self._emit_status("最終書き出しは完了しませんでした(状態: {0})。".format(label))
 
-    def _do_export(self, preview=True, dirty_stack_ids=None, force_full=False):
+    def _do_export(self, preview=True, dirty_stack_ids=None, force_full=False, export_request_id=None):
         cfg = self.config
 
         # 2026.07.19-03(フェーズ2): Final専用の差分集合をこの時点で
@@ -3256,8 +5073,14 @@ class LiveSyncEngine(QtCore.QObject):
                 write_flag,
                 started_at,
                 finished_at,
-                None,
+                export_request_id,
             )
+            self._export_last_meta = {
+                "ok": bool(result_obj.get("ok")),
+                "status": result_obj.get("status"),
+                "export_id": result_obj.get("export_id"),
+                "message": result_obj.get("message") or "",
+            }
             publish_export_outputs(dest_root, result_obj, write_flag)
             published = True
             ok = bool(result_obj.get("ok"))
@@ -3298,10 +5121,16 @@ class LiveSyncEngine(QtCore.QObject):
                             False,
                             started_at,
                             time.time(),
-                            None,
+                            export_request_id,
                         ),
                         False,
                     )
+                    self._export_last_meta = {
+                        "ok": False,
+                        "status": "exception",
+                        "export_id": export_id,
+                        "message": "{0}".format(exc),
+                    }
                 except Exception as write_exc:
                     _log("error", "書き出し結果ファイルの保存に失敗しました(書き出し自体は続行します): {0}".format(write_exc))
                 self._emit_export_outcome(
@@ -4224,6 +6053,383 @@ class LiveSyncPanel(QtWidgets.QWidget):
 
 
 # ---------------------------------------------------------------------------
+# 2026.10.19(1.4.0 PB-b): Painter API と確認ダイアログ(engine 依存)
+# ---------------------------------------------------------------------------
+try:
+    import substance_painter.layerstack as layerstack
+except Exception:
+    layerstack = None
+
+
+class RebaseEngineHooks(object):
+    def __init__(self, engine):
+        self.engine = engine
+
+    def is_shutting_down(self):
+        return bool(getattr(self.engine, "_shutting_down", False))
+
+    def emit_status(self, text):
+        if self.is_shutting_down():
+            _log("info", text)
+            try:
+                _append_history("SP", text)
+            except Exception:
+                pass
+            return
+        self.engine._emit_status(text)
+
+    def log(self, level, text):
+        _log(level, text)
+
+    def set_blocks_exports(self, value):
+        self.engine._set_rebase_blocks_exports(value)
+
+    def resume_blocked_exports(self):
+        self.engine._resume_blocked_exports()
+
+    def load_config(self):
+        return load_config()
+
+    def current_project_key(self):
+        return _current_project_key()
+
+    def project_subfolder(self):
+        return _project_subfolder_name()
+
+
+class PainterRebaseApi(object):
+    def __init__(self, engine):
+        self.engine = engine
+        self.closed = False
+        self._can_disable = None
+
+    def _alive(self):
+        return not self.closed and self.engine is not None and not getattr(
+            self.engine, "_shutting_down", False)
+
+    def now(self):
+        return time.time()
+
+    def project_open(self):
+        if not self._alive():
+            return False
+        try:
+            return bool(project.is_open())
+        except Exception:
+            return False
+
+    def current_project_key(self):
+        if not self._alive():
+            return None
+        try:
+            return _current_project_key()
+        except Exception:
+            return None
+
+    def snapshot(self):
+        defaults = dict(_PAINTER_STATE_DEFAULTS)
+        out = {
+            "is_open": False,
+            "in_edition": False,
+            "project_key": defaults.get("project_key"),
+            "saved_path": defaults.get("saved_path"),
+            "busy": defaults.get("busy"),
+            "exporting": defaults.get("exporting"),
+            "needs_saving": defaults.get("needs_saving"),
+            "needs_saving_missing": False,
+            "can_disable_auto_unwrap": defaults.get("can_disable_auto_unwrap"),
+            "last_edit_at": None,
+        }
+        if not self._alive():
+            return out
+        try:
+            out["is_open"] = bool(project.is_open())
+        except Exception:
+            out["is_open"] = False
+        try:
+            fn = getattr(project, "is_in_edition_state", None)
+            out["in_edition"] = bool(fn()) if callable(fn) else False
+        except Exception:
+            out["in_edition"] = False
+        try:
+            out["project_key"] = _current_project_key()
+        except Exception:
+            out["project_key"] = None
+        if _is_unsaved_project_key(out["project_key"]):
+            out["saved_path"] = None
+        else:
+            try:
+                out["saved_path"] = project.file_path()
+            except Exception:
+                out["saved_path"] = None
+        try:
+            out["busy"] = bool(project.is_busy())
+        except Exception:
+            out["busy"] = True
+        out["exporting"] = bool(getattr(self.engine, "exporting", True))
+        needs_fn = getattr(project, "needs_saving", None)
+        if not callable(needs_fn):
+            out["needs_saving"] = False
+            out["needs_saving_missing"] = True
+        else:
+            try:
+                out["needs_saving"] = bool(needs_fn())
+            except Exception:
+                out["needs_saving"] = False
+                out["needs_saving_missing"] = True
+        if self._can_disable is None:
+            self._can_disable = supports_auto_unwrap_settings(
+                getattr(project, "MeshReloadingSettings", None))
+        out["can_disable_auto_unwrap"] = bool(self._can_disable)
+        out["last_edit_at"] = getattr(self.engine, "_last_texture_event_at", None)
+        return out
+
+    def recheck(self, request):
+        if not self._alive():
+            return ApprovalDecision("wait", "busy")
+        snap = self.snapshot()
+        mesh = request.get("mesh") if isinstance(request, dict) else None
+        cache = None
+        coord = getattr(self.engine, "_rebase", None)
+        rid = request.get("request_id") if isinstance(request, dict) else None
+        if coord is not None and rid:
+            cache = coord._precheck.get(rid)
+        exists, sha1_ok, new_cache = mesh_precheck(mesh, cache=cache)
+        if coord is not None and rid:
+            coord._precheck.put(rid, new_cache)
+        cancelled = False
+        superseded = False
+        if coord is not None and rid:
+            cancelled = rid in coord._cancelled
+            superseded = rid in coord._superseded
+        if not exists:
+            sha1_ok = None
+        painter_state = build_painter_state(
+            now=self.now() if not callable(getattr(self.engine, "_rebase", None)) else (
+                self.engine._rebase.clock() if self.engine._rebase is not None else self.now()
+            ),
+            is_open=snap.get("is_open"),
+            in_edition=snap.get("in_edition"),
+            project_key=snap.get("project_key"),
+            saved_path=snap.get("saved_path"),
+            busy=snap.get("busy"),
+            exporting=snap.get("exporting"),
+            needs_saving=snap.get("needs_saving"),
+            backup_includes_unsaved=BACKUP_INCLUDES_UNSAVED,
+            mesh_exists=exists,
+            mesh_sha1_ok=sha1_ok,
+            superseded=superseded,
+            cancelled=cancelled,
+            can_disable_auto_unwrap=snap.get("can_disable_auto_unwrap"),
+            last_edit_at=snap.get("last_edit_at"),
+        )
+        settings = None
+        if coord is not None:
+            settings = coord._settings
+        return decide_approval(request, painter_state, settings)
+
+    def project_file_path(self):
+        if not self._alive():
+            return None
+        try:
+            return project.file_path()
+        except Exception:
+            return None
+
+    def is_busy(self):
+        if not self._alive():
+            return True
+        try:
+            return bool(project.is_busy())
+        except Exception:
+            return True
+
+    def file_exists(self, path):
+        try:
+            return os.path.isfile(path)
+        except OSError:
+            return False
+
+    def file_size(self, path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    def make_dirs(self, path):
+        if not self._alive():
+            return
+        os.makedirs(path, exist_ok=True)
+
+    def save_as_copy(self, path):
+        if not self._alive():
+            raise RuntimeError("closed")
+        mode = getattr(project, "ProjectSaveMode", None)
+        full = getattr(mode, "Full", None) if mode is not None else None
+        if full is None:
+            raise RuntimeError("ProjectSaveMode.Full がありません")
+        project.save_as_copy(path, full)
+
+    def supports_auto_unwrap(self):
+        if self._can_disable is None:
+            self._can_disable = supports_auto_unwrap_settings(
+                getattr(project, "MeshReloadingSettings", None))
+        return bool(self._can_disable)
+
+    def make_reload_settings(self, **kwargs):
+        if not self._alive():
+            raise RuntimeError("closed")
+        cls = getattr(project, "MeshReloadingSettings", None)
+        if cls is None:
+            raise RuntimeError("MeshReloadingSettings がありません")
+        return cls(**kwargs)
+
+    def reload_mesh(self, path, settings, callback):
+        if not self._alive():
+            return
+        project.reload_mesh(path, settings, callback)
+
+    def uv_fill_context(self):
+        if not self._alive():
+            return {"api": None, "texture_sets": [], "ts_names": []}
+        fill_api = make_uv_fill_api(layerstack)
+        sets = []
+        names = []
+        try:
+            sets = list(textureset.all_texture_sets())
+        except Exception:
+            sets = []
+        for ts in sets:
+            name = _texture_set_name(ts)
+            if name:
+                names.append(name)
+        return {"api": fill_api, "texture_sets": sets, "ts_names": names}
+
+    def run_final_export(self, request_id):
+        if not self._alive():
+            return ExportAttempt(executed=False, message="closed")
+        return self.engine.run_rebase_final_export(request_id)
+
+    def last_imported_mesh_path(self):
+        if not self._alive():
+            return None
+        getter = getattr(project, "last_imported_mesh_path", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def record_painter_mesh(self, request):
+        if not self._alive():
+            return False
+        key = _current_project_key()
+        if _is_unsaved_project_key(key):
+            return False
+        path = self.last_imported_mesh_path()
+        mesh = request.get("mesh") if isinstance(request, dict) else None
+        if not isinstance(path, str) or path == "":
+            if isinstance(mesh, dict):
+                path = mesh.get("path")
+        if not isinstance(path, str) or path == "":
+            return False
+        prev = None
+        if isinstance(mesh, dict) and mesh.get("path") == path:
+            prev = {
+                "path": path,
+                "size": mesh.get("size"),
+                "mtime_ns": mesh.get("mtime_ns"),
+                "sha1": mesh.get("sha1"),
+            }
+        else:
+            by_project = self.engine.config.get("painter_mesh_by_project")
+            if isinstance(by_project, dict):
+                prev = by_project.get(key)
+        try:
+            record = build_mesh_record(path, prev, time.time())
+        except Exception:
+            return False
+        if record is None:
+            return False
+        written = _update_nested_config_entry("painter_mesh_by_project", key, record)
+        if written is None:
+            return False
+        self.engine.config["painter_mesh_by_project"] = written
+        return True
+
+
+class RebaseApprovalDialogHost(object):
+    """非モーダルの確認ダイアログ。シグナルはメソッドへつなぎ、shutdown で切る。"""
+
+    def __init__(self, text, on_result):
+        self._on_result = on_result
+        self._closed = False
+        parent = None
+        getter = getattr(ui, "get_main_window", None)
+        if callable(getter):
+            try:
+                parent = getter()
+            except Exception:
+                parent = None
+        self.box = QtWidgets.QMessageBox(parent) if parent is not None else QtWidgets.QMessageBox()
+        self.box.setWindowTitle(REBASE_DIALOG_TITLE)
+        self.box.setText(text)
+        self._run_btn = self.box.addButton(
+            REBASE_BUTTON_RUN, QtWidgets.QMessageBox.AcceptRole)
+        self._cancel_btn = self.box.addButton(
+            REBASE_BUTTON_CANCEL, QtWidgets.QMessageBox.RejectRole)
+        self.box.setDefaultButton(self._run_btn)
+        self.box.setEscapeButton(self._cancel_btn)
+        self.box.finished.connect(self._on_finished)
+        self.box.show()
+
+    def _on_finished(self, _result=None):
+        if self._closed:
+            return
+        clicked = None
+        try:
+            clicked = self.box.clickedButton()
+        except Exception:
+            clicked = None
+        action = "run" if clicked is self._run_btn else "cancel"
+        if callable(self._on_result):
+            self._on_result(action)
+
+    def disconnect_all(self):
+        try:
+            self.box.finished.disconnect(self._on_finished)
+        except Exception:
+            pass
+
+    def close(self):
+        self._closed = True
+        try:
+            self.box.close()
+        except Exception:
+            pass
+
+    def deleteLater(self):
+        fn = getattr(self.box, "deleteLater", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+def make_rebase_approval_dialog(text, on_result):
+    return RebaseApprovalDialogHost(text, on_result)
+
+
+def default_rebase_job_factory(request, reporter, api, settings, clock=None, approved=True):
+    return RebaseJob(
+        request, reporter, api, settings,
+        clock=clock or time.time, approved=approved,
+    )
+
+
+# ---------------------------------------------------------------------------
 # プラグインのライフサイクル(Substance Painterが自動的に呼び出す)
 # ---------------------------------------------------------------------------
 
@@ -4259,6 +6465,10 @@ def start_plugin():
         _panel = None
     try:
         _engine = LiveSyncEngine()
+        try:
+            _engine.start_rebase_watch()
+        except Exception as e:
+            _log("warning", "rebase タイマーの開始に失敗しました: {0}".format(e))
         # 2026.07.19-01: クラッシュ等でfinally節が実行されず残った
         # ステージングフォルダの残骸を、起動のたびに自動回収する。
         # 失敗しても起動処理自体は継続させたいため、専用のtry/exceptで
@@ -4298,15 +6508,36 @@ def start_plugin():
 
 def close_plugin():
     global _engine, _panel
-    # エンジンのイベント購読を先に解除してから参照を手放す。
-    # (connect_strong は自動解放されないため、明示的な解除が必須)
-    if _engine is not None:
+    # 2026.10.19(1.4.0 PB-b S3): 先にグローバルを退避して None にし、
+    # 後始末は個別の try/except で守る。delete_ui_element(_panel) は残す
+    # (#38 のパネル接続を片付ける唯一の経路)。
+    engine = _engine
+    panel = _panel
+    _engine = None
+    _panel = None
+    if engine is not None:
         try:
-            _engine.shutdown()
+            engine.shutdown()
         except Exception as e:
             _log("error", "エンジンの後始末に失敗しました: {0}".format(e))
-    if _panel is not None:
-        ui.delete_ui_element(_panel)
-        _panel = None
-    _engine = None
+    if panel is not None:
+        try:
+            ui.delete_ui_element(panel)
+        except Exception as e:
+            _log("error", "パネルの後始末に失敗しました: {0}".format(e))
+    if engine is not None:
+        try:
+            import weakref
+            ref = weakref.ref(engine)
+        except Exception:
+            ref = None
+        engine = None
+        if ref is not None:
+            if ref() is None:
+                _log("info", "LiveSyncEngine は解放されました")
+            else:
+                _log(
+                    "warning",
+                    "LiveSyncEngine が残っています(要実機確認 S4)。deleteLater は入れていません",
+                )
     _log("info", "SP -> Maya Live Sync プラグインを停止しました。")

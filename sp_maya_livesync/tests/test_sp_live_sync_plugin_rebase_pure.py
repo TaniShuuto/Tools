@@ -189,7 +189,7 @@ def test_plugin_source_has_no_uvremap_import():
 
 
 def test_plugin_imports_without_painter_or_qt_objects():
-    assert plugin.__version__ == "1.3.1"
+    assert plugin.__version__ == "1.4.0"
     assert callable(plugin.parse_rebase_request)
     assert callable(plugin.decide_approval)
 
