@@ -393,6 +393,7 @@ def engine(isolated, monkeypatch):
     eng.config["staging_dir"] = str(isolated / "staging")
     eng.config["watch_dir"] = str(isolated / "watch")
     eng.config["final_export_dir"] = str(isolated / "final")
+    eng.config["uvremap_root_dir"] = str(isolated / "uvremap")
     (isolated / "staging").mkdir()
     (isolated / "watch").mkdir()
     (isolated / "final").mkdir()

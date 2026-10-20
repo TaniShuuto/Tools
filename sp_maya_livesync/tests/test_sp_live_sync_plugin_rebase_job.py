@@ -771,7 +771,7 @@ def test_coordinator_auto_and_uv_old_text(tmp_path):
     assert "2D ビュー" in dialogs[0].text
 
 
-def test_coordinator_wait_does_not_rewrite(tmp_path):
+def test_coordinator_wait_rewrites_only_when_reason_changes(tmp_path):
     api = FakeApi(tmp_path)
     api.project_is_open = False
     coord, api, hooks, clock, dialogs, jobs = _coord(tmp_path, api=api)
@@ -790,6 +790,36 @@ def test_coordinator_wait_does_not_rewrite(tmp_path):
     second = plugin.read_rebase_status(root, RID)
     assert first["updated_at"] == second["updated_at"]
     assert first["state"] == "received"
+    assert first["reason"] == "busy"
+    assert first["message"] == plugin.rebase_wait_message("busy")
+
+    api.busy = False
+    api.needs_saving = True
+    clock.advance(1)
+    coord.tick(clock())
+    changed = plugin.read_rebase_status(root, RID)
+    assert changed["updated_at"] > second["updated_at"]
+    assert changed["reason"] == "unsaved_changes"
+    assert changed["message"] == plugin.rebase_wait_message("unsaved_changes")
+
+
+def test_wait_reason_messages_are_actionable_and_unknown_is_empty():
+    assert "保存" in plugin.rebase_wait_message("unsaved_changes")
+    assert "終わるまで" in plugin.rebase_wait_message("busy")
+    assert "開いてください" in plugin.rebase_wait_message("no_project")
+    assert "依頼と違います" in plugin.rebase_wait_message("project_mismatch")
+    assert "落ち着く" in plugin.rebase_wait_message("recent_edit")
+    assert plugin.rebase_wait_message("other") == ""
+    assert plugin.is_valid_rebase_transition("received", "received") is True
+    status = plugin.build_rebase_status(
+        RID,
+        "received",
+        NOW,
+        plugin.__version__,
+        reason="recent_edit",
+        message=plugin.rebase_wait_message("recent_edit"),
+    )
+    assert status["reason"] == "recent_edit"
 
 
 def test_coordinator_supersede_and_job_lock(tmp_path):
@@ -992,7 +1022,11 @@ def test_export_path_writes_request_id_first(engine, isolated, monkeypatch, tmp_
     engine._safe_export(preview=False, force_full=True, export_request_id=RID)
     assert order[0][0] == "result"
     assert order[0][1] == RID
+    assert [kind for kind, _value in order[:3]] == ["result", "result", "flag"]
+    copies = list((isolated / "uvremap").rglob("rebase/results/{0}.json".format(RID)))
+    assert len(copies) == 1
     body = _status_file(isolated)
+    assert json.loads(copies[0].read_text(encoding="utf-8")) == body
     parsed = rb.parse_sync_result(body)
     assert parsed["request_id"] == RID
     judged = rb.judge_completion(
@@ -1054,7 +1088,7 @@ def test_engine_wiring_and_shutdown(engine, monkeypatch):
     engine.enabled = False
     engine.on_texture_state(types.SimpleNamespace(action=plugin.event.TextureStateEventAction.ADD, stack_id=1))
     assert engine._last_texture_event_at is not None
-    assert plugin.__version__ == "1.4.0"
+    assert plugin.__version__ == "1.4.1"
     src = inspect.getsource(plugin.LiveSyncPanel)
     assert "rebase" not in src
     engine.shutdown()
@@ -1137,7 +1171,7 @@ def test_plugin_version_in_results(engine, isolated, monkeypatch):
     _arm_export(monkeypatch, isolated, "Success")
     engine._safe_export(preview=True)
     body = _status_file(isolated)
-    assert body["plugin_version"] == "1.4.0"
+    assert body["plugin_version"] == plugin.__version__
     assert rb.plugin_supports_rebase(rb.parse_sync_result(body)) is True
 
 

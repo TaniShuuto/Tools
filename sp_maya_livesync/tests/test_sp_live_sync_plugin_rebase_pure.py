@@ -189,7 +189,7 @@ def test_plugin_source_has_no_uvremap_import():
 
 
 def test_plugin_imports_without_painter_or_qt_objects():
-    assert plugin.__version__ == "1.4.0"
+    assert plugin.__version__ == "1.4.1"
     assert callable(plugin.parse_rebase_request)
     assert callable(plugin.decide_approval)
 
@@ -1391,7 +1391,7 @@ def test_pb_a_functions_are_keyword_only():
     _assert_keyword_only(
         plugin.build_rebase_approval_text,
         "backup_dir", "needs_saving", "can_disable_auto_unwrap",
-        "backup_includes_unsaved", "uv_fill_reproject",
+        "backup_includes_unsaved", "uv_fill_reproject", "has_direction_fills",
     )
     with pytest.raises(TypeError):
         plugin.build_rebase_status(RID, "failed", 1, PLUGIN_VERSION, "busy")

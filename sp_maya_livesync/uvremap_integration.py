@@ -2040,7 +2040,7 @@ class UVRemapController:
         rid = request.get("request_id")
         if rid in self._rebase_exhausted:
             return
-        decision = self._rebase_judge(final_dir, request, record, status_read)
+        decision = self._rebase_judge(root, final_dir, request, record, status_read)
         reason = getattr(decision, "reason", "")
         if getattr(decision, "action", "") == "complete":
             # この tick で完了処理を進める。起動前から done でも、実行した分は履歴に残す。
@@ -2098,9 +2098,15 @@ class UVRemapController:
         self._rebase_wait_text.pop(rid, None)
         self._rebase_note_once((rid, "exhausted"), MSG_REBASE_RETRY_EXHAUSTED)
 
-    def _rebase_judge(self, final_dir, request, record, status_read):
-        sync = None
-        if final_dir:
+    def _rebase_judge(self, root, final_dir, request, record, status_read):
+        request_id = request.get("request_id") if isinstance(request, dict) else None
+        # 要実機確認: 通常 Final が共有結果を上書きした後も、この控えを優先して
+        # Maya の基準 UV 切り替えが完了すること。
+        try:
+            sync = rb.read_rebase_result(root, request_id)
+        except Exception:
+            sync = None
+        if sync is None and final_dir:
             try:
                 sync = rb.read_sync_result(final_dir)
             except Exception:
@@ -2156,7 +2162,7 @@ class UVRemapController:
                 terminal = False
             else:
                 decision = self._rebase_judge(
-                    final_dir, request, record, status_read,
+                    root, final_dir, request, record, status_read,
                 )
                 reason = getattr(decision, "reason", "")
                 if reason in _REBASE_UNCONFIRMED:
@@ -2222,7 +2228,8 @@ class UVRemapController:
             self._rebase_done_seen_at[rid] = now
             seen = now
         try:
-            decision = self._rebase_judge(final_dir, request, record, status_read)
+            decision = self._rebase_judge(
+                root, final_dir, request, record, status_read)
         except Exception:
             decision = None
         reason = getattr(decision, "reason", "")
