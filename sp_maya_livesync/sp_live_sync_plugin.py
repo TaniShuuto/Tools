@@ -2372,7 +2372,9 @@ def make_uv_fill_api(layerstack_module):
     # 安全側で「方向チャンネル不明」として、チャンネルを持つフィルを数える。
     direction_types = None
     try:
-        channel_type = getattr(layerstack_module, "ChannelType")
+        channel_type = getattr(layerstack_module, "ChannelType", None)
+        if channel_type is None:
+            channel_type = getattr(textureset, "ChannelType")
         normal = getattr(channel_type, "Normal")
         direction_types = [normal]
         anisotropy = getattr(channel_type, "AnisotropyAngle", None)
