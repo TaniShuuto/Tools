@@ -312,3 +312,30 @@ def test_texture_move_cross_volume_skips_retry_and_copies(tmp_path, monkeypatch)
     assert list((tmp_path / "watch").rglob("*.tmp")) == []
     assert slept == []
     assert failed["n"] == 1
+
+
+def test_texture_move_falls_back_to_copy_when_sharing_violation_persists(tmp_path, monkeypatch):
+    # 1 つ目の置き換え(ステージング -> 監視先)が共有違反のまま再試行を使い切ると、
+    # 既存の切り替えでコピー -> 2 つ目の置き換え(一時ファイル -> 監視先)へ進む。
+    # 待ちは 1 つ目の 5 回(合計 1.0 秒)だけで、1 枚あたり 2.0 秒を超えない。
+    eng = _make_engine(tmp_path, monkeypatch)
+    slept = _record_sleep(monkeypatch)
+    real = os.replace
+    direct = {"n": 0}
+
+    def _flaky(src, dst):
+        if os.path.basename(dst) == "Body_BaseColor.png" and not str(src).endswith(".tmp"):
+            direct["n"] += 1
+            raise _with_winerror(32)
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", _flaky)
+    _arm_export(monkeypatch, tmp_path, "Success", payload=b"png-bytes")
+    eng._do_export(preview=True)
+    found = list((tmp_path / "watch").rglob("Body_BaseColor.png"))
+    assert len(found) == 1
+    assert found[0].read_bytes() == b"png-bytes"
+    assert list((tmp_path / "watch").rglob("*.tmp")) == []
+    assert direct["n"] == len(_DELAYS) + 1
+    assert slept == list(_DELAYS)
+    assert sum(slept) <= 2.0
