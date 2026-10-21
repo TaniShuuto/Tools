@@ -634,6 +634,8 @@ class UVRemapController:
         self._rebase_complete_tries = {}
         self._rebase_exhausted = set()
         self._rebase_guidance = set()
+        # 2026.10.21(RB-d2): 完了時の direction_fills。_rebase_guidance と同じくメモリだけ。
+        self._rebase_direction_fills = {}
         self._rebase_wait_text = {}
         # このセッションで、終端になる前に見た依頼。起動時に既に終端の文は履歴へ重ねない。
         self._rebase_live_ids = set()
@@ -1907,14 +1909,33 @@ class UVRemapController:
         self._rebase_emitted_text = self._rebase_view_cache.get("text") or ""
 
     def _rebase_is_settled(self, record, rid):
-        """候補を破棄済み、または完了済み。以降の tick では状態ファイルを読まない。"""
+        """候補を破棄済み、完了済み、または再試行の上限。以降の tick では状態ファイルを読まない。"""
         if isinstance(record, dict) and record.get("completed"):
+            return True
+        if rid in self._rebase_exhausted:
             return True
         return rid in self._rebase_discarded
 
+    def _rebase_guidance_text(self, rid):
+        """完了案内。方向チャンネルの注意があるときは改行で続ける。"""
+        text = rb.MSG_DONE_GUIDANCE
+        n = self._rebase_direction_fills.get(rid, 0)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            return text
+        return text + "\n" + rb.MSG_DONE_DIRECTION_FMT.format(n=n)
+
+    def _rebase_direction_count(self, status_read):
+        status = getattr(status_read, "status", None)
+        if not isinstance(status, dict):
+            return 0
+        value = status.get("direction_fills", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return 0
+        return value
+
     def _rebase_completed_view(self, rid):
         if rid in self._rebase_guidance:
-            text = rb.MSG_DONE_GUIDANCE
+            text = self._rebase_guidance_text(rid)
         else:
             text = rb.MSG_DONE
         return {
@@ -1929,6 +1950,14 @@ class UVRemapController:
         rid = request.get("request_id")
         if isinstance(record, dict) and record.get("completed"):
             return self._rebase_completed_view(rid)
+        if rid in self._rebase_exhausted:
+            return {
+                "text": MSG_REBASE_RETRY_EXHAUSTED,
+                "phase": "failed",
+                "can_cancel": False,
+                "terminal": False,
+                "request_id": rid,
+            }
         frozen = self._rebase_frozen_view.get(rid)
         if rid in self._rebase_discarded and isinstance(frozen, dict):
             return dict(frozen)
@@ -2045,13 +2074,13 @@ class UVRemapController:
         if getattr(decision, "action", "") == "complete":
             # この tick で完了処理を進める。起動前から done でも、実行した分は履歴に残す。
             self._rebase_live_ids.add(rid)
-            self._rebase_run_complete(project_key, rid)
+            self._rebase_run_complete(project_key, rid, status_read)
             return
         if reason in _REBASE_UNCONFIRMED:
             self._rebase_note_once((rid, "unconfirmed"), rb.MSG_RESULT_UNCONFIRMED)
             self._rebase_live_ids.add(rid)
 
-    def _rebase_run_complete(self, project_key, rid):
+    def _rebase_run_complete(self, project_key, rid, status_read=None):
         tries = int(self._rebase_complete_tries.get(rid, 0))
         if tries >= REBASE_COMPLETE_RETRY_MAX:
             self._rebase_mark_exhausted(rid)
@@ -2071,6 +2100,12 @@ class UVRemapController:
             self._rebase_guidance.add(rid)
             self._rebase_wait_text.pop(rid, None)
             self._rebase_note_once((rid, "guidance"), rb.MSG_DONE_GUIDANCE)
+            n = self._rebase_direction_count(status_read)
+            if n >= 1:
+                self._rebase_direction_fills[rid] = n
+                self._rebase_note_once(
+                    (rid, "direction"), rb.MSG_DONE_DIRECTION_FMT.format(n=n),
+                )
             return
         if status == "already_completed" or (
             status == "skipped" and reason == "no_local_record"
@@ -2148,7 +2183,7 @@ class UVRemapController:
         state = self._rebase_state(status_read)
         if record.get("completed"):
             if rid in self._rebase_guidance:
-                text = rb.MSG_DONE_GUIDANCE
+                text = self._rebase_guidance_text(rid)
             else:
                 text = rb.MSG_DONE
             phase = "done"
@@ -2176,7 +2211,7 @@ class UVRemapController:
                     can_cancel = False
                     terminal = False
                 elif rid in self._rebase_guidance:
-                    text = rb.MSG_DONE_GUIDANCE
+                    text = self._rebase_guidance_text(rid)
                     phase = "done"
                     can_cancel = False
                     terminal = True

@@ -100,7 +100,7 @@ class FakeRuntime:
         return []
 
 
-def _sync_body(version="1.3.0", **over):
+def _sync_body(version="1.4.0", **over):
     body = {
         "schema": 1,
         "plugin_version": version,
@@ -309,10 +309,22 @@ def test_send_precheck_creates_nothing(tmp_path, setup, message):
     assert rb.list_requests(ctrl._work) == []
 
 
-def test_plugin_130_is_accepted(tmp_path):
-    ctrl = _make(tmp_path, sync_body=_sync_body("1.3.0"))
+@pytest.mark.parametrize("version", ["1.3.0", "1.3.9"])
+def test_rebase_send_refuses_plugin_before_140(tmp_path, version):
+    ctrl = _make(tmp_path, sync_body=_sync_body(version))
+    result = ctrl.rebase_send()
+    assert result["ok"] is False
+    assert result["message"] == rb.MSG_PLUGIN_UPDATE_REQUIRED
+    assert ctrl._order == []
+    assert rb.list_requests(ctrl._work) == []
+
+
+@pytest.mark.parametrize("version", ["1.4.0", "1.4.3"])
+def test_rebase_send_accepts_plugin_140_or_newer(tmp_path, version):
+    ctrl = _make(tmp_path, sync_body=_sync_body(version))
     result = ctrl.rebase_send()
     assert result["ok"] is True
+    assert rb.list_requests(ctrl._work)
 
 
 def test_replace_confirms_once_and_locked_does_not(tmp_path, monkeypatch):
@@ -545,6 +557,38 @@ def test_done_completes_once_and_guides_once(tmp_path):
     assert sum(1 for _s, text in ctrl._history if text == rb.MSG_DONE_GUIDANCE) == 1
     assert second["message"] == ""
     assert ctrl.rebase_view()["text"] == rb.MSG_DONE_GUIDANCE
+
+
+def test_done_with_direction_fills_notes_history_and_screen_once(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    _put_status(
+        ctrl, sent["request_id"], "done",
+        uv_fills={"direction": 2, "enabled": True},
+    )
+    _put_result(ctrl, sent["request_id"])
+    note = rb.MSG_DONE_DIRECTION_FMT.format(n=2)
+    shown = ctrl.rebase_tick(100.0)
+    assert shown["message"] == rb.MSG_DONE_GUIDANCE + "\n" + note
+    assert ctrl.rebase_view()["text"] == shown["message"]
+    texts = [text for _source, text in ctrl._history]
+    assert texts.count(rb.MSG_DONE_GUIDANCE) == 1
+    assert texts.count(note) == 1
+    assert texts.index(rb.MSG_DONE_GUIDANCE) < texts.index(note)
+    again = ctrl.rebase_tick(102.0)
+    assert again["message"] == ""
+    assert [text for _source, text in ctrl._history].count(note) == 1
+
+
+def test_done_with_zero_direction_fills_skips_the_note(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    _put_status(ctrl, sent["request_id"], "done", uv_fills={"direction": 0})
+    _put_result(ctrl, sent["request_id"])
+    shown = ctrl.rebase_tick(100.0)
+    assert shown["message"] == rb.MSG_DONE_GUIDANCE
+    assert ctrl.rebase_view()["text"] == rb.MSG_DONE_GUIDANCE
+    assert not any("法線" in text for _source, text in ctrl._history)
 
 
 def test_done_prefers_rebase_result_when_shared_result_was_overwritten(tmp_path):
@@ -1054,11 +1098,12 @@ def test_follow_block_releases_except_open_and_recent_done(tmp_path):
     for step in range(5):
         ctrl.rebase_tick(300.0 + step)
     assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    # RB-d2: 上限到達は settled。追従の 60 秒止めは外れる。表示は上限の文言のまま。
     ctrl.follow_tick(1)
-    assert calls == []
+    assert calls == [1]
     ctrl.rebase_tick(361.0)
     ctrl.follow_tick(2)
-    assert calls == [2]
+    assert calls == [1, 2]
     assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
     assert "discard" not in _kinds(ctrl)
 
@@ -1144,3 +1189,32 @@ def test_settled_requests_skip_later_status_reads(tmp_path, monkeypatch):
     ctrl.rebase_view()
     assert calls["n"] == 0
     assert ctrl.rebase_view()["text"] == rb.MSG_DONE_GUIDANCE
+
+
+def test_exhausted_done_skips_later_status_reads(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    real = rb.read_status
+
+    def wrapped(root, request_id):
+        calls["n"] += 1
+        return real(root, request_id)
+
+    monkeypatch.setattr(rb, "read_status", wrapped)
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    _arm_done(ctrl, sent["request_id"])
+    ctrl._runtime.complete_results = [
+        {"status": "partial", "reason": "", "failed_step": "active"}
+        for _ in range(6)
+    ]
+    for step in range(5):
+        ctrl.rebase_tick(300.0 + step)
+    assert sent["request_id"] in ctrl._rebase_exhausted
+    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    calls["n"] = 0
+    again = ctrl.rebase_tick(310.0)
+    assert calls["n"] == 0
+    assert again["message"] == ""
+    assert ctrl.rebase_view()["text"] == integ.MSG_REBASE_RETRY_EXHAUSTED
+    ctrl.rebase_view()
+    assert calls["n"] == 0

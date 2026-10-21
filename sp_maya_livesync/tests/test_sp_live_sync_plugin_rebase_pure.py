@@ -610,6 +610,15 @@ def test_write_status_readable_by_maya(tmp_path):
     assert got.status["state"] == "received"
 
 
+def _without_direction_fills(parsed):
+    """Maya の parse_status は RB-d2 で direction_fills を足す。プラグイン側は足さない。"""
+    if not isinstance(parsed, dict) or "direction_fills" not in parsed:
+        return parsed
+    copied = dict(parsed)
+    del copied["direction_fills"]
+    return copied
+
+
 @pytest.mark.parametrize("raw", [
     None,
     [],
@@ -631,7 +640,7 @@ def test_write_status_readable_by_maya(tmp_path):
     },
 ])
 def test_parse_status_matches_maya(raw):
-    assert plugin.parse_rebase_status(raw) == rb.parse_status(raw)
+    assert plugin.parse_rebase_status(raw) == _without_direction_fills(rb.parse_status(raw))
 
 
 def test_parse_status_drops_uv_fills_and_maya_still_reads():
@@ -647,9 +656,10 @@ def test_parse_status_drops_uv_fills_and_maya_still_reads():
     assert "extra" not in status["uv_fills"]
     ours = plugin.parse_rebase_status(status)
     theirs = rb.parse_status(status)
-    assert ours == theirs
+    assert ours == _without_direction_fills(theirs)
     assert "uv_fills" not in ours
     assert theirs is not None
+    assert theirs["direction_fills"] == 0
 
 
 def test_build_status_value_error():
