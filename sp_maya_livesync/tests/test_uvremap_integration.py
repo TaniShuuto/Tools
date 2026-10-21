@@ -22,6 +22,7 @@ for _p in (str(_PKG), str(_TESTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from fresh_import_probe import new_forbidden_modules  # noqa: E402
 import uvremap_follow as follow  # noqa: E402
 import uvremap_integration as integ  # noqa: E402
 
@@ -35,15 +36,9 @@ WATCH_ROOT = "C:/SPMayaLiveSync/live"
 
 
 def test_import_does_not_load_maya_qt_or_pillow():
-    banned = []
-    for name in sys.modules:
-        if name == "maya" or name.startswith("maya."):
-            banned.append(name)
-        if name in ("PySide6", "PySide2", "PIL") or name.startswith(
-            ("PySide6.", "PySide2.", "PIL.")
-        ):
-            banned.append(name)
-    assert banned == []
+    # 先に走った別のテストが本物の PySide6 / PIL を読み込んでいても影響を受けないよう、
+    # 新しいインタープリタで import して、禁止モジュールが増えないことを確かめる。
+    assert new_forbidden_modules(_PKG, ["uvremap_integration", "uvremap_follow"]) == []
 
 
 def test_source_imports_maya_qt_only_inside_functions():

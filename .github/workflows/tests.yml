@@ -1,0 +1,52 @@
+name: tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11: 動作確認の下限 / 3.13: Substance Painter 12 同梱 Python 想定
+        python-version: ["3.11", "3.13"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        # テストが import するのは pytest と numpy だけ。
+        # Pillow / PySide6 は入っていれば追加のテストが走る任意依存なので入れない。
+        run: python -m pip install "pytest>=8,<10" "numpy>=1.26,<3"
+
+      - name: Byte-compile sources
+        run: git ls-files -z -- 'sp_maya_livesync/*.py' | xargs -0 python -m py_compile
+
+      - name: Run tests
+        # test_maya_live_sync.py は maya.standalone(Maya 本体)が必要なため CI では対象外。
+        # ほかのテストは除外しない。
+        run: >-
+          python -m pytest -q -p no:cacheprovider
+          sp_maya_livesync/tests
+          --ignore=sp_maya_livesync/tests/test_maya_live_sync.py
