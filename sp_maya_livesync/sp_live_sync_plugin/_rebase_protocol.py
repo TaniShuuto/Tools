@@ -60,6 +60,9 @@ __all__ = [
     "REBASE_CONFIRM_LEAD",
     "REBASE_CAUTION_TEXT",
     "REBASE_CAUTION_TEXT_REPROJECT",
+    "REBASE_CAUTION_TEXT_REPROJECT_PRIOR",
+    "REBASE_PRIOR_FILL_WARNING_FMT",
+    "REBASE_PRIOR_AWAITING_MESSAGE_FMT",
     "REBASE_UNSAVED_NOTE",
     "REBASE_AUTO_UNWRAP_NOTE",
     "REBASE_WORKFLOW_GUIDANCE",
@@ -260,6 +263,7 @@ _PAINTER_STATE_DEFAULTS = {
     "last_edit_age_s": None,
     "saved_path": None,
     "project_key": None,
+    "prior_uv_fills": None,
 }
 _PAINTER_STATE_KEYS = (
     "now",
@@ -279,6 +283,7 @@ _PAINTER_STATE_KEYS = (
 )
 _REBASE_UV_FILLS_KEYS = (
     "enabled", "switched", "skipped", "failed", "rolled_back", "direction",
+    "prior",
 )
 
 ApprovalDecision = namedtuple("ApprovalDecision", ["action", "reason"])
@@ -340,6 +345,22 @@ REBASE_CAUTION_TEXT_REPROJECT = (
     "見た目を保ちます(切り替えた数は完了後に表示します)。"
     "2D ビューで描いた内容は追従せず、崩れます。"
     "元に戻すにはバックアップ({backup_dir})を開いてください"
+)
+REBASE_CAUTION_TEXT_REPROJECT_PRIOR = (
+    "3D ビューで描いた内容は新しい UV に合わせて描き直されます。"
+    "UV 投影のまま残っているフィル(マスクのフィルを含む)は、旧 UV セット経由に切り替えて"
+    "見た目を保ちます(切り替えた数は完了後に表示します)。"
+    "2D ビューで描いた内容は追従せず、崩れます。"
+    "元に戻すにはバックアップ({backup_dir})を開いてください"
+)
+REBASE_PRIOR_FILL_WARNING_FMT = (
+    "前回のリベースで切り替えた UV 投影のフィルが {n} 件あります({names})。"
+    "今回のリベースでは、これらの見た目が崩れます。"
+    "崩れてもよい場合だけ「実行する」を押してください。"
+)
+REBASE_PRIOR_AWAITING_MESSAGE_FMT = (
+    "前回切り替えた UV 投影のフィルが {n} 件あり、このリベースで見た目が崩れます。"
+    "Painter の確認画面で判断してください"
 )
 REBASE_UNSAVED_NOTE = "未保存の変更もバックアップに含まれます。"
 REBASE_AUTO_UNWRAP_NOTE = (
@@ -836,6 +857,7 @@ def _normalize_uv_fills(value):
     failed = 0
     rolled_back = 0
     direction = 0
+    prior = 0
     if isinstance(value, dict):
         raw_enabled = value.get("enabled", False)
         enabled = raw_enabled if isinstance(raw_enabled, bool) else False
@@ -850,6 +872,7 @@ def _normalize_uv_fills(value):
         failed = _as_int(value.get("failed", 0))
         rolled_back = _as_int(value.get("rolled_back", 0))
         direction = _as_int(value.get("direction", 0))
+        prior = _as_int(value.get("prior", 0))
     return {
         "enabled": enabled,
         "switched": switched,
@@ -857,6 +880,7 @@ def _normalize_uv_fills(value):
         "failed": failed,
         "rolled_back": rolled_back,
         "direction": direction,
+        "prior": prior,
     }
 
 

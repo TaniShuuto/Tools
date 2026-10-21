@@ -37,6 +37,7 @@ from ._rebase_protocol import (
     diff_rebase_scan,
     effective_rebase_approval,
     find_superseded_ids,
+    REBASE_PRIOR_AWAITING_MESSAGE_FMT,
     get_uv_old_index,
     normalize_rebase_settings,
     read_rebase_request_with_reason,
@@ -50,7 +51,7 @@ from ._rebase_protocol import (
     scan_rebase_dir,
     write_rebase_status,
 )
-from ._rebase_uvfill import inspect_direction_uv_fills
+from ._rebase_uvfill import inspect_uv_fills_for_approval
 from ._rebase_job import RebaseReporter
 
 __all__ = [
@@ -90,6 +91,8 @@ class RebaseCoordinator(object):
         self._needs_saving_missing_logged = False
         self._can_disable_cache = None
         self._read_counts = {}
+        # 依頼 ID ごとの prior 列挙。auto が run になったときだけ 1 回入れる。
+        self._prior_uv_fills = {}
 
     def _now(self, now=None):
         if now is not None:
@@ -277,6 +280,8 @@ class RebaseCoordinator(object):
         if rid:
             state = getattr(self._job, "state", None)
             self._precheck.drop_if_terminal(rid, state)
+            if isinstance(state, str) and state in _REBASE_TERMINAL:
+                self._prior_uv_fills.pop(rid, None)
             entry = self._entries.get(rid)
             if entry is not None:
                 entry["state"] = state
@@ -425,6 +430,15 @@ class RebaseCoordinator(object):
         painter_state = self._build_state(
             request, now, exists, sha1_ok, rid)
         decision = decide_approval(request, painter_state, self._settings)
+        if (
+            decision.action == "run"
+            and decision.reason == "auto_approved"
+            and rid not in self._prior_uv_fills
+        ):
+            self._remember_prior_uv_fills(request)
+            painter_state = self._build_state(
+                request, now, exists, sha1_ok, rid)
+            decision = decide_approval(request, painter_state, self._settings)
         action = decision.action
         reason = decision.reason
         current = entry.get("state")
@@ -446,10 +460,21 @@ class RebaseCoordinator(object):
             if self._dialog is not None and self._dialog_rid == rid:
                 self._refresh_open_dialog(root, rid, request, painter_state, now)
                 return
+            inspection = self._inspect_approval_fills(request)
+            prior_n = 0
+            prior_names = []
+            if inspection is not None:
+                prior_n = inspection.prior_count + inspection.prior_unknown
+                prior_names = inspection.prior_names
             if current != "awaiting_approval":
-                self._write_once(root, rid, "awaiting_approval", now)
+                message = ""
+                if prior_n >= 1:
+                    message = REBASE_PRIOR_AWAITING_MESSAGE_FMT.format(n=prior_n)
+                self._write_once(
+                    root, rid, "awaiting_approval", now, message=message)
                 entry["state"] = "awaiting_approval"
-            self._open_dialog(request, painter_state)
+            self._open_dialog(
+                request, painter_state, inspection, prior_n, prior_names)
             return
         if action == "run":
             self._start_job(request, approved=True)
@@ -570,6 +595,9 @@ class RebaseCoordinator(object):
         last_edit_at = snap.get("last_edit_at")
         if not mesh_exists:
             mesh_sha1_ok = None
+        prior_uv_fills = None
+        if rid in self._prior_uv_fills:
+            prior_uv_fills = self._prior_uv_fills[rid]
         return build_painter_state(
             now=now,
             is_open=is_open,
@@ -586,6 +614,7 @@ class RebaseCoordinator(object):
             cancelled=rid in self._cancelled,
             can_disable_auto_unwrap=can_disable,
             last_edit_at=last_edit_at,
+            prior_uv_fills=prior_uv_fills,
         )
 
     def _write_once(self, root, rid, state, now, reason=None, message=""):
@@ -609,8 +638,47 @@ class RebaseCoordinator(object):
         now = self._now()
         self._write_once(root, rid, state, now, reason=reason, message=message)
         self._precheck.drop_if_terminal(rid, state)
+        if state in _REBASE_TERMINAL:
+            self._prior_uv_fills.pop(rid, None)
 
-    def _open_dialog(self, request, painter_state):
+    def _uv_fill_api_and_sets(self):
+        ctx = self.api.uv_fill_context()
+        if isinstance(ctx, dict):
+            fill_api = ctx.get("api")
+            texture_sets = ctx.get("texture_sets") or []
+        else:
+            fill_api = ctx[0]
+            texture_sets = ctx[1] or [] if len(ctx) > 1 else []
+        return fill_api, texture_sets
+
+    def _remember_prior_uv_fills(self, request):
+        """auto が run のときだけ。失敗は unknown。同じ依頼では二度走査しない。"""
+        rid = request.get("request_id") if isinstance(request, dict) else None
+        try:
+            fill_api, texture_sets = self._uv_fill_api_and_sets()
+            found = inspect_uv_fills_for_approval(
+                fill_api,
+                texture_sets,
+                get_uv_old_index(request),
+                stop_after=1,
+            )
+            value = found.prior_count + found.prior_unknown
+        except Exception:
+            value = "unknown"
+        if isinstance(rid, str) and rid:
+            self._prior_uv_fills[rid] = value
+        return value
+
+    def _inspect_approval_fills(self, request):
+        """ダイアログ直前の 1 回。失敗は None(警告なしでダイアログを出す)。"""
+        try:
+            fill_api, texture_sets = self._uv_fill_api_and_sets()
+            return inspect_uv_fills_for_approval(
+                fill_api, texture_sets, get_uv_old_index(request))
+        except Exception:
+            return None
+
+    def _open_dialog(self, request, painter_state, inspection, prior_n, prior_names):
         if not callable(self.dialog_factory):
             return
         rid = request.get("request_id")
@@ -625,21 +693,8 @@ class RebaseCoordinator(object):
             (self._settings or {}).get("rebase_reproject_uv_fills")
         ) and get_uv_old_index(request) is not None
         has_direction_fills = False
-        # 要実機確認: レイヤー数百のプロジェクトで、この直前 1 回だけ行う
-        # 全スタック列挙にかかる時間を確認する。失敗してもダイアログは出す。
-        try:
-            ctx = self.api.uv_fill_context()
-            fill_api = ctx.get("api") if isinstance(ctx, dict) else ctx[0]
-            texture_sets = (
-                ctx.get("texture_sets") or []
-                if isinstance(ctx, dict)
-                else (ctx[1] or [] if len(ctx) > 1 else [])
-            )
-            direction_count, _direction_names = inspect_direction_uv_fills(
-                fill_api, texture_sets)
-            has_direction_fills = direction_count >= 1
-        except Exception:
-            has_direction_fills = False
+        if inspection is not None:
+            has_direction_fills = inspection.direction_count >= 1
         text = build_rebase_approval_text(
             request,
             backup_dir=backup_dir,
@@ -649,10 +704,17 @@ class RebaseCoordinator(object):
             backup_includes_unsaved=BACKUP_INCLUDES_UNSAVED,
             uv_fill_reproject=uv_fill_reproject,
             has_direction_fills=has_direction_fills,
+            prior_fill_count=prior_n,
+            prior_fill_names=prior_names,
         )
         self._dialog_action = None
         self._dialog_rid = rid
-        self._dialog = self.dialog_factory(text, self._on_dialog_result)
+        # 警告があるときだけ既定を「やめる」にする。引数を省いた偽物は従来どおり。
+        if prior_n >= 1:
+            self._dialog = self.dialog_factory(
+                text, self._on_dialog_result, default_cancel=True)
+        else:
+            self._dialog = self.dialog_factory(text, self._on_dialog_result)
 
     def _on_dialog_result(self, action):
         if self._is_closed():
@@ -727,6 +789,7 @@ class RebaseCoordinator(object):
         self._job_request_id = None
         self.api = None
         self._precheck.clear()
+        self._prior_uv_fills.clear()
         self._entries.clear()
         self._set_blocks(False)
 
@@ -743,6 +806,7 @@ class RebaseCoordinator(object):
                 pass
             self._on_job_finished()
         self._precheck.clear()
+        self._prior_uv_fills.clear()
         self._prev_scan = None
         self._entries.clear()
         self._cancelled.clear()

@@ -254,7 +254,7 @@ def test_version_has_a_single_home():
                     isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets):
                 homes.append(name)
     assert homes == ["_version"]
-    assert plugin.__version__ == _part_module("_version").__version__ == "1.4.4"
+    assert plugin.__version__ == _part_module("_version").__version__ == "1.4.5"
 
 
 def test_engine_and_panel_are_only_touched_in_init():
