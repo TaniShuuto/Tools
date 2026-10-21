@@ -1,5 +1,5 @@
 """
-sp_live_sync_plugin.py
+sp_live_sync_plugin フォルダー形式 (sp_live_sync_plugin/__init__.py)
 Substance 3D Painter 側プラグイン(SP Live Sync, B案:自前パイプライン)
 
 変更履歴はリポジトリルートの CHANGELOG.md を参照。
@@ -9,7 +9,7 @@ Substance 3D Painter 側プラグイン(SP Live Sync, B案:自前パイプライ
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
 #
 # 変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 import os
 import re
@@ -6867,6 +6867,41 @@ _engine = None
 _panel = None
 
 
+# フォルダー版(sp_live_sync_plugin/__init__.py)へ移したあと、plugins フォルダーに
+# 古い1ファイル版が残っていると、どちらが読まれているか分かりにくい。
+# 検出だけ行い、ファイルは削除しない。
+STALE_SINGLE_FILE_PLUGIN_WARNING = (
+    "古い sp_live_sync_plugin.py が plugins フォルダーに残っています({path})。"
+    "このフォルダー版が使われていますが、混乱を防ぐため古いファイルを削除してください。"
+)
+
+
+def stale_single_file_plugin_path(init_file):
+    """__init__.py の絶対パスから、古い1ファイル版のパスを返す。
+
+    返すのは <init_file の親の親>/sp_live_sync_plugin.py がファイルとして
+    存在するときだけ。無い、同名のフォルダーだけ、パスが壊れている、の
+    いずれでも None。例外は出さない。この1パスの存在確認しかしない。
+    """
+    try:
+        if isinstance(init_file, bytes):
+            init_file = os.fsdecode(init_file)
+        elif hasattr(init_file, "__fspath__"):
+            init_file = os.fspath(init_file)
+        if not isinstance(init_file, str) or not init_file:
+            return None
+        package_dir = os.path.dirname(init_file)
+        plugins_dir = os.path.dirname(package_dir)
+        if not plugins_dir:
+            return None
+        candidate = os.path.join(plugins_dir, "sp_live_sync_plugin.py")
+        if os.path.isfile(candidate):
+            return candidate
+    except Exception:
+        return None
+    return None
+
+
 def start_plugin():
     global _engine, _panel
     # SP側・Maya側でバージョンがズレたまま運用してしまい、片方だけ古い
@@ -6874,6 +6909,14 @@ def start_plugin():
     # 最初に必ずバージョンをログへ出す(Pythonログに出力される)。
     _log("info", "[sp_live_sync_plugin] loaded version: {0}  (file: {1})".format(
         __version__, os.path.abspath(__file__)))
+    try:
+        stale_path = stale_single_file_plugin_path(os.path.abspath(__file__))
+        if stale_path:
+            stale_message = STALE_SINGLE_FILE_PLUGIN_WARNING.format(path=stale_path)
+            _log("warning", stale_message)
+            _append_history("SP", stale_message)
+    except Exception as stale_error:
+        _log("warning", "古い1ファイル版プラグインの確認に失敗しました: {0}".format(stale_error))
     # 2026.07.24(緊急バグ修正): 従来は既存の_engineの有無を確認せず
     # 無条件で新規LiveSyncEngine()を作成していた。SPのプラグイン無効化→
     # 再有効化を経由せずstart_plugin()が二重に呼ばれた場合(Mayaの
