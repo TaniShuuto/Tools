@@ -35,7 +35,7 @@
 
 1. **純関数の部品も、`_base` を経由して間接的に `substance_painter.logging` を読み込む。** `_rebase_protocol` などは `_base`(`_log`、依頼 ID)を import し、`_base` は `import substance_painter.logging as sp_log` をする。指示の検査(自分の import に `substance_painter` / `PySide` / `_qt` が無い)は満たしているが、「Painter なしで単独 import できる」とまでは言えない。本当に単独で読めるようにするには、`_log` を差し込める形にするなど設計の変更が要るので、やっていない。
 2. **`reload_plugin` の呼ばれる順序は、Adobe の資料だけでは確定できなかった。** 資料にあるのは「フックは close のあと、start の前に実行される」「パッケージ形式のプラグインは、フックで部品を手で読み直す」ことまでで、本体の `importlib.reload` がフックの前か後かは書かれていない。そのため、フックの中で (a) `sys.modules` から部品を取り除き、(b) 本体も `importlib.reload` する実装にした。どちらの順でも部品が新しくなることをテストで確かめた。実機で確認してほしい項目は報告に書いた。
-3. **導入文書。** `Easy_install.md` と `README.md` には「`sp_live_sync_plugin` フォルダーごと」コピーする旨が既にあるので変更しなかった。ただし「中の .py を一部だけ置かない」という明示的な禁止の文はない。ファイルが 15 個になったので、1 文足すかは相談したい。
+3. **導入文書。** `Easy_install.md` と `README.md` には「`sp_live_sync_plugin` フォルダーごと」コピーする旨が既にあるので変更しなかった。ただし「中の .py を一部だけ置かない」という明示的な禁止の文はない。ファイルが 15 個になったので、1 文足すかは相談したい。 → 利用者の判断で、両方の文書に「一部だけ置き換えない」旨の 1 文を追記した(2026-10-21)。
 4. **`test_plugin_source_has_no_uvremap_import` を、相対 import の名前だけ緩めた。** 部品から `resolve_uvremap_root` / `uvremap_root_for_project`(関数)を取り込むと、名前に `uvremap_` が含まれて誤検出になるため。`uvremap_core` のようなモジュールの import を禁じる意図は残してある(絶対 import と `from . import x` は従来どおり厳しく見る)。
 5. **`__init__.py` は分割前のトップレベル名を保つため、元の標準ライブラリ・`substance_painter` の import をすべて持つ。** 使っていない import が多いのは意図どおり(互換)。新しく `import sys` / `import importlib`(`reload_plugin` 用)が増えた。
 6. **計画書とレビュー結果(Projects の `claude/plugin_split_plan.md`、`claude/plugin_split_review_20261021.md`)は、この環境では読めなかった。** 指示文に書かれた仕様(層、部品名、移動する名前)に従った。レビューの 3 章の修正が指示文に反映済みなら問題ない。
