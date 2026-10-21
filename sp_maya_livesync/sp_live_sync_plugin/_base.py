@@ -58,6 +58,8 @@ __all__ = [
     "write_json_atomic",
     "write_sync_flag",
     "publish_export_outputs",
+    "REPLACE_RETRY_DELAYS_S",
+    "_replace_with_retry",
     "write_rebase_result_copy",
     "_hash_file_hex",
     "build_mesh_record",
@@ -471,9 +473,19 @@ def _merge_and_write_config(cfg):
     # 置き換える。SPとMayaが同時に保存/読込を行った際に、書き込み途中の
     # 不完全なJSONを相手側が読んでしまう(torn read)のを防ぐため。
     tmp_path = CONFIG_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, CONFIG_PATH)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        _replace_with_retry(tmp_path, CONFIG_PATH)
+    except Exception:
+        # 2026.10.21(1.4.4): 失敗時に一時ファイルを残さない
+        # (write_json_atomic と同じ)。残す挙動に依存するテストは無い。
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def save_config(cfg):
@@ -658,8 +670,54 @@ def build_export_result(
     }
 
 
+# ---------------------------------------------------------------------------
+# 2026.10.21(1.4.4): os.replace の短い再試行
+# ---------------------------------------------------------------------------
+# Windows では、置き換え先を他プロセス(Maya の読み取り、クラウド同期)が
+# 開いていると os.replace が PermissionError(WinError 5)や共有違反
+# (winerror 32)・ロック違反(winerror 33)で失敗する。Painter の
+# メインスレッドで待つため、待ちの合計は 1 秒を超えない。
+# FileNotFoundError と、それ以外の OSError(別ボリュームの winerror 17、
+# errno.EXDEV、ディスク満杯など)は再試行しない。
+# 待ちの回数を使い切ったら、最後の例外を型を変えずに送出する。
+REPLACE_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.3, 0.35)  # 合計 1.0 秒
+
+
+def _replace_with_retry(src, dst, *, delays=REPLACE_RETRY_DELAYS_S, sleep_fn=None):
+    """os.replace(src, dst) を、共有違反と思われるエラーのときだけ再試行する。
+
+    delays の各要素は、失敗した直後の待ち秒。既定は 5 回(合計 1.0 秒)。
+    その後の失敗は待たずに、その例外をそのまま送出する。
+    再試行の末に成功したときは、ファイル名だけを info で 1 行残す。
+    sleep_fn はテスト用。既定は time.sleep。
+    """
+    sleep = time.sleep if sleep_fn is None else sleep_fn
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            os.replace(src, dst)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            retryable = isinstance(exc, PermissionError) or winerror in (32, 33)
+            if not retryable or attempt > len(delays):
+                raise
+            sleep(delays[attempt - 1])
+        else:
+            if attempt > 1:
+                _log(
+                    "info",
+                    "共有違反のため置き換えを再試行し、{0}回目で成功しました: {1}".format(
+                        attempt, os.path.basename(dst)),
+                )
+            return
+
+
 def write_json_atomic(path, obj):
     """一時ファイルへ書いてから os.replace() で原子的に置き換える。
+    共有違反のときは短い再試行をする。
     失敗したときは一時ファイルを残さない。
     """
     tmp_path = path + ".tmp"
@@ -669,7 +727,7 @@ def write_json_atomic(path, obj):
             os.makedirs(parent, exist_ok=True)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+        _replace_with_retry(tmp_path, path)
     except Exception:
         try:
             if os.path.isfile(tmp_path):
@@ -686,9 +744,17 @@ def write_sync_flag(flag_path):
     mtime だけを見るので、中身の形式は変えない。
     """
     tmp_flag_path = flag_path + ".tmp"
-    with open(tmp_flag_path, "w", encoding="utf-8") as f:
-        f.write(str(time.time()))
-    os.replace(tmp_flag_path, flag_path)
+    try:
+        with open(tmp_flag_path, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        _replace_with_retry(tmp_flag_path, flag_path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp_flag_path):
+                os.remove(tmp_flag_path)
+        except OSError:
+            pass
+        raise
 
 
 def publish_export_outputs(

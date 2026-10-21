@@ -81,6 +81,8 @@ from ._base import (
     load_config,
     msvcrt,
     publish_export_outputs,
+    REPLACE_RETRY_DELAYS_S,
+    _replace_with_retry,
     rebase_result_path,
     rebase_results_dir,
     save_config,

@@ -23,6 +23,7 @@ from ._base import (
     _append_history,
     _is_unsaved_project_key,
     _log,
+    _replace_with_retry,
     _update_nested_config_entry,
     build_export_result,
     build_mesh_record,
@@ -1317,7 +1318,7 @@ class LiveSyncEngine(QtCore.QObject):
                                 # 直前にos.remove(dest)する必要は無い(それを行うと
                                 # destが一瞬存在しない窓ができ、Maya側のポーリングが
                                 # 「消えた」と誤認する余地を作ってしまう)。
-                                os.replace(src, dest)
+                                _replace_with_retry(src, dest)
                             except OSError:
                                 # 2026.07.24(緊急バグ修正): ステージングと監視/Final
                                 # フォルダが別ボリューム(共有PCでネットワークドライブを
@@ -1330,7 +1331,7 @@ class LiveSyncEngine(QtCore.QObject):
                                 # 同一ボリューム内のrenameとして常に原子的にする。
                                 tmp_dest = dest + ".tmp"
                                 shutil.copyfile(src, tmp_dest)
-                                os.replace(tmp_dest, dest)
+                                _replace_with_retry(tmp_dest, dest)
                                 os.remove(src)
                             moved_count += 1
                             replaced_this_set = True
