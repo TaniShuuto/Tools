@@ -13,6 +13,7 @@ for _p in (_PKG, _TESTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from plugin_patch import patch_plugin_attr  # noqa: E402
 from test_sp_live_sync_plugin_protocol import plugin  # noqa: E402
 import uvremap_rebase as rb  # noqa: E402
 
@@ -246,7 +247,7 @@ def test_gates_and_uv_old_index(monkeypatch):
     uv = FakeNode("FillLayerNode", Mode.UV, UVProjectionParams(), name="uv")
     ts = TextureSetFake("Body", ["stack"])
     api = _api([uv])
-    monkeypatch.setattr(plugin, "switch_uv_fills_in_stack",
+    patch_plugin_attr(monkeypatch, plugin, "switch_uv_fills_in_stack",
                         lambda stack, a, label, source: plugin.switch_uv_fills_in_stack(
                             stack, a, label, source))
     # replace get_root via layerstack on api already bound

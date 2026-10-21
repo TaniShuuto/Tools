@@ -76,6 +76,7 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 1. Substance Painter を起動します。
 2. 上部メニュー **Python > Plugins Folder** をクリックします（フォルダが開きます）。
 3. 開いたフォルダに **`sp_live_sync_plugin` フォルダーごと**コピーします。
+   （更新のときも、フォルダーの中のファイルを一部だけ置き換えないでください。古い部品と新しい部品が混ざると正しく動きません。フォルダーを丸ごと置き換えます。）
 4. 以前の版の **`sp_live_sync_plugin.py`** が plugins フォルダーにあれば**削除**します。
 5. Substance Painter を**一度再起動**します。
 6. 上部メニュー **Python > `sp_live_sync_plugin`** に**チェック**を入れて有効化します（更新後にチェックが外れていたら入れ直します）。

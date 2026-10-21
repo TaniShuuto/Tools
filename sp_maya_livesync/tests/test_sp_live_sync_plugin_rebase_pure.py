@@ -24,6 +24,7 @@ for _p in (_PKG, _TESTS):
         sys.path.insert(0, _p)
 
 from test_sp_live_sync_plugin_protocol import plugin  # noqa: E402
+from plugin_patch import patch_plugin_attr  # noqa: E402
 from plugin_source import plugin_source_text  # noqa: E402
 import uvremap_rebase as rb  # noqa: E402
 
@@ -185,12 +186,15 @@ def test_plugin_source_has_no_uvremap_import():
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             assert "uvremap_" not in module
-            for alias in node.names:
-                assert "uvremap_" not in alias.name
+            # uvremap_core のようなモジュールの取り込みを禁じる。パッケージ内の部品から
+            # resolve_uvremap_root のような関数を取り込むのは構わない(module が部品名のとき)。
+            if node.level == 0 or not node.module:
+                for alias in node.names:
+                    assert "uvremap_" not in alias.name
 
 
 def test_plugin_imports_without_painter_or_qt_objects():
-    assert plugin.__version__ == "1.4.2"
+    assert plugin.__version__ == "1.4.3"
     assert callable(plugin.parse_rebase_request)
     assert callable(plugin.decide_approval)
 
@@ -707,7 +711,7 @@ def test_write_status_transition_and_corrupt_and_error(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("readonly")
 
-    monkeypatch.setattr(plugin, "write_json_atomic", boom)
+    patch_plugin_attr(monkeypatch, plugin, "write_json_atomic", boom)
     third = _rid(7)
     status = plugin.build_rebase_status(third, "received", 4, PLUGIN_VERSION)
     assert plugin.write_rebase_status(tmp_path, status) is False

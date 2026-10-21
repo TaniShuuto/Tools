@@ -15,6 +15,8 @@ import types
 
 import pytest
 
+from plugin_patch import patch_plugin_attr
+
 _MISSING = object()
 _SAVED_MODULES = {}
 
@@ -345,8 +347,8 @@ def test_publish_writes_result_before_flag(monkeypatch):
     def _flag(path):
         order.append("flag")
 
-    monkeypatch.setattr(plugin, "write_json_atomic", _json)
-    monkeypatch.setattr(plugin, "write_sync_flag", _flag)
+    patch_plugin_attr(monkeypatch, plugin, "write_json_atomic", _json)
+    patch_plugin_attr(monkeypatch, plugin, "write_sync_flag", _flag)
     plugin.publish_export_outputs("C:/SPMayaLiveSync/live/demo", {"schema": 1}, True)
     assert order == ["result", "flag"]
 
@@ -365,8 +367,8 @@ def test_publish_still_writes_flag_when_result_write_fails(monkeypatch):
     def _flag(path):
         order.append("flag")
 
-    monkeypatch.setattr(plugin, "write_json_atomic", _json)
-    monkeypatch.setattr(plugin, "write_sync_flag", _flag)
+    patch_plugin_attr(monkeypatch, plugin, "write_json_atomic", _json)
+    patch_plugin_attr(monkeypatch, plugin, "write_sync_flag", _flag)
     plugin.publish_export_outputs("C:/SPMayaLiveSync/live/demo", {"schema": 1}, True)
     assert order == ["result", "flag"]
 
@@ -375,10 +377,10 @@ def test_publish_still_writes_flag_when_result_write_fails(monkeypatch):
 def isolated(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg"
     cfg.mkdir()
-    monkeypatch.setattr(plugin, "CONFIG_DIR", str(cfg))
-    monkeypatch.setattr(plugin, "CONFIG_PATH", str(cfg / "live_sync_config.json"))
-    monkeypatch.setattr(plugin, "CONFIG_LOCK_PATH", str(cfg / "live_sync_config.json.lock"))
-    monkeypatch.setattr(plugin, "HISTORY_LOG_PATH", str(cfg / "history.log"))
+    patch_plugin_attr(monkeypatch, plugin, "CONFIG_DIR", str(cfg))
+    patch_plugin_attr(monkeypatch, plugin, "CONFIG_PATH", str(cfg / "live_sync_config.json"))
+    patch_plugin_attr(monkeypatch, plugin, "CONFIG_LOCK_PATH", str(cfg / "live_sync_config.json.lock"))
+    patch_plugin_attr(monkeypatch, plugin, "HISTORY_LOG_PATH", str(cfg / "history.log"))
     return tmp_path
 
 
@@ -441,8 +443,8 @@ def test_do_export_writes_result_before_flag(engine, isolated, monkeypatch):
         order.append(("flag", os.path.basename(path)))
         return real_flag(path)
 
-    monkeypatch.setattr(plugin, "write_json_atomic", _json)
-    monkeypatch.setattr(plugin, "write_sync_flag", _flag)
+    patch_plugin_attr(monkeypatch, plugin, "write_json_atomic", _json)
+    patch_plugin_attr(monkeypatch, plugin, "write_sync_flag", _flag)
     _arm_export(monkeypatch, isolated, "Success")
     engine._do_export(preview=True)
     assert [name for name, _base in order] == ["result", "flag"]
@@ -528,7 +530,7 @@ def test_result_write_failure_does_not_stop_export(engine, isolated, monkeypatch
     def _bad_json(path, obj):
         raise OSError("readonly")
 
-    monkeypatch.setattr(plugin, "write_json_atomic", _bad_json)
+    patch_plugin_attr(monkeypatch, plugin, "write_json_atomic", _bad_json)
     engine._do_export(preview=True)
     assert list(isolated.rglob("_sync_complete.flag"))
     assert list(isolated.rglob("_sync_result.json")) == []
@@ -687,7 +689,7 @@ def test_mesh_record_retries_empty_or_busy_without_sleep(engine, isolated, monke
     slept = []
     monkeypatch.setattr(plugin.time, "sleep", lambda seconds: slept.append(seconds))
     logs = []
-    monkeypatch.setattr(plugin, "_log", lambda level, message: logs.append((level, message)))
+    patch_plugin_attr(monkeypatch, plugin, "_log", lambda level, message: logs.append((level, message)))
 
     engine._mesh_record_retries = 0
     engine._on_mesh_record_timer()
