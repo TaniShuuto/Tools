@@ -47,6 +47,7 @@ __all__ = (
     "CLEANUP_AGE_S",
     "MESSAGE_MAX",
     "MIN_PLUGIN_VERSION",
+    "MIN_REBASE_PLUGIN_VERSION",
     "REQUEST_RELOAD",
     "REQUEST_ID_RE",
     "UV_OLD_NAME_RE",
@@ -68,6 +69,7 @@ __all__ = (
     "MSG_STATUS_UNREADABLE",
     "MSG_PLUGIN_UPDATE_REQUIRED",
     "MSG_DONE_GUIDANCE",
+    "MSG_DONE_DIRECTION_FMT",
     "MSG_RESULT_UNCONFIRMED",
     "StatusRead",
     "RebaseDisplay",
@@ -203,7 +205,10 @@ POLL_MIN_S = 0.5
 POLL_MAX_S = 30.0
 CLEANUP_AGE_S = 7 * 86400
 MESSAGE_MAX = 500
+# 結果ファイルを読む下限。リベース送信の下限は MIN_REBASE_PLUGIN_VERSION。
 MIN_PLUGIN_VERSION = (1, 3, 0)
+# 2026.10.21(RB-d2): リベース依頼を作る下限。1.3.x は結果を読めてもリベースできない。
+MIN_REBASE_PLUGIN_VERSION = (1, 4, 0)
 
 # 依頼の reload。使うときは必ずコピーを返す(この辞書をそのまま入れない)。
 REQUEST_RELOAD = {
@@ -237,11 +242,21 @@ MSG_SUPERSEDED = "新しい依頼に置き換えられました"
 MSG_CANCELING = "取り消し中です"
 MSG_CANNOT_CANCEL = "読み直しが始まったため取り消せません"
 MSG_STATUS_UNREADABLE = "状態を読めません"
-MSG_PLUGIN_UPDATE_REQUIRED = "Painter プラグインの更新が必要です"
+# 2026.10.21(RB-d2): 版は _sync_result.json の plugin_version。更新直後は古い版が残る。
+MSG_PLUGIN_UPDATE_REQUIRED = (
+    "Painter プラグインの更新が必要です(1.4.0 以上)。"
+    "更新済みの場合は、Painter のパネルで「今すぐ全量同期(Final)」を 1 回実行してから送ってください"
+)
 MSG_DONE_GUIDANCE = (
     "リベースが完了しました。ストロークは新しい UV に再投影されています。"
     "次を Painter で確認してください: 2D ビューのストローク、UV 投影のフィル、"
     "ベイク済みのメッシュマップ(再ベイクが必要な場合があります)"
+)
+# 2026.10.21(RB-d2): done の uv_fills.direction が 1 以上のとき、履歴と完了表示に続ける。
+MSG_DONE_DIRECTION_FMT = (
+    "法線(または異方性の角度)を含む UV 投影のフィルが {n} 件あります。"
+    "UV を回転・反転した島では陰影が狂うことがあります。"
+    "Painter の履歴で対象を確認し、必要なら法線を描き直すか再ベイクしてください"
 )
 # 2026.10.19(RB-a): done なのに完了判定が complete でないときの表示。使うのは RB-d。
 # decide_display は選ばない。
@@ -827,6 +842,8 @@ def parse_status(raw) -> dict | None:
 
     未知のキーは落とす(正規化するキーだけを残す)。``backup_name`` はファイル名だけ。
     ``message`` は文字列でなければ空、``MESSAGE_MAX`` で切る。
+    ``uv_fills`` 自体は残さない。``direction`` が 0 以上の整数(bool を除く)なら
+    ``direction_fills`` にその値を入れ、無い・不正なら 0。
     """
     if not isinstance(raw, dict):
         return None
@@ -852,7 +869,18 @@ def parse_status(raw) -> dict | None:
         "message": _clip_message(raw.get("message")),
         "backup_name": _filename_only(raw.get("backup_name")),
         "result_export_id": _optional_text(raw.get("result_export_id")),
+        "direction_fills": _direction_fill_count(raw.get("uv_fills")),
     }
+
+
+def _direction_fill_count(uv_fills) -> int:
+    """``uv_fills.direction`` が 0 以上の整数ならその値。bool・不正・無しは 0。"""
+    if not isinstance(uv_fills, dict):
+        return 0
+    value = uv_fills.get("direction")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def read_status(root, request_id) -> StatusRead:
@@ -955,13 +983,17 @@ def _version_at_least(version: tuple[int, ...], minimum: tuple[int, ...]) -> boo
 
 
 def plugin_supports_rebase(sync_result) -> bool:
-    """一度も見ていない(None)、版が読めない、1.3.0 未満は False。"""
+    """一度も見ていない(None)、版が読めない、1.4.0 未満は False。
+
+    下限は ``MIN_REBASE_PLUGIN_VERSION``。結果ファイルを読む下限
+    ``MIN_PLUGIN_VERSION`` (1.3.0) とは別。
+    """
     if not isinstance(sync_result, dict):
         return False
     version = parse_version(sync_result.get("plugin_version"))
     if version is None:
         return False
-    return _version_at_least(version, MIN_PLUGIN_VERSION)
+    return _version_at_least(version, MIN_REBASE_PLUGIN_VERSION)
 
 
 # ---------------------------------------------------------------------------

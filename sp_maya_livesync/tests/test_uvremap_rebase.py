@@ -852,6 +852,34 @@ def test_parse_status_backup_name_and_message_limit():
     }) is None
 
 
+@pytest.mark.parametrize("uv_fills,expected", [
+    ({"direction": 2}, 2),
+    ({"direction": 0}, 0),
+    (None, 0),
+    ({"direction": "2"}, 0),
+    ({"direction": True}, 0),
+    ({"direction": -1}, 0),
+])
+def test_parse_status_direction_fills(uv_fills, expected):
+    raw = {
+        "schema": 1,
+        "request_id": RID,
+        "state": "done",
+        "updated_at": 1,
+        "message": "残す",
+        "unknown": 1,
+    }
+    if uv_fills is not None:
+        raw["uv_fills"] = uv_fills
+    parsed = rb.parse_status(raw)
+    assert parsed is not None
+    assert parsed["direction_fills"] == expected
+    assert parsed["message"] == "残す"
+    assert parsed["state"] == "done"
+    assert "uv_fills" not in parsed
+    assert "unknown" not in parsed
+
+
 # ---------------------------------------------------------------------------
 # 7. decide_display
 # ---------------------------------------------------------------------------
@@ -1089,20 +1117,42 @@ def test_judge_completion_priority_and_scene_and_final_full():
 # 10. plugin_supports_rebase
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("version,ok", [
-    (None, False),
     ("1.2.0", False),
-    ("1.3.0", True),
+    ("1.3.0", False),
+    ("1.3.9", False),
+    ("1.4", True),
     ("1.4.0", True),
+    ("1.4.3", True),
     ("1.10.0", True),
+    ("", False),
+    ("abc", False),
     ("nope", False),
     ("1.4.0-beta", True),
     ("1.2.0a", False),
 ])
 def test_plugin_supports_rebase(version, ok):
-    if version is None:
-        assert rb.plugin_supports_rebase(None) is False
-        return
     assert rb.plugin_supports_rebase({"plugin_version": version}) is ok
+
+
+@pytest.mark.parametrize("sync_result", [None, [], "1.4.0", 1, {"plugin_version": None}])
+def test_plugin_supports_rebase_rejects_non_dict_and_unreadable(sync_result):
+    assert rb.plugin_supports_rebase(sync_result) is False
+
+
+def test_rebase_version_floor_is_separate_from_result_floor():
+    assert rb.MIN_PLUGIN_VERSION == (1, 3, 0)
+    assert rb.MIN_REBASE_PLUGIN_VERSION == (1, 4, 0)
+    assert "MIN_REBASE_PLUGIN_VERSION" in rb.__all__
+    assert "MSG_DONE_DIRECTION_FMT" in rb.__all__
+    assert rb.MSG_PLUGIN_UPDATE_REQUIRED == (
+        "Painter プラグインの更新が必要です(1.4.0 以上)。"
+        "更新済みの場合は、Painter のパネルで「今すぐ全量同期(Final)」を 1 回実行してから送ってください"
+    )
+    assert rb.MSG_DONE_DIRECTION_FMT.format(n=2) == (
+        "法線(または異方性の角度)を含む UV 投影のフィルが 2 件あります。"
+        "UV を回転・反転した島では陰影が狂うことがあります。"
+        "Painter の履歴で対象を確認し、必要なら法線を描き直すか再ベイクしてください"
+    )
 
 
 def test_parse_version_is_numeric_not_lexical():
@@ -1372,6 +1422,7 @@ def test_message_constants_are_non_empty_and_failed_formats():
         "MSG_STATUS_UNREADABLE",
         "MSG_PLUGIN_UPDATE_REQUIRED",
         "MSG_DONE_GUIDANCE",
+        "MSG_DONE_DIRECTION_FMT",
         "MSG_RESULT_UNCONFIRMED",
     )
     for name in names:
