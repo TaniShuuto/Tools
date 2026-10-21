@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""フォルダー形式(1.4.2)のソース一覧と、古い1ファイル版の検出。"""
+"""フォルダー形式のソース一覧(1.4.3 で役割ごとの部品に分割)と、古い1ファイル版の検出。"""
 from __future__ import annotations
 
 import ast
@@ -43,8 +43,27 @@ def _imported_and_single_shot(source):
     return imported, single_shot
 
 
-def test_plugin_package_py_files_are_init_only():
-    assert _relpaths() == {"__init__.py"}
+EXPECTED_PACKAGE_FILES = {
+    "__init__.py",
+    "_base.py",
+    "_live_engine.py",
+    "_live_panel.py",
+    "_painter_rebase_api.py",
+    "_project_key.py",
+    "_qt.py",
+    "_rebase_coordinator.py",
+    "_rebase_job.py",
+    "_rebase_policy.py",
+    "_rebase_protocol.py",
+    "_rebase_uvfill.py",
+    "_settings_model.py",
+    "_version.py",
+    "_wizard.py",
+}
+
+
+def test_plugin_package_py_files_are_the_expected_parts():
+    assert _relpaths() == EXPECTED_PACKAGE_FILES
 
 
 def test_source_helper_finds_violation_only_in_sibling_module(tmp_path):

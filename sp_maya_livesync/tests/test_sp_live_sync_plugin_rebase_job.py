@@ -22,6 +22,7 @@ for _p in (_PKG, _TESTS):
 from test_sp_live_sync_plugin_protocol import (  # noqa: E402
     plugin, ProjectError, _arm_export, _status_file,
 )
+from plugin_patch import patch_plugin_attr  # noqa: E402
 from plugin_source import plugin_source_text  # noqa: E402
 
 pytest_plugins = ["test_sp_live_sync_plugin_protocol"]
@@ -633,7 +634,7 @@ def test_terminal_write_retry(tmp_path, monkeypatch):
                 return False
         return real(root_arg, status)
 
-    monkeypatch.setattr(plugin, "write_rebase_status", flaky)
+    patch_plugin_attr(monkeypatch, plugin, "write_rebase_status", flaky)
     _drive_happy_job(job, api, clock)
     assert job.finished
     job.tick(clock())
@@ -1017,8 +1018,8 @@ def test_export_path_writes_request_id_first(engine, isolated, monkeypatch, tmp_
         order.append(("flag", None))
         return real_flag(path)
 
-    monkeypatch.setattr(plugin, "write_json_atomic", _json)
-    monkeypatch.setattr(plugin, "write_sync_flag", _flag)
+    patch_plugin_attr(monkeypatch, plugin, "write_json_atomic", _json)
+    patch_plugin_attr(monkeypatch, plugin, "write_sync_flag", _flag)
     _arm_export(monkeypatch, isolated, "Success")
     engine._safe_export(preview=False, force_full=True, export_request_id=RID)
     assert order[0][0] == "result"
@@ -1089,7 +1090,7 @@ def test_engine_wiring_and_shutdown(engine, monkeypatch):
     engine.enabled = False
     engine.on_texture_state(types.SimpleNamespace(action=plugin.event.TextureStateEventAction.ADD, stack_id=1))
     assert engine._last_texture_event_at is not None
-    assert plugin.__version__ == "1.4.2"
+    assert plugin.__version__ == "1.4.3"
     src = inspect.getsource(plugin.LiveSyncPanel)
     assert "rebase" not in src
     engine.shutdown()
@@ -1235,7 +1236,7 @@ def test_terminal_write_failure_keeps_job_for_retry(tmp_path, monkeypatch):
                 return False
         return real_write(path_root, status)
 
-    monkeypatch.setattr(plugin, "write_rebase_status", flaky)
+    patch_plugin_attr(monkeypatch, plugin, "write_rebase_status", flaky)
     held = False
     for _ in range(16):
         coord.tick(clock())
@@ -1270,7 +1271,7 @@ def test_terminal_write_giveup_is_logged(tmp_path, monkeypatch):
             return False
         return real_write(path_root, status)
 
-    monkeypatch.setattr(plugin, "write_rebase_status", always_fail)
+    patch_plugin_attr(monkeypatch, plugin, "write_rebase_status", always_fail)
     for _ in range(40):
         if coord._job is None and jobs and jobs[0].finished:
             break
@@ -1363,7 +1364,7 @@ def test_empty_ts_names_is_not_all_texture_sets(tmp_path, monkeypatch):
         calls.append(label)
         return plugin.UvFillStackReport(label)
 
-    monkeypatch.setattr(plugin, "switch_uv_fills_in_stack", spy)
+    patch_plugin_attr(monkeypatch, plugin, "switch_uv_fills_in_stack", spy)
 
     class _Ts(object):
         def name(self):
@@ -1487,7 +1488,7 @@ def test_close_plugin_reports_engine_released(monkeypatch):
     def capture(level, text):
         logs.append((level, text))
 
-    monkeypatch.setattr(plugin, "_log", capture)
+    patch_plugin_attr(monkeypatch, plugin, "_log", capture)
     plugin._engine = plugin.LiveSyncEngine()
     plugin._panel = types.SimpleNamespace(engine=plugin._engine)
     plugin.close_plugin()
