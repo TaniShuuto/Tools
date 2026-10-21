@@ -1090,7 +1090,7 @@ def test_engine_wiring_and_shutdown(engine, monkeypatch):
     engine.enabled = False
     engine.on_texture_state(types.SimpleNamespace(action=plugin.event.TextureStateEventAction.ADD, stack_id=1))
     assert engine._last_texture_event_at is not None
-    assert plugin.__version__ == "1.4.3"
+    assert plugin.__version__ == "1.4.4"
     src = inspect.getsource(plugin.LiveSyncPanel)
     assert "rebase" not in src
     engine.shutdown()
