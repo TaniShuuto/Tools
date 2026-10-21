@@ -98,7 +98,7 @@ Substance 3D PainterとMayaでは導入方法が異なります。
 
 ### 1. プラグインを配置する
 
-`sp_live_sync_plugin.py`
+`sp_live_sync_plugin` フォルダーごと
 
 を以下のフォルダへコピーします。
 
@@ -110,6 +110,10 @@ Documents/
             └── plugins
 ```
 
+以前の版の `sp_live_sync_plugin.py` が plugins フォルダーにあれば削除します。
+
+起動時の作業フォルダーに同名のファイルやフォルダーがあると、そちらが優先されます。
+
 ---
 
 ### 2. Substance 3D Painterを再起動
@@ -120,19 +124,11 @@ Documents/
 
 ### 3. プラグインを有効化
 
-上部メニュー
+上部メニュー **Python > `sp_live_sync_plugin`** にチェックを入れて有効化します。更新後にチェックが外れていたら入れ直します。
 
-```
-Python
-```
-
-から
-
-```
-SP Live Sync
-```
-
-をクリックして有効化します。
+戻し方: plugins フォルダーの `sp_live_sync_plugin` フォルダーを**削除してから**、
+以前の `sp_live_sync_plugin.py` を置く
+（フォルダーが残っているとフォルダー側が優先され、元に戻らない）。
 
 ---
 
@@ -623,7 +619,7 @@ AOをBase Colorに含めたワークフローを利用している場合に有�
 | ------------------------------ | ------------------------------------------------- |
 | **Install.py**                 | Mayaへドラッグ＆ドロップしてインストールを行います。アップデート時もこのファイルを使用します。 |
 | **maya_live_sync.py**          | Maya側でLive Syncを実行するメインプログラムです。                   |
-| **sp_live_sync_plugin.py**     | Substance 3D Painter側でLive Syncを実行するプラグインです。      |
+| **sp_live_sync_plugin/**       | Substance 3D Painter側でLive Syncを実行するプラグインです（フォルダーごと）。 |
 | **sp_to_aiStandardSurface.py** | テクスチャを解析し、aiStandardSurfaceへ自動接続するツールです。          |
 | **udim_setup.py**              | UDIMテクスチャを検出し、Arnold用マテリアルへ自動セットアップするツールです。      |
 

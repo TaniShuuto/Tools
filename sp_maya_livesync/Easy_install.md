@@ -22,7 +22,7 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 | --- | --- |
 | `install.py` | Maya 用インストーラー |
 | `maya_live_sync.py` | Maya 本体（必須） |
-| `sp_live_sync_plugin.py` | Substance Painter 本体（必須） |
+| `sp_live_sync_plugin/` | Substance Painter 本体（必須。フォルダーごと） |
 | `sp_to_aiStandardSurface.py` | aiSS（テクスチャ自動割り当て機能）本体（任意） |
 | `udim_setup.py` | UDIM自動セットアップ機能本体（任意） |
 | `udim_setup_icon.png` | UDIM機能のシェルフアイコン（任意、無くても動作します） |
@@ -71,15 +71,22 @@ Substance Painter で塗った内容を、Maya にリアルタイム反映する
 
 ---
 
-## ② Substance Painter 側（ファイルを1つ置くだけ）
+## ② Substance Painter 側（フォルダーを置く）
 
 1. Substance Painter を起動します。
 2. 上部メニュー **Python > Plugins Folder** をクリックします（フォルダが開きます）。
-3. 開いたフォルダに **`sp_live_sync_plugin.py`** をコピーします。
-4. Substance Painter を**一度再起動**します。
-5. 上部メニュー **Python > sp_live_sync_plugin** に**チェック**を入れて有効化します。
-6. 初回だけ**セットアップウィザード**が自動で開きます。
+3. 開いたフォルダに **`sp_live_sync_plugin` フォルダーごと**コピーします。
+4. 以前の版の **`sp_live_sync_plugin.py`** が plugins フォルダーにあれば**削除**します。
+5. Substance Painter を**一度再起動**します。
+6. 上部メニュー **Python > `sp_live_sync_plugin`** に**チェック**を入れて有効化します（更新後にチェックが外れていたら入れ直します）。
+7. 初回だけ**セットアップウィザード**が自動で開きます。
    → **すべて既定値のまま「完了」まで進めてOK**です（Maya 側と自動で一致します）。
+
+戻し方: plugins フォルダーの `sp_live_sync_plugin` フォルダーを**削除してから**、
+以前の `sp_live_sync_plugin.py` を置く
+（フォルダーが残っているとフォルダー側が優先され、元に戻らない）。
+
+起動時の作業フォルダーに同名のファイルやフォルダーがあると、そちらが優先されます。
 
 パネルを開くと、一番上に太字の **「Live Sync を有効にする」** というチェックボックスがあります。これをONにすると同期が始まります。
 

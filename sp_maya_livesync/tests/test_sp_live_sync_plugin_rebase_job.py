@@ -22,6 +22,7 @@ for _p in (_PKG, _TESTS):
 from test_sp_live_sync_plugin_protocol import (  # noqa: E402
     plugin, ProjectError, _arm_export, _status_file,
 )
+from plugin_source import plugin_source_text  # noqa: E402
 
 pytest_plugins = ["test_sp_live_sync_plugin_protocol"]
 import uvremap_rebase as rb  # noqa: E402
@@ -1088,7 +1089,7 @@ def test_engine_wiring_and_shutdown(engine, monkeypatch):
     engine.enabled = False
     engine.on_texture_state(types.SimpleNamespace(action=plugin.event.TextureStateEventAction.ADD, stack_id=1))
     assert engine._last_texture_event_at is not None
-    assert plugin.__version__ == "1.4.1"
+    assert plugin.__version__ == "1.4.2"
     src = inspect.getsource(plugin.LiveSyncPanel)
     assert "rebase" not in src
     engine.shutdown()
@@ -1136,7 +1137,7 @@ def test_shutdown_safety(tmp_path, engine):
     engine._resume_safe_export_after_busy(True, None, False, None)
     assert engine._last_export_attempt.executed is False
     engine._shutting_down = False
-    tree = ast.parse(inspect.getsource(plugin))
+    tree = ast.parse(plugin_source_text())
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1194,8 +1195,7 @@ def test_coexist_with_settings_ui(engine, isolated, monkeypatch):
 
 
 def test_no_lambda_connect_or_new_threads():
-    path = os.path.join(_PKG, "sp_live_sync_plugin.py")
-    tree = ast.parse(open(path, encoding="utf-8").read())
+    tree = ast.parse(plugin_source_text())
     banned = {"threading", "atexit", "subprocess"}
     imported = set()
     for node in ast.walk(tree):

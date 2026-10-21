@@ -24,6 +24,7 @@ for _p in (_PKG, _TESTS):
         sys.path.insert(0, _p)
 
 from test_sp_live_sync_plugin_protocol import plugin  # noqa: E402
+from plugin_source import plugin_source_text  # noqa: E402
 import uvremap_rebase as rb  # noqa: E402
 
 RID = "rb-20261019-053400-3fa2"
@@ -175,7 +176,7 @@ def _settings(approval="ask", **over):
 # 1. import
 # ---------------------------------------------------------------------------
 def test_plugin_source_has_no_uvremap_import():
-    source = Path(plugin.__file__).read_text(encoding="utf-8")
+    source = plugin_source_text()
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -189,7 +190,7 @@ def test_plugin_source_has_no_uvremap_import():
 
 
 def test_plugin_imports_without_painter_or_qt_objects():
-    assert plugin.__version__ == "1.4.1"
+    assert plugin.__version__ == "1.4.2"
     assert callable(plugin.parse_rebase_request)
     assert callable(plugin.decide_approval)
 
