@@ -9,7 +9,7 @@ Substance 3D Painter 側プラグイン(SP Live Sync, B案:自前パイプライ
 # どの版か」を即座に確認できるようにする(maya_live_sync.py と同じ方式)。
 #
 # 変更履歴(日付入り)はリポジトリルートの CHANGELOG.md を参照。
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import os
 import re
@@ -706,7 +706,14 @@ def write_sync_flag(flag_path):
     os.replace(tmp_flag_path, flag_path)
 
 
-def publish_export_outputs(dest_root, result_obj, write_flag):
+def publish_export_outputs(
+    dest_root,
+    result_obj,
+    write_flag,
+    *,
+    rebase_root=None,
+    rebase_request_id=None,
+):
     """2026.10.18(1.3.0): 結果ファイルを先に書き、その後に印を書く。
 
     write_flag が偽のときは印を書かない(1件も移動していないとき等、
@@ -714,12 +721,31 @@ def publish_export_outputs(dest_root, result_obj, write_flag):
     止めない。印の失敗は呼び出し元へ伝える。
     """
     result_path = os.path.join(dest_root, SYNC_RESULT_NAME)
+    result_written = False
     try:
         write_json_atomic(result_path, result_obj)
+        result_written = True
     except Exception as exc:
         _log("error", "書き出し結果ファイルの保存に失敗しました(書き出し自体は続行します): {0}".format(exc))
+    if result_written and rebase_root and is_valid_rebase_request_id(rebase_request_id):
+        write_rebase_result_copy(rebase_root, rebase_request_id, result_obj)
     if write_flag:
         write_sync_flag(os.path.join(dest_root, SYNC_FLAG_NAME))
+    return result_written
+
+
+def write_rebase_result_copy(root, request_id, result_obj):
+    """リベース Final の結果を上書きされない依頼別ファイルへ原子的に保存する。"""
+    try:
+        path = rebase_result_path(root, request_id)
+        write_json_atomic(path, result_obj)
+        return True
+    except Exception as exc:
+        _log(
+            "warning",
+            "rebase: 結果の控えを書けませんでした(done は続行します): {0}".format(exc),
+        )
+        return False
 
 
 def _hash_file_hex(path, algorithm, chunk_size=_HASH_CHUNK_BYTES):
@@ -805,6 +831,7 @@ REBASE_SCHEMA = 1
 REBASE_DIRNAME = "rebase"
 REBASE_REQUESTS_DIRNAME = "requests"
 REBASE_STATUS_DIRNAME = "status"
+REBASE_RESULTS_DIRNAME = "results"
 REBASE_STATES = (
     "received",
     "awaiting_approval",
@@ -887,6 +914,7 @@ _REBASE_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _REBASE_STATE_SET = frozenset(REBASE_STATES)
 _REBASE_TERMINAL = frozenset(REBASE_TERMINAL_STATES)
 _REBASE_REASON_SET = frozenset(REBASE_REASONS)
+_REBASE_STATUS_REASON_SET = _REBASE_REASON_SET | frozenset(REBASE_APPROVAL_ONLY_REASONS)
 _REBASE_REQUEST_KEYS = (
     "schema",
     "request_id",
@@ -951,7 +979,9 @@ _PAINTER_STATE_KEYS = (
     "can_disable_auto_unwrap",
     "last_edit_age_s",
 )
-_REBASE_UV_FILLS_KEYS = ("enabled", "switched", "skipped", "failed", "rolled_back")
+_REBASE_UV_FILLS_KEYS = (
+    "enabled", "switched", "skipped", "failed", "rolled_back", "direction",
+)
 
 ApprovalDecision = namedtuple("ApprovalDecision", ["action", "reason"])
 RebaseScan = namedtuple("RebaseScan", ["requests", "cancels"])
@@ -1028,6 +1058,27 @@ REBASE_DONE_GUIDANCE = (
     "次を Painter で確認してください: 2D ビューのストローク、UV 投影のフィル、"
     "ベイク済みのメッシュマップ(再ベイクが必要な場合があります)。"
 )
+REBASE_DIRECTION_APPROVAL_NOTE = (
+    "法線を含む UV 投影のフィルは、UV を回転・反転すると陰影が狂うことがあります。"
+)
+REBASE_DIRECTION_WARNING_FMT = (
+    "法線(または異方性の角度)を含む UV 投影のフィルが {n} 件あります"
+    "({names})。UV を回転・反転した島では陰影が狂うことがあります。"
+    "3D ビューで確認し、必要なら法線を描き直すか再ベイクしてください。"
+)
+REBASE_WAIT_MESSAGES = {
+    "unsaved_changes": (
+        "Painter に未保存の変更があります。"
+        "Painter でプロジェクトを保存すると確認画面が出ます"
+    ),
+    "busy": "Painter が処理中です。終わるまで待っています",
+    "no_project": "Painter で対象のプロジェクトを開いてください",
+    "project_mismatch": (
+        "Painter で開いているプロジェクトが依頼と違います。"
+        "対象のプロジェクトを開いてください"
+    ),
+    "recent_edit": "Painter での編集が落ち着くのを待っています",
+}
 REBASE_BUTTON_RUN = "実行する"
 REBASE_BUTTON_CANCEL = "やめる"
 
@@ -1141,6 +1192,10 @@ def rebase_status_dir(root):
     return os.path.join(str(root), REBASE_DIRNAME, REBASE_STATUS_DIRNAME)
 
 
+def rebase_results_dir(root):
+    return os.path.join(str(root), REBASE_DIRNAME, REBASE_RESULTS_DIRNAME)
+
+
 def rebase_request_path(root, rid):
     rid = _checked_rebase_request_id(rid)
     return os.path.join(rebase_requests_dir(root), rid + ".json")
@@ -1154,6 +1209,11 @@ def rebase_cancel_path(root, rid):
 def rebase_status_path(root, rid):
     rid = _checked_rebase_request_id(rid)
     return os.path.join(rebase_status_dir(root), rid + ".json")
+
+
+def rebase_result_path(root, rid):
+    rid = _checked_rebase_request_id(rid)
+    return os.path.join(rebase_results_dir(root), rid + ".json")
 
 
 # --- 3.2 設定の丸め(R-6) ---
@@ -1511,6 +1571,7 @@ def _normalize_uv_fills(value):
     skipped = 0
     failed = 0
     rolled_back = 0
+    direction = 0
     if isinstance(value, dict):
         raw_enabled = value.get("enabled", False)
         enabled = raw_enabled if isinstance(raw_enabled, bool) else False
@@ -1524,12 +1585,14 @@ def _normalize_uv_fills(value):
         skipped = _as_int(value.get("skipped", 0))
         failed = _as_int(value.get("failed", 0))
         rolled_back = _as_int(value.get("rolled_back", 0))
+        direction = _as_int(value.get("direction", 0))
     return {
         "enabled": enabled,
         "switched": switched,
         "skipped": skipped,
         "failed": failed,
         "rolled_back": rolled_back,
+        "direction": direction,
     }
 
 
@@ -1552,7 +1615,7 @@ def build_rebase_status(
     if not isinstance(state, str) or state not in _REBASE_STATE_SET:
         raise ValueError("state が不正です")
     if reason is not None and (
-            not isinstance(reason, str) or reason not in _REBASE_REASON_SET):
+            not isinstance(reason, str) or reason not in _REBASE_STATUS_REASON_SET):
         raise ValueError("reason が不正です")
     if not _rebase_is_finite_number(now):
         raise ValueError("updated_at が不正です")
@@ -2070,6 +2133,7 @@ def build_rebase_approval_text(
     can_disable_auto_unwrap=True,
     backup_includes_unsaved=False,
     uv_fill_reproject=False,
+    has_direction_fills=False,
 ):
     """確認ダイアログの本文。注意文と運用案内は常に入れる。uv_old は見ない。"""
     parts = [REBASE_CONFIRM_LEAD]
@@ -2083,11 +2147,20 @@ def build_rebase_approval_text(
     caution = REBASE_CAUTION_TEXT_REPROJECT if uv_fill_reproject else REBASE_CAUTION_TEXT
     parts.append(caution.format(backup_dir=backup_dir))
     parts.append(REBASE_WORKFLOW_GUIDANCE)
+    if has_direction_fills:
+        parts.append(REBASE_DIRECTION_APPROVAL_NOTE)
     if needs_saving and backup_includes_unsaved:
         parts.append(REBASE_UNSAVED_NOTE)
     if not can_disable_auto_unwrap:
         parts.append(REBASE_AUTO_UNWRAP_NOTE)
     return "\n".join(parts)
+
+
+def rebase_wait_message(reason):
+    """待機理由に対応する利用者向け文言。未知の理由は空文字。"""
+    if not isinstance(reason, str):
+        return ""
+    return REBASE_WAIT_MESSAGES.get(reason, "")
 
 
 def _current_project_key():
@@ -2274,7 +2347,12 @@ def get_uv_old_name(request):
 
 UvFillApi = namedtuple(
     "UvFillApi",
-    ["get_root_layer_nodes", "ProjectionMode", "UVSetToUVSetProjectionParams"],
+    [
+        "get_root_layer_nodes",
+        "ProjectionMode",
+        "UVSetToUVSetProjectionParams",
+        "direction_channel_types",
+    ],
 )
 
 
@@ -2289,7 +2367,23 @@ def make_uv_fill_api(layerstack_module):
         return None
     if not hasattr(mode, "UV") or not hasattr(mode, "UVSetToUVSet"):
         return None
-    return UvFillApi(get_roots, mode, params_cls)
+    # 要実機確認: Painter 12.1.5 の列挙名は ChannelType.Normal /
+    # ChannelType.AnisotropyAngle を想定する。Normal を取得できない場合は
+    # 安全側で「方向チャンネル不明」として、チャンネルを持つフィルを数える。
+    direction_types = None
+    try:
+        channel_type = getattr(layerstack_module, "ChannelType", None)
+        if channel_type is None:
+            channel_type = getattr(textureset, "ChannelType")
+        normal = getattr(channel_type, "Normal")
+        direction_types = [normal]
+        anisotropy = getattr(channel_type, "AnisotropyAngle", None)
+        if anisotropy is not None:
+            direction_types.append(anisotropy)
+        direction_types = tuple(direction_types)
+    except Exception:
+        direction_types = None
+    return UvFillApi(get_roots, mode, params_cls, direction_types)
 
 
 def node_type_token(node):
@@ -2315,6 +2409,81 @@ def _safe_call(obj, name, *args, **kwargs):
         return fn(*args, **kwargs)
     except Exception:
         return None
+
+
+def uv_fill_has_direction_channel(active_channels, normal_types):
+    """active_channels が法線・異方性角度を含むか。列挙不明時は安全側で真。"""
+    if normal_types is None:
+        return True
+    try:
+        channels = list(active_channels or [])
+        direction_types = tuple(normal_types)
+    except (TypeError, ValueError):
+        return True
+    for channel in channels:
+        for direction_type in direction_types:
+            try:
+                if channel == direction_type:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _uv_fill_direction_state(node, normal_types):
+    """戻りは (チャンネルを持つ対象か, 方向チャンネルありか)。失敗は不明=あり。"""
+    try:
+        active_channels = getattr(node, "active_channels")
+    except AttributeError:
+        # マスク内のフィルエフェクトなど、チャンネルを持たないものは対象外。
+        return False, False
+    except Exception:
+        return True, True
+    if callable(active_channels):
+        try:
+            active_channels = active_channels()
+        except Exception:
+            return True, True
+    return True, uv_fill_has_direction_channel(active_channels, normal_types)
+
+
+def _direction_fill_name(node):
+    try:
+        name = node.get_name()
+    except Exception:
+        name = None
+    if not isinstance(name, str) or not name:
+        return "名前不明"
+    return name[:64]
+
+
+def inspect_direction_uv_fills(api, texture_sets):
+    """現在 UV 投影のフィルにある方向チャンネルを数える。ダイアログ直前用。"""
+    count = 0
+    names = []
+    if api is None:
+        return count, names
+    for ts in texture_sets or []:
+        for stack in _iter_texture_set_stacks(ts):
+            walk = {"paint_layers": 0, "groups_unreadable": 0}
+            try:
+                roots = api.get_root_layer_nodes(stack)
+            except Exception:
+                continue
+            for node in iter_uv_fill_nodes(roots, walk):
+                try:
+                    if node.get_projection_mode() != api.ProjectionMode.UV:
+                        continue
+                except Exception:
+                    continue
+                candidate, has_direction = _uv_fill_direction_state(
+                    node, api.direction_channel_types)
+                if not candidate or not has_direction:
+                    continue
+                count += 1
+                if len(names) < 10:
+                    names.append(_direction_fill_name(node))
+    return count, names
 
 
 def _iter_named_children(node, names):
@@ -2528,6 +2697,8 @@ class UvFillStackReport(object):
         self.needs_manual_check = False
         self.missing_attrs = []
         self.switched_names = []
+        self.direction_fills = 0
+        self.direction_fill_names = []
 
 
 def _remember_missing_attrs(report, detail):
@@ -2558,6 +2729,8 @@ def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
     for node in iter_uv_fill_nodes(roots, walk):
         report.visited += 1
         report.uv_fills_found += 1
+        direction_candidate, has_direction = _uv_fill_direction_state(
+            node, api.direction_channel_types)
         result, detail = switch_uv_fill_node(node, api, source_uv_set)
         _remember_missing_attrs(report, detail)
         if result == "switched":
@@ -2570,6 +2743,10 @@ def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
                 applied.append((node, {}))
             if isinstance(name, str) and name:
                 report.switched_names.append(name)
+            if direction_candidate and has_direction:
+                report.direction_fills += 1
+                if len(report.direction_fill_names) < 10:
+                    report.direction_fill_names.append(_direction_fill_name(node))
         elif result == "skipped":
             report.skipped_not_uv += 1
         else:
@@ -2586,6 +2763,8 @@ def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
                 report.needs_manual_check = True
         report.switched = 0
         report.switched_names = []
+        report.direction_fills = 0
+        report.direction_fill_names = []
     return report
 
 
@@ -2600,6 +2779,8 @@ class UvFillSummary(object):
         self.rolled_back = 0
         self.needs_manual_check = False
         self.missing_attrs = []
+        self.direction_fills = 0
+        self.direction_fill_names = []
 
     def to_status_dict(self):
         return {
@@ -2608,6 +2789,7 @@ class UvFillSummary(object):
             "skipped": int(self.skipped),
             "failed": int(self.failed),
             "rolled_back": int(self.rolled_back),
+            "direction": int(self.direction_fills),
         }
 
     def to_message(self):
@@ -2625,6 +2807,10 @@ class UvFillSummary(object):
             parts.append("ロールバック {0} 件".format(self.rolled_back))
         if self.needs_manual_check or self.missing_attrs:
             parts.append("一部は目視確認が必要です")
+        if self.direction_fills >= 1:
+            names = ", ".join(self.direction_fill_names) or "名前不明"
+            parts.append(REBASE_DIRECTION_WARNING_FMT.format(
+                n=self.direction_fills, names=names))
         cleaned = []
         for part in parts:
             if not isinstance(part, str) or part == "":
@@ -2716,6 +2902,7 @@ def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_
             "skipped_not_uv": 0,
             "failed": 0,
             "rolled_back": 0,
+            "direction": 0,
         }
         for stack in _iter_texture_set_stacks(ts):
             report = switch_uv_fills_in_stack(stack, api, name, uv_old_index)
@@ -2724,10 +2911,16 @@ def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_
             counts["skipped_not_uv"] += report.skipped_not_uv
             counts["failed"] += report.failed
             counts["rolled_back"] += report.rolled_back
+            counts["direction"] += report.direction_fills
             summary.switched += report.switched
             summary.skipped += report.skipped_not_uv
             summary.failed += report.failed
             summary.rolled_back += report.rolled_back
+            summary.direction_fills += report.direction_fills
+            for fill_name in report.direction_fill_names:
+                if len(summary.direction_fill_names) >= 10:
+                    break
+                summary.direction_fill_names.append(fill_name[:64])
             if report.needs_manual_check:
                 summary.needs_manual_check = True
             for attr in report.missing_attrs:
@@ -2960,6 +3153,10 @@ class RebaseJob(object):
             backup_name=self.backup_name,
         )
         self.reporter.log(REBASE_DONE_GUIDANCE)
+        if self.uv_fills is not None and self.uv_fills.direction_fills >= 1:
+            names = ", ".join(self.uv_fills.direction_fill_names) or "名前不明"
+            self.reporter.log(REBASE_DIRECTION_WARNING_FMT.format(
+                n=self.uv_fills.direction_fills, names=names))
         self.finished = True
         self.outcome = "done"
         self.reporter.finished("done")
@@ -3689,6 +3886,15 @@ class RebaseCoordinator(object):
         if prev_reason != reason:
             self._last_wait_reason[rid] = reason
             self._emit("rebase 待機: {0}".format(reason))
+            if current == "received":
+                self._write_once(
+                    root,
+                    rid,
+                    "received",
+                    now,
+                    reason=reason,
+                    message=rebase_wait_message(reason),
+                )
         if wait_timed_out(entry.get("first_wait_at"), now, self._settings):
             if current in ("received", "awaiting_approval"):
                 self._finish_request(
@@ -3810,6 +4016,22 @@ class RebaseCoordinator(object):
         uv_fill_reproject = bool(
             (self._settings or {}).get("rebase_reproject_uv_fills")
         ) and get_uv_old_index(request) is not None
+        has_direction_fills = False
+        # 要実機確認: レイヤー数百のプロジェクトで、この直前 1 回だけ行う
+        # 全スタック列挙にかかる時間を確認する。失敗してもダイアログは出す。
+        try:
+            ctx = self.api.uv_fill_context()
+            fill_api = ctx.get("api") if isinstance(ctx, dict) else ctx[0]
+            texture_sets = (
+                ctx.get("texture_sets") or []
+                if isinstance(ctx, dict)
+                else (ctx[1] or [] if len(ctx) > 1 else [])
+            )
+            direction_count, _direction_names = inspect_direction_uv_fills(
+                fill_api, texture_sets)
+            has_direction_fills = direction_count >= 1
+        except Exception:
+            has_direction_fills = False
         text = build_rebase_approval_text(
             request,
             backup_dir=backup_dir,
@@ -3818,6 +4040,7 @@ class RebaseCoordinator(object):
                 painter_state.get("can_disable_auto_unwrap")),
             backup_includes_unsaved=BACKUP_INCLUDES_UNSAVED,
             uv_fill_reproject=uv_fill_reproject,
+            has_direction_fills=has_direction_fills,
         )
         self._dialog_action = None
         self._dialog_rid = rid
@@ -5230,7 +5453,20 @@ class LiveSyncEngine(QtCore.QObject):
                 "export_id": result_obj.get("export_id"),
                 "message": result_obj.get("message") or "",
             }
-            publish_export_outputs(dest_root, result_obj, write_flag)
+            rebase_root = None
+            if (
+                not preview
+                and result_obj.get("ok") is True
+                and is_valid_rebase_request_id(export_request_id)
+            ):
+                rebase_root = resolve_uvremap_root(cfg, subfolder)
+            publish_export_outputs(
+                dest_root,
+                result_obj,
+                write_flag,
+                rebase_root=rebase_root,
+                rebase_request_id=export_request_id,
+            )
             published = True
             ok = bool(result_obj.get("ok"))
             self._emit_export_outcome(

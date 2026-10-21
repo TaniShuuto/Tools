@@ -236,7 +236,7 @@ def test_is_valid_request_id(value, ok):
 ])
 def test_path_rejects_unsafe_request_id(tmp_path, bad):
     before = list(tmp_path.rglob("*"))
-    for fn in (rb.request_path, rb.cancel_path, rb.status_path):
+    for fn in (rb.request_path, rb.cancel_path, rb.status_path, rb.result_path):
         with pytest.raises(ValueError):
             fn(tmp_path, bad)
     assert list(tmp_path.rglob("*")) == before
@@ -246,17 +246,20 @@ def test_paths_stay_inside_rebase_dirs(tmp_path):
     request = rb.request_path(tmp_path, RID)
     cancel = rb.cancel_path(tmp_path, RID)
     status = rb.status_path(tmp_path, RID)
+    result = rb.result_path(tmp_path, RID)
     root = tmp_path.resolve()
     assert isinstance(request, Path)
     assert rb.rebase_dir(tmp_path) == tmp_path / "rebase"
     assert rb.requests_dir(tmp_path) == tmp_path / "rebase" / "requests"
     assert rb.status_dir(tmp_path) == tmp_path / "rebase" / "status"
+    assert rb.results_dir(tmp_path) == tmp_path / "rebase" / "results"
     assert request == tmp_path / "rebase" / "requests" / (RID + ".json")
     assert cancel == tmp_path / "rebase" / "requests" / (RID + ".cancel")
     assert status == tmp_path / "rebase" / "status" / (RID + ".json")
+    assert result == tmp_path / "rebase" / "results" / (RID + ".json")
     sub = tmp_path / "final" / "body"
     assert rb.sync_result_path(sub) == sub / "_sync_result.json"
-    for path in (request, cancel, status):
+    for path in (request, cancel, status, result):
         assert path.resolve().is_relative_to(root)
         assert ".." not in path.parts
 
@@ -880,6 +883,19 @@ def test_decide_display_for_each_state(state):
     assert shown.show_done_guidance is (state == "done")
 
 
+@pytest.mark.parametrize("state", ["received", "awaiting_approval"])
+def test_decide_display_prefers_wait_message(state):
+    request = _build(created_at=1000, ttl_s=1800)
+    shown = rb.decide_display(
+        request,
+        _status(state, message="Painter で保存してください"),
+        now=1000,
+        cancel_requested=False,
+    )
+    assert shown.text == "Painter で保存してください"
+    assert shown.can_cancel is True
+
+
 @pytest.mark.parametrize("state", ["received", "awaiting_approval", "preparing"])
 def test_decide_display_canceling_while_cancelable(state):
     request = _build(created_at=1000, ttl_s=1800)
@@ -1153,6 +1169,19 @@ def test_read_sync_result_broken_file_is_none(tmp_path):
     assert parsed["request_id"] is None
 
 
+def test_read_rebase_result_parses_and_requires_matching_request_id(tmp_path):
+    path = rb.result_path(tmp_path, RID)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_sync(RID)), encoding="utf-8")
+    parsed = rb.read_rebase_result(tmp_path, RID)
+    assert parsed is not None
+    assert parsed["request_id"] == RID
+    path.write_text(json.dumps(_sync(_rid(9))), encoding="utf-8")
+    assert rb.read_rebase_result(tmp_path, RID) is None
+    path.write_text("{", encoding="utf-8")
+    assert rb.read_rebase_result(tmp_path, RID) is None
+
+
 # ---------------------------------------------------------------------------
 # 12. 設定の丸め
 # ---------------------------------------------------------------------------
@@ -1242,6 +1271,9 @@ def test_cleanup_keeps_fresh_open_and_unreadable_files(tmp_path):
     _put_request(tmp_path, old, created_at=now - age - 100, ttl_s=60)
     _put_status(tmp_path, old, "failed", now - age)
     rb.write_cancel(tmp_path, old)
+    old_result = rb.result_path(tmp_path, old)
+    old_result.parent.mkdir(parents=True, exist_ok=True)
+    old_result.write_text(json.dumps(_sync(old)), encoding="utf-8")
 
     busy = _rid(3)
     _put_request(tmp_path, busy, created_at=1, ttl_s=60)
@@ -1284,6 +1316,7 @@ def test_cleanup_keeps_fresh_open_and_unreadable_files(tmp_path):
     assert not rb.request_path(tmp_path, old).exists()
     assert not rb.cancel_path(tmp_path, old).exists()
     assert not rb.status_path(tmp_path, old).exists()
+    assert not old_result.exists()
     assert not rb.request_path(tmp_path, expired).exists()
     assert not rb.cancel_path(tmp_path, expired).exists()
     assert mesh.read_bytes() == b"MESH"

@@ -30,6 +30,7 @@ __all__ = (
     "REBASE_DIRNAME",
     "REQUESTS_DIRNAME",
     "STATUS_DIRNAME",
+    "RESULTS_DIRNAME",
     "MESHES_DIRNAME",
     "STATES",
     "TERMINAL_STATES",
@@ -76,9 +77,11 @@ __all__ = (
     "rebase_dir",
     "requests_dir",
     "status_dir",
+    "results_dir",
     "request_path",
     "cancel_path",
     "status_path",
+    "result_path",
     "sync_result_path",
     "normalize_rebase_settings",
     "build_request",
@@ -92,6 +95,7 @@ __all__ = (
     "read_status",
     "parse_sync_result",
     "read_sync_result",
+    "read_rebase_result",
     "parse_version",
     "plugin_supports_rebase",
     "decide_display",
@@ -107,6 +111,7 @@ SCHEMA = 1
 REBASE_DIRNAME = "rebase"
 REQUESTS_DIRNAME = "requests"
 STATUS_DIRNAME = "status"
+RESULTS_DIRNAME = "results"
 MESHES_DIRNAME = "meshes"
 _REQUEST_EXT = ".json"
 _CANCEL_EXT = ".cancel"
@@ -485,6 +490,10 @@ def status_dir(root) -> Path:
     return rebase_dir(root) / STATUS_DIRNAME
 
 
+def results_dir(root) -> Path:
+    return rebase_dir(root) / RESULTS_DIRNAME
+
+
 def request_path(root, request_id) -> Path:
     rid = _checked_request_id(request_id)
     return requests_dir(root) / "{0}{1}".format(rid, _REQUEST_EXT)
@@ -498,6 +507,11 @@ def cancel_path(root, request_id) -> Path:
 def status_path(root, request_id) -> Path:
     rid = _checked_request_id(request_id)
     return status_dir(root) / "{0}{1}".format(rid, _REQUEST_EXT)
+
+
+def result_path(root, request_id) -> Path:
+    rid = _checked_request_id(request_id)
+    return results_dir(root) / "{0}{1}".format(rid, _REQUEST_EXT)
 
 
 def sync_result_path(final_subfolder_dir) -> Path:
@@ -903,6 +917,19 @@ def read_sync_result(final_subfolder_dir) -> dict | None:
     return parse_sync_result(raw)
 
 
+def read_rebase_result(root, request_id) -> dict | None:
+    """依頼別の結果控えを読み、通常の同期結果と同じ契約で検査する。"""
+    if not is_valid_request_id(request_id):
+        return None
+    raw = _read_json_safe(result_path(root, request_id))
+    if raw is None:
+        return None
+    parsed = parse_sync_result(raw)
+    if parsed is None or parsed.get("request_id") != request_id:
+        return None
+    return parsed
+
+
 def parse_version(text) -> tuple[int, ...] | None:
     """``1.3.0`` を ``(1, 3, 0)`` にする。``1.4.0-beta`` は数字の部分だけ。
 
@@ -992,6 +1019,10 @@ def _display_for_state(state, status) -> RebaseDisplay:
         text = _failed_text(status)
     elif state == "rejected":
         text = _rejected_text(status)
+    elif state in ("received", "awaiting_approval"):
+        # 要実機確認: Painter の待機対処文が Maya のリベース表示へ反映されること。
+        text = _clip_message(status.get("message")) or _STATE_TEXT.get(
+            state, MSG_STATUS_UNREADABLE)
     else:
         text = _STATE_TEXT.get(state, MSG_STATUS_UNREADABLE)
     phase = _STATE_PHASE.get(state, "unreadable")
@@ -1211,7 +1242,7 @@ def _cleanup_rows(root, now) -> list[dict]:
 
 
 def _remove_terminal_files(root, request_id, remove_fn) -> bool:
-    """読めた依頼 JSON、.cancel、読めた状態 JSON を消す。読めないファイルは残す。"""
+    """読めた依頼・状態・結果 JSON と .cancel を消す。読めない JSON は残す。"""
     deleted = False
     if read_request(root, request_id) is not None:
         deleted = _try_remove(request_path(root, request_id), remove_fn) or deleted
@@ -1219,6 +1250,8 @@ def _remove_terminal_files(root, request_id, remove_fn) -> bool:
     status_read = read_status(root, request_id)
     if status_read.kind == "ok":
         deleted = _try_remove(status_path(root, request_id), remove_fn) or deleted
+    if read_rebase_result(root, request_id) is not None:
+        deleted = _try_remove(result_path(root, request_id), remove_fn) or deleted
     return deleted
 
 

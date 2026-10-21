@@ -249,6 +249,15 @@ def _put_result(ctrl, request_id, **over):
     (ctrl._final / "_sync_result.json").write_text(json.dumps(body), encoding="utf-8")
 
 
+def _put_rebase_result(ctrl, request_id, **over):
+    body = _sync_body()
+    body["request_id"] = request_id
+    body.update(over)
+    path = rb.result_path(ctrl._work, request_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+
 def test_send_order_uses_utc_and_candidate_id(tmp_path, monkeypatch):
     ctrl = _make(tmp_path)
     real_write = rb.write_request
@@ -541,6 +550,28 @@ def test_done_completes_once_and_guides_once(tmp_path):
     assert sum(1 for _s, text in ctrl._history if text == rb.MSG_DONE_GUIDANCE) == 1
     assert second["message"] == ""
     assert ctrl.rebase_view()["text"] == rb.MSG_DONE_GUIDANCE
+
+
+def test_done_prefers_rebase_result_when_shared_result_was_overwritten(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    rid = sent["request_id"]
+    _put_status(ctrl, rid, "done")
+    _put_rebase_result(ctrl, rid)
+    _put_result(ctrl, None)
+    shown = ctrl.rebase_tick(100.0)
+    assert _kinds(ctrl).count("complete") == 1
+    assert shown["message"] == rb.MSG_DONE_GUIDANCE
+
+
+def test_done_without_rebase_result_uses_legacy_shared_result(tmp_path):
+    ctrl = _make(tmp_path)
+    sent = ctrl.rebase_send()
+    rid = sent["request_id"]
+    _arm_done(ctrl, rid)
+    assert not rb.result_path(ctrl._work, rid).exists()
+    ctrl.rebase_tick(100.0)
+    assert _kinds(ctrl).count("complete") == 1
 
 
 @pytest.mark.parametrize("over,reason_file", [

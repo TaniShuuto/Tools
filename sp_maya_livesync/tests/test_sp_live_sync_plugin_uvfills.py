@@ -24,6 +24,12 @@ class Mode(object):
     Triplanar = "Triplanar"
 
 
+class ChannelType(object):
+    Normal = "Normal"
+    AnisotropyAngle = "AnisotropyAngle"
+    BaseColor = "BaseColor"
+
+
 class UVProjectionParams(object):
     def __init__(self):
         self.filtering_mode = "bilinear"
@@ -46,7 +52,8 @@ class PartialUVSetParams(object):
 
 class FakeNode(object):
     def __init__(self, type_name, mode=None, params=None, name="node", children=None,
-                 mask_effects=None, content_effects=None, has_mask=False):
+                 mask_effects=None, content_effects=None, has_mask=False,
+                 active_channels_marker=None):
         self._type = type_name
         self.mode = mode
         self.params = params or UVProjectionParams()
@@ -58,6 +65,8 @@ class FakeNode(object):
         self.set_calls = []
         self.fail_set_params = False
         self.fail_rollback = False
+        if active_channels_marker is not None:
+            self.active_channels = active_channels_marker
 
     def get_type(self):
         return self._type
@@ -121,6 +130,7 @@ class LayerstackFake(object):
     def __init__(self, roots, params_cls=UVSetToUVSetProjectionParams):
         self._roots = roots
         self.ProjectionMode = Mode
+        self.ChannelType = ChannelType
         self.UVSetToUVSetProjectionParams = params_cls
 
     def get_root_layer_nodes(self, stack):
@@ -313,6 +323,66 @@ def test_summary_status_and_message():
     message = summary.to_message()
     assert len(message) <= 500
     assert "切り替え" in message
+
+
+def test_direction_channel_pure_detection_and_reporting():
+    assert plugin.uv_fill_has_direction_channel(
+        [ChannelType.Normal], (ChannelType.Normal, ChannelType.AnisotropyAngle))
+    assert plugin.uv_fill_has_direction_channel(
+        [ChannelType.AnisotropyAngle],
+        (ChannelType.Normal, ChannelType.AnisotropyAngle),
+    )
+    assert not plugin.uv_fill_has_direction_channel(
+        [ChannelType.BaseColor],
+        (ChannelType.Normal, ChannelType.AnisotropyAngle),
+    )
+    assert plugin.uv_fill_has_direction_channel([ChannelType.BaseColor], None)
+
+    normal = FakeNode(
+        "FillLayerNode",
+        Mode.UV,
+        name="N" * 80,
+        active_channels_marker=[ChannelType.Normal],
+    )
+    color = FakeNode(
+        "FillLayerNode",
+        Mode.UV,
+        name="color",
+        active_channels_marker=[ChannelType.BaseColor],
+    )
+    mask = FakeNode("FillEffect", Mode.UV, name="mask-without-channels")
+    api = _api([normal, color, mask])
+    report = plugin.switch_uv_fills_in_stack("stack", api, "Body", 1)
+    assert report.direction_fills == 1
+    assert report.direction_fill_names == ["N" * 64]
+
+    current_normal = FakeNode(
+        "FillLayerNode",
+        Mode.UV,
+        name="current-normal",
+        active_channels_marker=[ChannelType.Normal],
+    )
+    inspect_api = _api([current_normal, mask])
+    count, names = plugin.inspect_direction_uv_fills(
+        inspect_api, [TextureSetFake("Body", ["stack"])])
+    assert (count, names) == (1, ["current-normal"])
+
+
+def test_direction_summary_is_in_status_message_and_approval():
+    summary = plugin.UvFillSummary()
+    summary.enabled = True
+    summary.direction_fills = 2
+    summary.direction_fill_names = ["Normal A", "Normal B"]
+    status = summary.to_status_dict()
+    assert status["direction"] == 2
+    assert plugin.REBASE_DIRECTION_WARNING_FMT.format(
+        n=2, names="Normal A, Normal B") in summary.to_message()
+    text = plugin.build_rebase_approval_text(
+        {"ts_names": ["Body"]},
+        backup_dir="backup",
+        has_direction_fills=True,
+    )
+    assert plugin.REBASE_DIRECTION_APPROVAL_NOTE in text
 
 
 class _RecycleNode(object):
