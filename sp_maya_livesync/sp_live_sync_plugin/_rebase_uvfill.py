@@ -17,6 +17,12 @@ __all__ = [
     "uv_fill_has_direction_channel",
     "_uv_fill_direction_state",
     "_direction_fill_name",
+    "_read_source_uv_set",
+    "_empty_uv_fill_approval",
+    "_prior_scan_limit_reached",
+    "_append_capped_fill_name",
+    "UvFillApproval",
+    "inspect_uv_fills_for_approval",
     "inspect_direction_uv_fills",
     "_iter_named_children",
     "_node_has_projection_api",
@@ -126,12 +132,78 @@ def _direction_fill_name(node):
     return name[:64]
 
 
-def inspect_direction_uv_fills(api, texture_sets):
-    """現在 UV 投影のフィルにある方向チャンネルを数える。ダイアログ直前用。"""
-    count = 0
-    names = []
+def _read_source_uv_set(node):
+    """(読めたか, 番号)。整数でない・例外・属性が無いときは (False, None)。"""
+    try:
+        params = node.get_projection_parameters()
+    except Exception:
+        return False, None
+    if params is None:
+        return False, None
+    try:
+        source = getattr(params, "source_uv_set")
+    except Exception:
+        return False, None
+    if isinstance(source, bool) or not isinstance(source, int):
+        return False, None
+    return True, source
+
+
+UvFillApproval = namedtuple(
+    "UvFillApproval",
+    [
+        "direction_count",
+        "direction_names",
+        "prior_count",
+        "prior_unknown",
+        "prior_names",
+    ],
+)
+
+
+def _empty_uv_fill_approval():
+    return UvFillApproval(0, [], 0, 0, [])
+
+
+def _prior_scan_limit_reached(stop_after, total):
+    """stop_after が bool 以外の int で、prior の合計がそこに達したら真。"""
+    if isinstance(stop_after, bool) or not isinstance(stop_after, int):
+        return False
+    return total >= stop_after
+
+
+def _append_capped_fill_name(names, node):
+    if len(names) < 10:
+        names.append(_direction_fill_name(node))
+
+
+def inspect_uv_fills_for_approval(api, texture_sets, uv_old_index, *, stop_after=None):
+    """方向チャンネルと、前回切り替えた UV 投影フィルを 1 回の走査で数える。
+
+    prior_count は UVSetToUVSet かつ source_uv_set が uv_old_index と一致する数。
+    prior_unknown は UVSetToUVSet だが source_uv_set を読めない数。
+    uv_old_index が None のとき prior_* は 0 / 空。
+    stop_after が int のとき、prior_count + prior_unknown がそこに達したら打ち切る。
+    """
+    direction_count = 0
+    direction_names = []
+    prior_count = 0
+    prior_unknown = 0
+    prior_names = []
     if api is None:
-        return count, names
+        return _empty_uv_fill_approval()
+    uvset_mode = getattr(api.ProjectionMode, "UVSetToUVSet", None)
+    count_prior = uv_old_index is not None and uvset_mode is not None
+
+    def _pack():
+        return UvFillApproval(
+            direction_count,
+            direction_names,
+            prior_count,
+            prior_unknown,
+            prior_names,
+        )
+
     for ts in texture_sets or []:
         for stack in _iter_texture_set_stacks(ts):
             walk = {"paint_layers": 0, "groups_unreadable": 0}
@@ -140,19 +212,34 @@ def inspect_direction_uv_fills(api, texture_sets):
             except Exception:
                 continue
             for node in iter_uv_fill_nodes(roots, walk):
+                if _prior_scan_limit_reached(
+                        stop_after, prior_count + prior_unknown):
+                    return _pack()
                 try:
-                    if node.get_projection_mode() != api.ProjectionMode.UV:
-                        continue
+                    mode = node.get_projection_mode()
                 except Exception:
                     continue
-                candidate, has_direction = _uv_fill_direction_state(
-                    node, api.direction_channel_types)
-                if not candidate or not has_direction:
-                    continue
-                count += 1
-                if len(names) < 10:
-                    names.append(_direction_fill_name(node))
-    return count, names
+                if mode == api.ProjectionMode.UV:
+                    candidate, has_direction = _uv_fill_direction_state(
+                        node, api.direction_channel_types)
+                    if candidate and has_direction:
+                        direction_count += 1
+                        _append_capped_fill_name(direction_names, node)
+                elif count_prior and mode == uvset_mode:
+                    readable, source = _read_source_uv_set(node)
+                    if not readable:
+                        prior_unknown += 1
+                        _append_capped_fill_name(prior_names, node)
+                    elif source == uv_old_index:
+                        prior_count += 1
+                        _append_capped_fill_name(prior_names, node)
+    return _pack()
+
+
+def inspect_direction_uv_fills(api, texture_sets):
+    """現在 UV 投影のフィルにある方向チャンネルを数える。ダイアログ直前用。"""
+    found = inspect_uv_fills_for_approval(api, texture_sets, None)
+    return found.direction_count, found.direction_names
 
 
 def _iter_named_children(node, names):
@@ -286,6 +373,11 @@ def switch_uv_fill_node(node, api, source_uv_set):
     except Exception as exc:
         return "failed", {"reason": "get_mode", "error": "{0}".format(exc)}
     if mode != api.ProjectionMode.UV:
+        uvset_mode = getattr(api.ProjectionMode, "UVSetToUVSet", None)
+        if uvset_mode is not None and mode == uvset_mode:
+            readable, source = _read_source_uv_set(node)
+            if readable and source == source_uv_set:
+                return "skipped", "prior_uvset"
         return "skipped", "not_uv"
     record["old_mode"] = mode
     try:
@@ -359,6 +451,7 @@ class UvFillStackReport(object):
         self.uv_fills_found = 0
         self.switched = 0
         self.skipped_not_uv = 0
+        self.prior = 0
         self.failed = 0
         self.rolled_back = 0
         self.paint_layers = 0
@@ -418,6 +511,8 @@ def switch_uv_fills_in_stack(stack, api, label, source_uv_set):
                     report.direction_fill_names.append(_direction_fill_name(node))
         elif result == "skipped":
             report.skipped_not_uv += 1
+            if detail == "prior_uvset":
+                report.prior += 1
         else:
             report.failed += 1
             failed = True
@@ -444,6 +539,7 @@ class UvFillSummary(object):
         self.per_texture_set = {}
         self.switched = 0
         self.skipped = 0
+        self.prior = 0
         self.failed = 0
         self.rolled_back = 0
         self.needs_manual_check = False
@@ -459,6 +555,7 @@ class UvFillSummary(object):
             "failed": int(self.failed),
             "rolled_back": int(self.rolled_back),
             "direction": int(self.direction_fills),
+            "prior": int(self.prior),
         }
 
     def to_message(self):
@@ -569,6 +666,7 @@ def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_
             "found": 0,
             "switched": 0,
             "skipped_not_uv": 0,
+            "prior": 0,
             "failed": 0,
             "rolled_back": 0,
             "direction": 0,
@@ -578,11 +676,13 @@ def switch_uv_fills_for_project(api, texture_sets, ts_names, *, enabled, uv_old_
             counts["found"] += report.uv_fills_found
             counts["switched"] += report.switched
             counts["skipped_not_uv"] += report.skipped_not_uv
+            counts["prior"] += report.prior
             counts["failed"] += report.failed
             counts["rolled_back"] += report.rolled_back
             counts["direction"] += report.direction_fills
             summary.switched += report.switched
             summary.skipped += report.skipped_not_uv
+            summary.prior += report.prior
             summary.failed += report.failed
             summary.rolled_back += report.rolled_back
             summary.direction_fills += report.direction_fills

@@ -15,8 +15,10 @@ from ._rebase_protocol import (
     REBASE_BACKUP_DIRNAME,
     REBASE_CAUTION_TEXT,
     REBASE_CAUTION_TEXT_REPROJECT,
+    REBASE_CAUTION_TEXT_REPROJECT_PRIOR,
     REBASE_CONFIRM_LEAD,
     REBASE_DIRECTION_APPROVAL_NOTE,
+    REBASE_PRIOR_FILL_WARNING_FMT,
     REBASE_UNSAVED_NOTE,
     REBASE_WAIT_MESSAGES,
     REBASE_WORKFLOW_GUIDANCE,
@@ -34,6 +36,7 @@ from ._rebase_protocol import (
 __all__ = [
     "needs_saving_for_rebase",
     "decide_approval",
+    "_prior_uv_fills_block_auto",
     "wait_timed_out",
     "mesh_precheck",
     "_REBASE_PRECHECK_CACHE_MAX",
@@ -104,6 +107,13 @@ def decide_approval(request, painter_state, settings):
     can_disable = bool(_painter_state_get(painter_state, "can_disable_auto_unwrap"))
     if approval == "auto" and not can_disable:
         return ApprovalDecision("ask", "auto_unwrap_unverified")
+    # 前回切り替えた UV 投影フィルがあると auto を ask に落とす。
+    # ここで return しない。未保存の wait などを飛ばさないため。
+    prior_uv_fills = _painter_state_get(painter_state, "prior_uv_fills")
+    demoted_for_prior = False
+    if approval == "auto" and _prior_uv_fills_block_auto(prior_uv_fills):
+        approval = "ask"
+        demoted_for_prior = True
     idle_s = rounded.get("rebase_auto_idle_s", 10.0)
     last_edit_age_s = _painter_state_get(painter_state, "last_edit_age_s")
     if approval == "auto":
@@ -117,7 +127,18 @@ def decide_approval(request, painter_state, settings):
         return ApprovalDecision("wait", "unsaved_changes")
     if approval == "auto":
         return ApprovalDecision("run", "auto_approved")
+    if demoted_for_prior:
+        return ApprovalDecision("ask", "prior_uv_fills")
     return ApprovalDecision("ask", "needs_approval")
+
+
+def _prior_uv_fills_block_auto(value):
+    """auto を ask に落とす prior_uv_fills か。None と 0 は落とさない。"""
+    if value == "unknown":
+        return True
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    return value >= 1
 
 
 def wait_timed_out(first_wait_at, now, settings):
@@ -274,13 +295,17 @@ def build_painter_state(
     cancelled,
     can_disable_auto_unwrap,
     last_edit_at,
+    prior_uv_fills=None,
 ):
-    """decide_approval の入力 14 キー。project_open = is_open and in_edition。"""
+    """decide_approval の入力。project_open = is_open and in_edition。
+
+    prior_uv_fills が None のときはキーを出さない(既存の 14 キーを保つ)。
+    """
     if mesh_sha1_ok is True or mesh_sha1_ok is False or mesh_sha1_ok is None:
         sha1_ok = mesh_sha1_ok
     else:
         sha1_ok = None
-    return {
+    state = {
         "now": now,
         "project_open": bool(is_open) and bool(in_edition),
         "project_key": project_key,
@@ -296,6 +321,9 @@ def build_painter_state(
         "can_disable_auto_unwrap": bool(can_disable_auto_unwrap),
         "last_edit_age_s": compute_last_edit_age(now, last_edit_at),
     }
+    if prior_uv_fills is not None:
+        state["prior_uv_fills"] = prior_uv_fills
+    return state
 
 
 # --- 3.7 バックアップ・再試行・読み直し ---
@@ -407,6 +435,8 @@ def build_rebase_approval_text(
     backup_includes_unsaved=False,
     uv_fill_reproject=False,
     has_direction_fills=False,
+    prior_fill_count=0,
+    prior_fill_names=None,
 ):
     """確認ダイアログの本文。注意文と運用案内は常に入れる。uv_old は見ない。"""
     parts = [REBASE_CONFIRM_LEAD]
@@ -417,8 +447,29 @@ def build_rebase_approval_text(
         names = [name for name in ts_names if isinstance(name, str) and name]
         if names:
             parts.append("対象: {0}".format(", ".join(names)))
-    caution = REBASE_CAUTION_TEXT_REPROJECT if uv_fill_reproject else REBASE_CAUTION_TEXT
+    has_prior = (
+        isinstance(prior_fill_count, int)
+        and not isinstance(prior_fill_count, bool)
+        and prior_fill_count >= 1
+    )
+    if uv_fill_reproject and has_prior:
+        caution = REBASE_CAUTION_TEXT_REPROJECT_PRIOR
+    elif uv_fill_reproject:
+        caution = REBASE_CAUTION_TEXT_REPROJECT
+    else:
+        caution = REBASE_CAUTION_TEXT
     parts.append(caution.format(backup_dir=backup_dir))
+    if has_prior:
+        shown = []
+        if isinstance(prior_fill_names, (list, tuple)):
+            for name in prior_fill_names:
+                if isinstance(name, str) and name:
+                    shown.append(name[:64])
+                if len(shown) >= 10:
+                    break
+        label = ", ".join(shown) if shown else "名前不明"
+        parts.append(REBASE_PRIOR_FILL_WARNING_FMT.format(
+            n=prior_fill_count, names=label))
     parts.append(REBASE_WORKFLOW_GUIDANCE)
     if has_direction_fills:
         parts.append(REBASE_DIRECTION_APPROVAL_NOTE)

@@ -422,7 +422,7 @@ def approval_action_from_role(role, accept_role):
 class RebaseApprovalDialogHost(object):
     """非モーダルの確認ダイアログ。シグナルはメソッドへつなぎ、shutdown で切る。"""
 
-    def __init__(self, text, on_result):
+    def __init__(self, text, on_result, default_cancel=False):
         self._on_result = on_result
         self._closed = False
         parent = None
@@ -444,7 +444,8 @@ class RebaseApprovalDialogHost(object):
             REBASE_BUTTON_RUN, QtWidgets.QMessageBox.AcceptRole)
         self._cancel_btn = self.box.addButton(
             REBASE_BUTTON_CANCEL, QtWidgets.QMessageBox.RejectRole)
-        self.box.setDefaultButton(self._run_btn)
+        self.box.setDefaultButton(
+            self._cancel_btn if default_cancel else self._run_btn)
         self.box.setEscapeButton(self._cancel_btn)
         self.box.finished.connect(self._on_finished)
         # 既定は ApplicationModal。仕様は出したまま操作できる非モーダル。
@@ -492,8 +493,9 @@ class RebaseApprovalDialogHost(object):
         self._parent = None
 
 
-def make_rebase_approval_dialog(text, on_result):
-    return RebaseApprovalDialogHost(text, on_result)
+def make_rebase_approval_dialog(text, on_result, default_cancel=False):
+    return RebaseApprovalDialogHost(
+        text, on_result, default_cancel=default_cancel)
 
 
 def default_rebase_job_factory(request, reporter, api, settings, clock=None, approved=True):
